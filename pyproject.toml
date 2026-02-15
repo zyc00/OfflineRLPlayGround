@@ -1,0 +1,18 @@
+[project]
+name = "offlinerlplayground"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium>=0.29.1",
+    "mani-skill>=3.0.0b22",
+    "scikit-learn>=1.8.0",
+    "setuptools==69.0.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.10.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["utils*", "data*", "env*"]
