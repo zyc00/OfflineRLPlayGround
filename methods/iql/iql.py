@@ -76,8 +76,81 @@ class Args:
     """early stopping patience"""
     grad_clip: float = 0.5
     """max gradient norm"""
+    nstep: int = 1
+    """n-step TD return (1 = standard 1-step, >1 = multi-step)"""
     num_random_actions: int = 3
     """number of random actions to sample per state for Q(s, a_random) estimation"""
+
+
+def compute_nstep_targets(trajectories, n, gamma):
+    """Compute n-step TD targets from trajectory data.
+
+    For each step t in each trajectory, computes:
+      G_t^n = Σ_{k=0}^{m-1} γ^k r_{t+k}   where m = min(n, steps_until_done)
+      bootstrap_state = s_{t+m}              (state to evaluate V on)
+      discount = γ^m if not done within n steps, else 0
+
+    Returns tensors aligned with torch.cat([t["states"] for t in trajectories]).
+    """
+    gp = [gamma ** k for k in range(n + 1)]  # precomputed gamma powers
+
+    all_nstep_returns = []
+    all_bootstrap_states = []
+    all_nstep_discounts = []
+
+    for traj in trajectories:
+        rewards = traj["rewards"]
+        states = traj["states"]
+        next_states = traj["next_states"]
+        dones = traj.get("dones", None)
+        if dones is None:
+            dones = torch.zeros_like(rewards)
+            dones[-1] = 1.0
+        T = len(rewards)
+
+        # Convert to Python lists for fast scalar access
+        r = rewards.tolist()
+        d = dones.tolist()
+
+        nret = [0.0] * T
+        disc = [0.0] * T
+        bidx = [0] * T       # bootstrap index
+        btype = [False] * T  # True = states[bidx], False = next_states[bidx]
+
+        for t in range(T):
+            G = 0.0
+            en = 0
+            for k in range(min(n, T - t)):
+                G += gp[k] * r[t + k]
+                en = k + 1
+                if d[t + k]:
+                    break
+            nret[t] = G
+            last = t + en - 1
+            if d[last]:
+                bidx[t] = last
+            elif t + en < T:
+                disc[t] = gp[en]
+                bidx[t] = t + en
+                btype[t] = True
+            else:
+                disc[t] = gp[min(en, n)]
+                bidx[t] = T - 1
+
+        # Vectorized tensor construction
+        bidx_t = torch.tensor(bidx, dtype=torch.long)
+        btype_t = torch.tensor(btype, dtype=torch.bool).unsqueeze(1)
+        boot_s = torch.where(btype_t, states[bidx_t], next_states[bidx_t])
+
+        all_nstep_returns.append(torch.tensor(nret))
+        all_bootstrap_states.append(boot_s)
+        all_nstep_discounts.append(torch.tensor(disc))
+
+    return (
+        torch.cat(all_nstep_returns),
+        torch.cat(all_bootstrap_states),
+        torch.cat(all_nstep_discounts),
+    )
 
 
 def train_iql(
@@ -88,8 +161,17 @@ def train_iql(
     terminated: torch.Tensor,
     device: torch.device,
     args: Args,
+    nstep_returns: torch.Tensor | None = None,
+    bootstrap_states: torch.Tensor | None = None,
+    nstep_discounts: torch.Tensor | None = None,
 ) -> tuple[QNetwork, Critic]:
-    """Train IQL Q and V networks on flat transition data."""
+    """Train IQL Q and V networks on flat transition data.
+
+    When nstep_returns/bootstrap_states/nstep_discounts are provided,
+    uses n-step TD targets for Q: Q(s,a) → G^n + γ^n V(s_{+n}).
+    Otherwise falls back to 1-step: Q(s,a) → r + γ V(s').
+    """
+    use_nstep = nstep_returns is not None
     state_dim = states.shape[1]
     action_dim = actions.shape[1]
 
@@ -123,6 +205,10 @@ def train_iql(
     val_r = rewards[val_idx].to(device)
     val_ns = next_states[val_idx].to(device)
     val_term = terminated[val_idx].to(device)
+    if use_nstep:
+        val_nstep_ret = nstep_returns[val_idx].to(device)
+        val_boot_s = bootstrap_states[val_idx].to(device)
+        val_nstep_disc = nstep_discounts[val_idx].to(device)
 
     best_val_loss = float("inf")
     best_q_state = None
@@ -145,10 +231,17 @@ def train_iql(
             ns = next_states[batch_idx].to(device)
             term = terminated[batch_idx].to(device)
 
-            # --- Q loss: Bellman backup using V ---
+            # --- Q loss: TD backup using V ---
             with torch.no_grad():
-                v_next = v_net(ns).squeeze(-1)
-                q_target_val = r + args.gamma * v_next * (1.0 - term)
+                if use_nstep:
+                    b_nret = nstep_returns[batch_idx].to(device)
+                    b_boot = bootstrap_states[batch_idx].to(device)
+                    b_disc = nstep_discounts[batch_idx].to(device)
+                    v_boot = v_net(b_boot).squeeze(-1)
+                    q_target_val = b_nret + b_disc * v_boot
+                else:
+                    v_next = v_net(ns).squeeze(-1)
+                    q_target_val = r + args.gamma * v_next * (1.0 - term)
             q_pred = q_net(s, a).squeeze(-1)
             q_loss = 0.5 * ((q_pred - q_target_val) ** 2).mean()
 
@@ -188,8 +281,12 @@ def train_iql(
         q_net.eval()
         v_net.eval()
         with torch.no_grad():
-            v_next_val = v_net(val_ns).squeeze(-1)
-            q_tgt = val_r + args.gamma * v_next_val * (1.0 - val_term)
+            if use_nstep:
+                v_boot_val = v_net(val_boot_s).squeeze(-1)
+                q_tgt = val_nstep_ret + val_nstep_disc * v_boot_val
+            else:
+                v_next_val = v_net(val_ns).squeeze(-1)
+                q_tgt = val_r + args.gamma * v_next_val * (1.0 - val_term)
             q_pred_val = q_net(val_s, val_a).squeeze(-1)
             val_q_loss = 0.5 * ((q_pred_val - q_tgt) ** 2).mean().item()
 
@@ -324,10 +421,23 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------
     # 3. Train IQL
     # ---------------------------------------------------------------
-    print(f"\nTraining IQL (expectile_tau={args.expectile_tau})...")
+    nstep_kw = {}
+    if args.nstep > 1:
+        print(f"\nComputing {args.nstep}-step TD targets...")
+        nret, boot_s, ndisc = compute_nstep_targets(
+            all_trajectories, args.nstep, args.gamma
+        )
+        nstep_kw = dict(
+            nstep_returns=nret, bootstrap_states=boot_s, nstep_discounts=ndisc
+        )
+        print(f"  n-step returns: mean={nret.mean():.4f}, std={nret.std():.4f}")
+        frac_boot = (ndisc > 0).float().mean()
+        print(f"  Bootstrapped: {frac_boot:.1%} of transitions")
+
+    print(f"\nTraining IQL (expectile_tau={args.expectile_tau}, nstep={args.nstep})...")
     q_net, v_net = train_iql(
         all_states, all_actions, all_rewards, all_next_states, all_terminated,
-        device, args,
+        device, args, **nstep_kw,
     )
 
     # Free training data

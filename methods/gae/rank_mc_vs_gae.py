@@ -28,7 +28,7 @@ from tqdm import tqdm
 from data.data_collection.ppo import Agent
 from data.offline_dataset import OfflineRLDataset
 from methods.gae.gae_online import Critic, _make_obs
-from methods.iql.iql import QNetwork, train_iql
+from methods.iql.iql import QNetwork, train_iql, compute_nstep_targets
 from methods.iql.iql import Args as IQLArgs
 
 
@@ -121,6 +121,12 @@ class Args:
     critic_weight_decay: float = 1e-4
     """weight decay (L2 regularization) for critic training"""
 
+    # Bootstrap GAE parameters (iterative GAE targets, like gae.py / PPO)
+    num_gae_iterations: int = 50
+    """number of outer GAE iterations for bootstrap training"""
+    critic_update_epochs: int = 4
+    """number of inner epochs per GAE iteration"""
+
     # IQL parameters
     train_dataset_path: str = "data/datasets/pickcube_expert.pt"
     """path to the training .pt dataset file (used to train IQL)"""
@@ -130,6 +136,8 @@ class Args:
     """number of training epochs for IQL"""
     iql_patience: int = 100
     """early stopping patience for IQL"""
+    iql_nstep: int = 10
+    """n-step TD return for IQL (1 = standard, >1 = multi-step)"""
 
     # Output
     output: str = ""
@@ -168,6 +176,7 @@ def _rollout_return(envs, agent, first_action, env_state, is_grasped,
 
         step_states = []
         step_next_states = []
+        step_actions = []
         step_rewards = []
         step_terminated = []
         step_dones = []
@@ -185,6 +194,7 @@ def _rollout_return(envs, agent, first_action, env_state, is_grasped,
         if store_trajectories:
             step_states.append(obs_t.clone())
             step_next_states.append(next_obs.clone())
+            step_actions.append(action.clone())
 
         step_rewards.append(reward.view(-1))
         step_terminated.append(terminated.view(-1).float())
@@ -207,6 +217,7 @@ def _rollout_return(envs, agent, first_action, env_state, is_grasped,
             if store_trajectories:
                 step_states.append(prev_obs)
                 step_next_states.append(next_obs.clone())
+                step_actions.append(action.clone())
 
             step_rewards.append(reward.view(-1))
             step_terminated.append(terminated.view(-1).float())
@@ -222,6 +233,7 @@ def _rollout_return(envs, agent, first_action, env_state, is_grasped,
         if store_trajectories:
             all_s = torch.stack(step_states, dim=0)      # (T, num_envs, obs_dim)
             all_ns = torch.stack(step_next_states, dim=0)
+            all_a = torch.stack(step_actions, dim=0)     # (T, num_envs, action_dim)
             all_t = torch.stack(step_terminated, dim=0)
             all_d = torch.stack(step_dones, dim=0)
 
@@ -237,6 +249,7 @@ def _rollout_return(envs, agent, first_action, env_state, is_grasped,
                 trajectories.append({
                     "states": all_s[:traj_len, env_idx].cpu(),
                     "next_states": all_ns[:traj_len, env_idx].cpu(),
+                    "actions": all_a[:traj_len, env_idx].cpu(),
                     "rewards": env_rewards.cpu(),
                     "dones": all_d[:traj_len, env_idx].cpu(),
                     "terminated": all_t[:traj_len, env_idx].cpu(),
@@ -487,12 +500,101 @@ def compute_gae_advantages(critic, trajectories, traj_to_state_action,
 
 
 # ---------------------------------------------------------------------------
+# V(s) training (iterative GAE bootstrap, like gae.py / PPO)
+# ---------------------------------------------------------------------------
+
+
+def train_value_bootstrap(trajectories, state_dim, gamma, gae_lambda, device, args):
+    """Train V(s) using iterative GAE bootstrap targets (like gae.py / PPO).
+
+    Each outer iteration recomputes GAE returns with the current critic,
+    then trains the critic on those frozen targets for K inner epochs.
+    """
+    critic = Critic("state", state_dim=state_dim).to(device)
+    optimizer = torch.optim.Adam(
+        critic.parameters(), lr=args.critic_lr, eps=1e-5,
+        weight_decay=args.critic_weight_decay,
+    )
+
+    all_states = torch.cat([t["states"] for t in trajectories], dim=0)
+    N = all_states.shape[0]
+
+    for gae_iter in range(1, args.num_gae_iterations + 1):
+        # Recompute GAE returns with current critic (frozen targets)
+        all_returns = []
+        critic.eval()
+        for traj in trajectories:
+            rewards = traj["rewards"].to(device)
+            terminated = traj["terminated"].to(device)
+            dones = traj["dones"].to(device)
+            traj_len = rewards.shape[0]
+
+            with torch.no_grad():
+                v = critic(traj["states"].to(device)).squeeze(-1)
+                v_next = critic(traj["next_states"].to(device)).squeeze(-1)
+
+            deltas = rewards + gamma * v_next * (1.0 - terminated) - v
+
+            advantages = torch.zeros(traj_len, device=device)
+            lastgaelam = 0.0
+            for t in reversed(range(traj_len)):
+                not_done = 1.0 - dones[t]
+                advantages[t] = lastgaelam = (
+                    deltas[t] + gamma * gae_lambda * not_done * lastgaelam
+                )
+
+            all_returns.append((advantages + v).cpu())
+
+        gae_returns = torch.cat(all_returns, dim=0)
+
+        # Train critic on GAE returns for K epochs
+        critic.train()
+        total_loss = 0.0
+        total_batches = 0
+        for _epoch in range(args.critic_update_epochs):
+            indices = torch.randperm(N)
+            for start in range(0, N, args.critic_batch_size):
+                batch_idx = indices[start : start + args.critic_batch_size]
+                batch_obs = all_states[batch_idx].to(device)
+                batch_returns = gae_returns[batch_idx].to(device)
+
+                pred = critic(batch_obs).squeeze(-1)
+                loss = 0.5 * ((pred - batch_returns) ** 2).mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+                optimizer.step()
+
+                total_loss += loss.item()
+                total_batches += 1
+
+        avg_loss = total_loss / max(total_batches, 1)
+        if gae_iter % 10 == 0 or gae_iter == 1:
+            print(
+                f"  GAE iter {gae_iter}/{args.num_gae_iterations}: "
+                f"loss={avg_loss:.6f}, "
+                f"returns mean={gae_returns.mean():.4f}, "
+                f"std={gae_returns.std():.4f}"
+            )
+
+    critic.eval()
+    return critic
+
+
+# ---------------------------------------------------------------------------
 # IQL advantage computation
 # ---------------------------------------------------------------------------
 
 
-def train_and_eval_iql(eval_dataset, sampled_actions, device, args):
+def train_and_eval_iql(eval_dataset, sampled_actions, device, args,
+                       extra_trajectories=None):
     """Train IQL for each tau and evaluate advantages for sampled actions.
+
+    Args:
+        extra_trajectories: Optional list of trajectory dicts (from MC rollouts)
+            with keys "states", "actions", "rewards", "next_states",
+            "terminated", "dones".
 
     Returns:
         dict mapping "IQL(tau)" -> (N, K) tensor of advantages
@@ -518,7 +620,42 @@ def train_and_eval_iql(eval_dataset, sampled_actions, device, args):
     eval_actions_list = [eval_dataset.actions[t["flat_indices"]] for t in eval_trajectories]
     all_actions = torch.cat(train_actions_list + eval_actions_list, dim=0)
 
-    print(f"  IQL training data: {all_states.shape[0]} transitions")
+    n_dataset = all_states.shape[0]
+
+    # Augment with rollout trajectories
+    if extra_trajectories is not None:
+        extra_states = torch.cat([t["states"] for t in extra_trajectories], dim=0)
+        extra_actions = torch.cat([t["actions"] for t in extra_trajectories], dim=0)
+        extra_rewards = torch.cat([t["rewards"] for t in extra_trajectories], dim=0)
+        extra_next = torch.cat([t["next_states"] for t in extra_trajectories], dim=0)
+        extra_term = torch.cat([t["terminated"] for t in extra_trajectories], dim=0)
+        all_states = torch.cat([all_states, extra_states], dim=0)
+        all_actions = torch.cat([all_actions, extra_actions], dim=0)
+        all_rewards = torch.cat([all_rewards, extra_rewards], dim=0)
+        all_next_states = torch.cat([all_next_states, extra_next], dim=0)
+        all_terminated = torch.cat([all_terminated, extra_term], dim=0)
+
+    print(f"  IQL training data: {all_states.shape[0]} transitions "
+          f"({n_dataset} dataset + {all_states.shape[0] - n_dataset} rollout)")
+
+    # Compute n-step TD targets if nstep > 1
+    nstep_kw = {}
+    if args.iql_nstep > 1:
+        # Combine all trajectory sources for n-step computation
+        nstep_trajs = list(all_trajectories)
+        if extra_trajectories is not None:
+            nstep_trajs = nstep_trajs + list(extra_trajectories)
+        print(f"  Computing {args.iql_nstep}-step TD targets from "
+              f"{len(nstep_trajs)} trajectories...")
+        nret, boot_s, ndisc = compute_nstep_targets(
+            nstep_trajs, args.iql_nstep, args.gamma
+        )
+        nstep_kw = dict(
+            nstep_returns=nret, bootstrap_states=boot_s, nstep_discounts=ndisc
+        )
+        frac_boot = (ndisc > 0).float().mean()
+        print(f"  n-step returns: mean={nret.mean():.4f}, std={nret.std():.4f}")
+        print(f"  Bootstrapped: {frac_boot:.1%} of transitions")
 
     eval_states = eval_dataset.state
     results = {}
@@ -532,17 +669,24 @@ def train_and_eval_iql(eval_dataset, sampled_actions, device, args):
             lr=args.critic_lr,
             batch_size=args.critic_batch_size,
             weight_decay=args.critic_weight_decay,
+            nstep=args.iql_nstep,
         )
 
-        print(f"\nTraining IQL (tau={tau})...")
+        print(f"\nTraining IQL (tau={tau}, nstep={args.iql_nstep})...")
         q_net, v_net = train_iql(
             all_states, all_actions, all_rewards, all_next_states, all_terminated,
-            device, iql_args,
+            device, iql_args, **nstep_kw,
         )
 
-        adv = _eval_iql_advantages(q_net, v_net, eval_states, sampled_actions, device)
+        adv, iql_q, iql_v = _eval_iql_advantages(
+            q_net, v_net, eval_states, sampled_actions, device
+        )
         label = f"IQL({tau})"
         results[label] = adv
+        results[f"{label}_Q"] = iql_q
+        results[f"{label}_V"] = iql_v
+        print(f"  {label} V(s):   mean={iql_v.mean():.4f}, std={iql_v.std():.4f}")
+        print(f"  {label} Q(s,a): mean={iql_q.mean():.4f}, std={iql_q.std():.4f}")
         print(f"  {label} A(s,a): mean={adv.mean():.4f}, std={adv.std():.4f}")
 
         del q_net, v_net
@@ -555,9 +699,17 @@ def train_and_eval_iql(eval_dataset, sampled_actions, device, args):
 
 
 def _eval_iql_advantages(q_net, v_net, eval_states, sampled_actions, device):
-    """Evaluate IQL advantages A(s,a_k) = Q(s,a_k) - V(s) for sampled actions."""
+    """Evaluate IQL advantages A(s,a_k) = Q(s,a_k) - V(s) for sampled actions.
+
+    Returns:
+        iql_advantages: (N, K) tensor
+        iql_q: (N, K) tensor of raw Q values
+        iql_v: (N,) tensor of raw V values
+    """
     N, K, _ = sampled_actions.shape
     iql_advantages = torch.zeros(N, K)
+    iql_q = torch.zeros(N, K)
+    iql_v = torch.zeros(N)
 
     q_net.eval()
     v_net.eval()
@@ -567,12 +719,14 @@ def _eval_iql_advantages(q_net, v_net, eval_states, sampled_actions, device):
             end = min(start + batch_size, N)
             s = eval_states[start:end].to(device)          # (B, state_dim)
             v = v_net(s).squeeze(-1)                        # (B,)
+            iql_v[start:end] = v.cpu()
             for k in range(K):
                 a = sampled_actions[start:end, k].to(device)  # (B, action_dim)
                 q = q_net(s, a).squeeze(-1)                   # (B,)
+                iql_q[start:end, k] = q.cpu()
                 iql_advantages[start:end, k] = (q - v).cpu()
 
-    return iql_advantages
+    return iql_advantages, iql_q, iql_v
 
 
 # ---------------------------------------------------------------------------
@@ -704,8 +858,8 @@ def plot_results(methods_dict, metrics, save_path):
         ax.legend(fontsize=9)
 
     # --- Row 2: Example state + Summary table ---
-    # Example state (near median Spearman for MC vs GAE)
-    mc_gae_key = "MC_vs_GAE"
+    # Example state (near median Spearman for MC vs GAE(MC))
+    mc_gae_key = [k for k in pairs if k.startswith("MC_vs_GAE")][0]
     rhos_mg = metrics["pairs"][mc_gae_key]["spearman_rhos"]
     median_rho = np.median(rhos_mg)
     example_idx = np.argmin(np.abs(rhos_mg - median_rho))
@@ -822,36 +976,175 @@ if __name__ == "__main__":
     print(f"  A(s,a): mean={mc_advantages.mean():.4f}, std={mc_advantages.std():.4f}")
 
     # -------------------------------------------------------------------
-    # 2. Train V(s) on MC returns → compute GAE advantages
+    # 2. Load training dataset for V(s) training
     # -------------------------------------------------------------------
-    critic = train_value_mc(
-        trajectories, state_dim, args.gamma, device, args
+    print(f"\nLoading training dataset: {args.train_dataset_path}")
+    train_dataset = OfflineRLDataset([args.train_dataset_path], False, False)
+    train_trajectories = train_dataset.extract_trajectories(
+        num_envs=args.dataset_num_envs, gamma=args.gamma
+    )
+    traj_lens = [t["states"].shape[0] for t in train_trajectories]
+    print(
+        f"  {len(train_trajectories)} trajectories, "
+        f"lengths: min={min(traj_lens)}, max={max(traj_lens)}, "
+        f"mean={sum(traj_lens)/len(traj_lens):.1f}"
+    )
+    del train_dataset
+
+    # -------------------------------------------------------------------
+    # 3. GAE(MC): Train V(s) on MC returns from training set → GAE adv
+    # -------------------------------------------------------------------
+    critic_mc = train_value_mc(
+        train_trajectories, state_dim, args.gamma, device, args
     )
 
-    print("\nComputing GAE advantages...")
-    gae_advantages = compute_gae_advantages(
-        critic, trajectories, traj_to_state_action,
+    # Load eval states (reused for all methods)
+    eval_dataset = OfflineRLDataset([args.eval_dataset_path], False, False)
+    eval_states = eval_dataset.state
+
+    v_gae_mc = _batched_forward(critic_mc, eval_states, device)
+    print(f"  GAE(MC) V(s) on eval: mean={v_gae_mc.mean():.4f}, std={v_gae_mc.std():.4f}")
+
+    print("\nComputing GAE(MC) advantages...")
+    gae_mc_advantages = compute_gae_advantages(
+        critic_mc, trajectories, traj_to_state_action,
         N, K, args.gamma, args.gae_lambda, device,
     )
     print(
-        f"  GAE A(s,a): mean={gae_advantages.mean():.4f}, "
-        f"std={gae_advantages.std():.4f}"
+        f"  GAE(MC) A(s,a): mean={gae_mc_advantages.mean():.4f}, "
+        f"std={gae_mc_advantages.std():.4f}"
     )
 
     # -------------------------------------------------------------------
-    # 3. Train IQL(s) → compute IQL advantages on same sampled actions
+    # 4. GAE(Bootstrap): Train V(s) with iterative GAE targets → GAE adv
     # -------------------------------------------------------------------
-    eval_dataset = OfflineRLDataset([args.eval_dataset_path], False, False)
+    print("\nTraining V(s) with bootstrap GAE targets on training set...")
+    critic_boot = train_value_bootstrap(
+        train_trajectories, state_dim, args.gamma, args.gae_lambda, device, args,
+    )
+    del train_trajectories
+
+    v_gae_boot = _batched_forward(critic_boot, eval_states, device)
+    print(f"  GAE(Boot) V(s) on eval: mean={v_gae_boot.mean():.4f}, std={v_gae_boot.std():.4f}")
+
+    print("Computing GAE(Bootstrap) advantages...")
+    gae_boot_advantages = compute_gae_advantages(
+        critic_boot, trajectories, traj_to_state_action,
+        N, K, args.gamma, args.gae_lambda, device,
+    )
+    print(
+        f"  GAE(Bootstrap) A(s,a): mean={gae_boot_advantages.mean():.4f}, "
+        f"std={gae_boot_advantages.std():.4f}"
+    )
+
+    # -------------------------------------------------------------------
+    # 5. Single-traj GAE (1 trajectory per (s,a), like gae.py)
+    # -------------------------------------------------------------------
+    seen = set()
+    single_indices = []
+    for i, (si, ai) in enumerate(traj_to_state_action):
+        if (si, ai) not in seen:
+            seen.add((si, ai))
+            single_indices.append(i)
+    single_trajs = [trajectories[i] for i in single_indices]
+    single_map = [traj_to_state_action[i] for i in single_indices]
+    print(f"\nSingle-traj subset: {len(single_trajs)} trajectories "
+          f"(1 per (s,a) pair, vs {len(trajectories)} total)")
+
+    print("Computing GAE(MC,1traj) advantages...")
+    gae_mc_1t = compute_gae_advantages(
+        critic_mc, single_trajs, single_map,
+        N, K, args.gamma, args.gae_lambda, device,
+    )
+    print(f"  GAE(MC,1traj) A(s,a): mean={gae_mc_1t.mean():.4f}, "
+          f"std={gae_mc_1t.std():.4f}")
+
+    print("Computing GAE(Boot,1traj) advantages...")
+    gae_boot_1t = compute_gae_advantages(
+        critic_boot, single_trajs, single_map,
+        N, K, args.gamma, args.gae_lambda, device,
+    )
+    print(f"  GAE(Boot,1traj) A(s,a): mean={gae_boot_1t.mean():.4f}, "
+          f"std={gae_boot_1t.std():.4f}")
+
+    # -------------------------------------------------------------------
+    # 6. Train IQL(s) → compute IQL advantages on same sampled actions
+    # -------------------------------------------------------------------
+    n_rollout_transitions = sum(t["states"].shape[0] for t in trajectories)
+    print(f"\nRollout trajectories for IQL: {len(trajectories)} trajectories, "
+          f"{n_rollout_transitions} transitions")
+
     iql_results = train_and_eval_iql(
         eval_dataset, sampled_actions, device, args,
+        extra_trajectories=trajectories,
     )
 
     # -------------------------------------------------------------------
-    # 4. Compare rankings (all pairs)
+    # 7. V(s) and Q(s,a) comparison across methods
     # -------------------------------------------------------------------
-    methods_dict = {"MC": mc_advantages.numpy(), "GAE": gae_advantages.numpy()}
+    print(f"\n{'='*60}")
+    print("V(s) COMPARISON ON EVAL STATES")
+    print(f"{'='*60}")
+    print(f"  MC  V(s):       mean={v_mc.mean():.4f}, std={v_mc.std():.4f}")
+    print(f"  GAE(MC) V(s):   mean={v_gae_mc.mean():.4f}, std={v_gae_mc.std():.4f}")
+    print(f"  GAE(Boot) V(s): mean={v_gae_boot.mean():.4f}, std={v_gae_boot.std():.4f}")
+    for label, val in iql_results.items():
+        if label.endswith("_V"):
+            iql_v = val
+            print(f"  {label[:-2]} V(s):  mean={iql_v.mean():.4f}, std={iql_v.std():.4f}")
+
+    # Correlations of V(s) across methods
+    v_mc_np = v_mc.numpy()
+    v_gae_mc_np = v_gae_mc.numpy()
+    v_gae_boot_np = v_gae_boot.numpy()
+    r_mc_gaemc, _ = sp_stats.pearsonr(v_mc_np, v_gae_mc_np)
+    r_mc_gaeboot, _ = sp_stats.pearsonr(v_mc_np, v_gae_boot_np)
+    r_gaemc_gaeboot, _ = sp_stats.pearsonr(v_gae_mc_np, v_gae_boot_np)
+    print(f"\n  V(s) Pearson r:")
+    print(f"    MC vs GAE(MC):        {r_mc_gaemc:.4f}")
+    print(f"    MC vs GAE(Boot):      {r_mc_gaeboot:.4f}")
+    print(f"    GAE(MC) vs GAE(Boot): {r_gaemc_gaeboot:.4f}")
+    for label, val in iql_results.items():
+        if label.endswith("_V"):
+            iql_v_np = val.numpy()
+            r_mc_iql, _ = sp_stats.pearsonr(v_mc_np, iql_v_np)
+            print(f"    MC vs {label[:-2]}:       {r_mc_iql:.4f}")
+
+    print(f"\n{'='*60}")
+    print("Q(s,a) COMPARISON ON EVAL STATES (sampled actions)")
+    print(f"{'='*60}")
+    print(f"  MC  Q(s,a):     mean={q_mc.mean():.4f}, std={q_mc.std():.4f}")
+    for label, val in iql_results.items():
+        if label.endswith("_Q"):
+            iql_q = val
+            print(f"  {label[:-2]} Q(s,a): mean={iql_q.mean():.4f}, std={iql_q.std():.4f}")
+            # Per-state Q correlation with MC
+            q_mc_flat = q_mc.numpy().flatten()
+            iql_q_flat = iql_q.numpy().flatten()
+            r_q, _ = sp_stats.pearsonr(q_mc_flat, iql_q_flat)
+            print(f"    Pearson r (pooled Q): {r_q:.4f}")
+            # Per-state Spearman on Q rankings
+            rhos_q = []
+            for i in range(N):
+                rho_q, _ = sp_stats.spearmanr(q_mc[i].numpy(), iql_q[i].numpy())
+                rhos_q.append(rho_q)
+            print(f"    Per-state Spearman ρ (Q ranks): mean={np.mean(rhos_q):.4f}, "
+                  f"median={np.median(rhos_q):.4f}")
+    print(f"{'='*60}")
+
+    # -------------------------------------------------------------------
+    # 8. Compare advantage rankings (all pairs)
+    # -------------------------------------------------------------------
+    methods_dict = {
+        "MC": mc_advantages.numpy(),
+        "GAE(MC)": gae_mc_advantages.numpy(),
+        "GAE(MC,1traj)": gae_mc_1t.numpy(),
+        "GAE(Bootstrap)": gae_boot_advantages.numpy(),
+        "GAE(Boot,1traj)": gae_boot_1t.numpy(),
+    }
     for label, adv in iql_results.items():
-        methods_dict[label] = adv.numpy()
+        if not label.endswith("_Q") and not label.endswith("_V"):
+            methods_dict[label] = adv.numpy()
 
     print("\nComputing ranking metrics...")
     metrics = compute_ranking_metrics(methods_dict)
@@ -872,18 +1165,23 @@ if __name__ == "__main__":
     print(f"{'='*60}")
 
     # -------------------------------------------------------------------
-    # 5. Save results and plot
+    # 9. Save results and plot
     # -------------------------------------------------------------------
     results = {
         "v_mc": v_mc,
         "q_mc": q_mc,
+        "v_gae_mc": v_gae_mc,
+        "v_gae_boot": v_gae_boot,
         "mc_advantages": mc_advantages,
-        "gae_advantages": gae_advantages,
+        "gae_mc_advantages": gae_mc_advantages,
+        "gae_mc_1traj_advantages": gae_mc_1t,
+        "gae_boot_advantages": gae_boot_advantages,
+        "gae_boot_1traj_advantages": gae_boot_1t,
         "sampled_actions": sampled_actions,
         "metrics": metrics,
     }
-    for label, adv in iql_results.items():
-        results[f"{label}_advantages"] = adv
+    for label, val in iql_results.items():
+        results[f"{label}"] = val
     save_path = os.path.join(
         os.path.dirname(args.eval_dataset_path),
         f"rank_mc_vs_gae_iql_K{K}_M{args.num_mc_rollouts}"
