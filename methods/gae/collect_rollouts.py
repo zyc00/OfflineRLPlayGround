@@ -47,7 +47,7 @@ class Args:
 
     num_sampled_actions: int = 8
     """K: actions sampled per state"""
-    num_mc_rollouts: int = 1
+    num_mc_rollouts: int = 10
     """M: rollouts per (state, action) pair"""
 
     output_dir: str = "data/datasets"
@@ -277,7 +277,8 @@ if __name__ == "__main__":
         "state_dim": state_dim,
     }
 
-    filename = f"rank_cache_K{K}_M{M}_seed{args.seed}.pt"
+    ckpt_name = os.path.splitext(os.path.basename(args.checkpoint))[0]
+    filename = f"rank_cache_{ckpt_name}_K{K}_M{M}_seed{args.seed}.pt"
     path = os.path.join(args.output_dir, filename)
     torch.save(cache, path)
     print(f"Saved to {path}")

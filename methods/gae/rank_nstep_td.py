@@ -51,7 +51,7 @@ class Args:
     gamma: float = 0.8
     gae_lambda: float = 0.95
 
-    cache_path: str = "data/datasets/rank_cache_K8_M1_seed1.pt"
+    cache_path: str = "data/datasets/rank_cache_K8_M10_seed1.pt"
     train_dataset_path: str = "data/datasets/pickcube_expert.pt"
     eval_dataset_path: str = "data/datasets/pickcube_expert_eval.pt"
     dataset_num_envs: int = 16
@@ -251,10 +251,13 @@ if __name__ == "__main__":
 
     # Trajectory length stats
     traj_lens = [t["states"].shape[0] for t in trajectories]
+    n_terminated = sum(1 for t in trajectories if t["terminated"][-1] > 0.5)
+    n_truncated = len(trajectories) - n_terminated
     print(f"  {N} states, K={K}, {len(trajectories)} trajectories, "
           f"{n_valid} valid")
     print(f"  Trajectory lengths: min={min(traj_lens)}, max={max(traj_lens)}, "
           f"mean={np.mean(traj_lens):.1f}")
+    print(f"  Terminated: {n_terminated}, Truncated: {n_truncated}")
 
     # =================================================================
     # 2. Train V(s) on MC returns
@@ -290,8 +293,147 @@ if __name__ == "__main__":
         args.gamma, list(args.nsteps), args.gae_lambda, device,
     )
 
+    # --- Diagnostic: per-trajectory TD(T) vs MC-V ---
+    max_n = max(args.nsteps)
+    td_max = all_advs[f"TD({max_n})"]
+    mc_v = all_advs["MC-V"]
+    diff = (td_max - mc_v).abs()
+    print(f"\n  Diagnostic: TD({max_n}) vs MC-V")
+    print(f"    Max abs diff:  {diff.max():.6f}")
+    print(f"    Mean abs diff: {diff.mean():.6f}")
+    if diff.max() > 1e-4:
+        worst = diff.argmax()
+        si, ai = worst // K, worst % K
+        print(f"    Worst (state={si}, action={ai}): "
+              f"TD={td_max[si, ai]:.6f}, MC-V={mc_v[si, ai]:.6f}")
+
     # =================================================================
-    # 4. Ranking comparison
+    # 4. Rollout averaging ablation: MC, TD(50), GAE with M rollouts
+    # =================================================================
+    # Count rollouts per (state, action)
+    rollout_counts = torch.zeros(N, K, dtype=torch.long)
+    for si, ai in traj_map:
+        rollout_counts[si, ai] += 1
+    max_rollouts = int(rollout_counts.max())
+    print(f"\n{'=' * 60}")
+    print(f"Rollout averaging ablation ({max_rollouts} rollouts per (s,a))")
+    print(f"{'=' * 60}")
+
+    if max_rollouts > 1:
+        # Pre-compute per-trajectory: MC return, TD(50) advantage, GAE advantage
+        # Then group by (si, ai) for subset averaging
+        all_s_flat = torch.cat([t["states"] for t in trajectories])
+        all_ns_flat = torch.cat([t["next_states"] for t in trajectories])
+        all_v_flat = v_eval(v_net, all_s_flat, device)
+        all_vnext_flat = v_eval(v_net, all_ns_flat, device)
+
+        mc_per_sa = [[[] for _ in range(K)] for _ in range(N)]
+        gae_per_sa = [[[] for _ in range(K)] for _ in range(N)]
+        td_nsteps_ablation = [5, 10, 20, 50]
+        td_per_sa = {n: [[[] for _ in range(K)] for _ in range(N)]
+                     for n in td_nsteps_ablation}
+
+        offset = 0
+        for i, traj in enumerate(trajectories):
+            si, ai = traj_map[i]
+            T = traj["states"].shape[0]
+            rewards = traj["rewards"]
+            terminated = traj["terminated"]
+            dones = traj["dones"]
+            v = all_v_flat[offset : offset + T]
+            v_next = all_vnext_flat[offset : offset + T]
+            offset += T
+
+            # MC return
+            ret = 0.0
+            for t in reversed(range(T)):
+                ret = rewards[t].item() + args.gamma * ret
+            mc_per_sa[si][ai].append(ret)
+
+            # TD errors (use dones to zero bootstrap for truncated too)
+            delta = rewards + args.gamma * v_next * (1.0 - dones) - v
+
+            # TD(n) advantages via cumulative sum
+            gamma_powers = args.gamma ** torch.arange(T, dtype=torch.float32)
+            cum = torch.cumsum(gamma_powers * delta, dim=0)
+            for n in td_nsteps_ablation:
+                n_eff = min(n, T)
+                td_per_sa[n][si][ai].append(cum[n_eff - 1].item())
+
+            # GAE advantage
+            gae_val = 0.0
+            for t in reversed(range(T)):
+                gae_val = delta[t] + args.gamma * args.gae_lambda * (1.0 - dones[t]) * gae_val
+            gae_per_sa[si][ai].append(gae_val.item())
+
+        # Test different numbers of rollouts
+        ms_to_test = sorted(set(
+            [1, 2, 4, 8, max_rollouts] + [max_rollouts // 2]
+        ))
+        ms_to_test = [m for m in ms_to_test if 1 <= m <= max_rollouts]
+
+        # Build method list: MC, TD(5), TD(10), TD(20), TD(50), GAE
+        method_list = [("MC", mc_per_sa)]
+        for n in td_nsteps_ablation:
+            method_list.append((f"TD({n})", td_per_sa[n]))
+        method_list.append(("GAE", gae_per_sa))
+
+        # Header
+        header_names = [name for name, _ in method_list]
+        print(f"\n  {'M':<4}", end="")
+        for name in header_names:
+            print(f" | {name:>8}", end="")
+        print()
+        print(f"  {'─' * (6 + 11 * len(header_names))}")
+
+        def pearson_vs_mc(mc_adv, other_adv, valid):
+            """Per-state Pearson r vs MC."""
+            rs = []
+            for i in range(mc_adv.shape[0]):
+                if not valid[i]:
+                    continue
+                r, _ = sp_stats.pearsonr(mc_adv[i], other_adv[i])
+                rs.append(r)
+            return np.nanmean(rs)
+
+        # Compute advantages for each (method, M) combination
+        adv_cache = {}
+        for m in ms_to_test:
+            for name, per_sa in method_list:
+                adv_m = np.zeros((N, K))
+                for si in range(N):
+                    for ai in range(K):
+                        vals = per_sa[si][ai][:m]
+                        adv_m[si, ai] = np.mean(vals) if vals else 0.0
+                if name == "MC":
+                    adv_m = adv_m - v_mc.numpy()[:, None]
+                adv_cache[(name, m)] = adv_m
+
+        # Table 1: Spearman rho
+        print("  [Spearman rho]")
+        for m in ms_to_test:
+            row = f"  {m:<4}"
+            for name, _ in method_list:
+                rho_mean, _, _ = spearman_vs_mc(mc_adv, adv_cache[(name, m)], valid)
+                row += f" | {rho_mean:>8.3f}"
+            print(row)
+
+        # Table 2: Pearson r
+        print(f"\n  {'M':<4}", end="")
+        for name in header_names:
+            print(f" | {name:>8}", end="")
+        print()
+        print(f"  {'─' * (6 + 11 * len(header_names))}")
+        print("  [Pearson r]")
+        for m in ms_to_test:
+            row = f"  {m:<4}"
+            for name, _ in method_list:
+                r_mean = pearson_vs_mc(mc_adv, adv_cache[(name, m)], valid)
+                row += f" | {r_mean:>8.3f}"
+            print(row)
+
+    # =================================================================
+    # 5. Ranking comparison
     # =================================================================
     print(f"\n{'=' * 60}")
     print("RANKING vs MC (Spearman rho)")
@@ -308,7 +450,7 @@ if __name__ == "__main__":
         print(f"  {name:<18} {rho_mean:>10.3f} {rho_med:>10.3f} {top1:>7.1%}")
 
     # =================================================================
-    # 5. Summary: TD(n) vs Avg(n) vs GAE
+    # 6. Summary: TD(n) vs Avg(n) vs GAE
     # =================================================================
     print(f"\n{'=' * 60}")
     print("SUMMARY: n-step comparison")
@@ -326,7 +468,7 @@ if __name__ == "__main__":
     print(f"  GAE({args.gae_lambda}):   rho = {gae_rho:.3f}")
 
     # =================================================================
-    # 6. Plot
+    # 7. Plot
     # =================================================================
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle("n-step TD vs Simple Average vs GAE: Action Ranking Quality",
