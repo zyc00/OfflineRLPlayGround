@@ -208,6 +208,67 @@ Actor-only training with oracle advantage from optimal policy re-rollouts.
 | Data-efficient (PPO) | GAE + pretrained critic | 93.2% | 50k |
 | Data-efficient (AWR) | MC16 AWR (actor-only) | **98.8%** | 50k |
 
+### 5. Action Ranking Quality: Which Advantage Estimator Ranks Actions Correctly?
+
+Offline analysis: for each eval state, sample K=8 actions, estimate advantage with different methods, measure Spearman rho against MC ground truth (M=10 rollouts). Scripts in `methods/gae/rank_*.py`.
+
+**Core comparison (M=10 rollouts per action):**
+
+| Method | Spearman rho | Top-1 Agree | Notes |
+|--------|-------------|-------------|-------|
+| MC (M=10) | 1.000 | 100% | Ground truth |
+| IQL>traj (bypass Q, use IQL's V + GAE) | 0.958 | 90.5% | Best learned method |
+| GAE (lambda=0.95, MC-supervised V) | 0.931 | 86.4% | Strong baseline |
+| TD(20) | 0.960 | 91.8% | Needs 20 steps |
+| TD(5) | 0.343 | 37.6% | Too few steps |
+| GAE (lambda=0) / TD(1) | 0.071 | 22.7% | 1-step TD is useless |
+| IQL Q-network (tau=0.5) | 0.010 | 12.5% | Random — Q-net fails |
+
+**Why IQL Q-network fails — SNR problem:**
+
+| Metric | Value |
+|--------|-------|
+| Q cross-state variance | 0.265 |
+| Q within-state variance | 0.0001 |
+| SNR ratio | 495x (cross-state dominates) |
+| IQL V quality (Pearson r) | 0.963 (excellent) |
+| IQL Q action ranking | 0.010 (random) |
+
+The Q-network learns V(s) well but cannot resolve the tiny action-dependent residual A(s,a).
+
+**NN regression destroys ranking (rank_nn_regression):**
+
+| Method | rho vs MC | Notes |
+|--------|-----------|-------|
+| Sample GAE (direct from trajectory) | 0.931 | No NN, direct computation |
+| NN(GAE) — NN trained on GAE targets | 0.023 | NN regression destroys it |
+| NN(Q_MC) — NN trained on MC Q targets | -0.005 | Q-scale SNR problem |
+| NN(A_MC) — NN trained on MC A targets | 0.040 | Even with perfect targets |
+
+**Larger networks don't help (rank_network_size):**
+
+| hidden_dim | GAE(0.95) | IQL Q-net | IQL>traj(0.95) |
+|-----------|-----------|-----------|----------------|
+| 256 | 0.931 | 0.007 | 0.960 |
+| 512 | 0.934 | 0.006 | 0.956 |
+| 1024 | 0.934 | 0.010 | 0.954 |
+
+**Effect of rollout count M (rank_nstep_td):**
+
+| M rollouts | MC | TD(50) | GAE(0.95) |
+|-----------|-----|--------|-----------|
+| 1 | 0.300 | 0.258 | 0.270 |
+| 2 | 0.406 | 0.379 | 0.386 |
+| 4 | 0.528 | 0.521 | 0.506 |
+| 8 | 0.701 | 0.696 | 0.671 |
+| 16 | 1.000 | 0.997 | 0.931 |
+
+**Key conclusions:**
+1. **Learned V(s) is excellent; learned Q(s,a) cannot rank actions** — the SNR problem is fundamental, not a capacity issue
+2. **GAE(lambda=0.95) with trajectory rollouts** is the best practical method (rho=0.931) — it uses V only for bootstrapping, not action discrimination
+3. **NN MSE regression on any target** destroys ranking quality (0.931 -> 0.023) — the regression objective doesn't prioritize within-state ordering
+4. **Single rollout (M=1) is unreliable** for all methods (~0.3) — need M>=8 for decent ranking with sparse rewards
+
 ## Research Questions
 
 1. How do different advantage estimators (GAE vs MC vs IQL) compare for offline-to-online finetuning?
