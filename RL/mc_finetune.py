@@ -1,20 +1,24 @@
-"""PPO finetuning with sparse reward for offline-to-online RL.
+"""PPO finetuning with MC-estimated Q-V advantage (no learned baseline).
 
-Finetunes a pretrained policy checkpoint using online PPO.
-Supports GAE, MC1, and MC_M (M>1, with state save/restore) advantage estimation.
+Estimates advantage = Q^π*(s_t, a_t) - V^π*(s_t) via MC re-rollouts:
+  - Q^π*(s_t, a_t): from s_t take a_t (current policy), then follow π* → MC return
+  - V^π*(s_t): from s_t sample action from π*, then follow π* → MC return
+Uses state save/restore for re-rollouts. Supports MC1, MC5, MC10 via --mc_samples.
+
+No critic is trained. Actor-only PPO.
 
 Usage:
-  # GAE (default)
-  python -m RL.ppo_finetune
+  # MC1 (single re-rollout)
+  python -m RL.mc_finetune --mc_samples 1
 
-  # MC1
-  python -m RL.ppo_finetune --advantage_mode mc --exp_name ppo_mc
+  # MC5
+  python -m RL.mc_finetune --mc_samples 5
 
-  # MC3 (3 re-rollouts per state-action pair)
-  python -m RL.ppo_finetune --mc_samples 3
+  # MC10
+  python -m RL.mc_finetune --mc_samples 10
 
-  # 1-env (real-world simulation)
-  python -m RL.ppo_finetune --num_envs 1 --num_minibatches 1
+  # Data-efficient setting
+  python -m RL.mc_finetune --mc_samples 5 --num_envs 50 --num_steps 100 --num_minibatches 5 --update_epochs 20 --target_kl 100.0 --eval_freq 1 --total_timesteps 50000
 """
 
 import os
@@ -22,7 +26,7 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
@@ -31,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
+from tqdm import tqdm
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
@@ -45,18 +50,10 @@ class Args:
     # Finetuning
     checkpoint: str = "runs/pickcube_ppo/ckpt_101.pt"
     """pretrained checkpoint to finetune from"""
-    advantage_mode: Literal["gae", "mc"] = "gae"
-    """advantage estimation: 'gae' (lambda=0.9) or 'mc' (lambda=1.0, pure MC)"""
-    mc_samples: int = 1
-    """number of MC rollout samples per (s,a). >1 uses state save/restore for re-rollouts."""
-    reset_critic: bool = True
-    """reset critic weights (needed when finetuning with different reward mode)"""
-    critic_checkpoint: Optional[str] = None
-    """pretrained critic checkpoint (overrides reset_critic)"""
-    critic_hidden_dim: int = 256
-    """hidden dimension for critic network (only used with reset_critic)"""
-    critic_num_layers: int = 3
-    """number of hidden layers for critic network (only used with reset_critic)"""
+    optimal_checkpoint: str = "runs/pickcube_ppo/ckpt_301.pt"
+    """optimal/converged policy for MC re-rollouts"""
+    mc_samples: int = 5
+    """number of MC re-rollout samples per (s,a). Uses state save/restore."""
 
     # Environment
     env_id: str = "PickCube-v1"
@@ -66,17 +63,14 @@ class Args:
     control_mode: str = "pd_joint_delta_pos"
     max_episode_steps: int = 50
 
-    # PPO hyperparameters
+    # PPO hyperparameters (actor only)
     gamma: float = 0.8
-    gae_lambda: float = 0.9
-    """GAE lambda (overridden to 1.0 when advantage_mode='mc')"""
     learning_rate: float = 3e-4
     num_steps: int = 50
-    """rollout length per iteration (= max_episode_steps for full episodes)"""
+    """rollout length per iteration"""
     num_minibatches: int = 32
     update_epochs: int = 4
     clip_coef: float = 0.2
-    vf_coef: float = 0.5
     ent_coef: float = 0.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.1
@@ -87,8 +81,6 @@ class Args:
     total_timesteps: int = 2_000_000
     eval_freq: int = 5
     """evaluate every N iterations"""
-    warmup_iters: int = 0
-    """iterations to train critic only (no policy update). Useful with reset_critic."""
     seed: int = 1
     cuda: bool = True
 
@@ -106,27 +98,19 @@ class Args:
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
-    # Override gae_lambda for MC mode (including mc_samples > 1)
-    if args.advantage_mode == "mc" or args.mc_samples > 1:
-        args.gae_lambda = 1.0
-        args.advantage_mode = "mc"
-
     args.batch_size = args.num_envs * args.num_steps
     args.minibatch_size = args.batch_size // args.num_minibatches
     args.num_iterations = args.total_timesteps // args.batch_size
 
     if args.exp_name is None:
-        if args.mc_samples > 1:
-            args.exp_name = f"ppo_mc{args.mc_samples}"
-        else:
-            args.exp_name = f"ppo_{args.advantage_mode}"
+        args.exp_name = f"mc{args.mc_samples}_raw"
     run_name = f"{args.exp_name}__seed{args.seed}__{int(time.time())}"
 
-    mode_str = f"MC{args.mc_samples}" if args.mc_samples > 1 else args.advantage_mode.upper()
-    print(f"=== PPO Finetuning ({mode_str}) ===")
+    print(f"=== PPO Finetuning (Raw MC{args.mc_samples}, no baseline, optimal rollout) ===")
     print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  Reward: {args.reward_mode}")
-    print(f"  GAE lambda: {args.gae_lambda}, MC samples: {args.mc_samples}")
+    print(f"  Optimal policy: {args.optimal_checkpoint}")
+    print(f"  Reward: {args.reward_mode}, gamma: {args.gamma}")
+    print(f"  MC samples: {args.mc_samples}")
     print(f"  Envs: {args.num_envs}, Steps: {args.num_steps}")
     print(f"  Batch: {args.batch_size}, Minibatch: {args.minibatch_size}")
     print(f"  Iterations: {args.num_iterations}")
@@ -181,31 +165,21 @@ if __name__ == "__main__":
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
 
-    # ── Agent setup ────────────────────────────────────────────────────
+    # ── Agent setup (actor only — critic exists but is not trained) ────
     agent = Agent(envs).to(device)
     agent.load_state_dict(torch.load(args.checkpoint, map_location=device))
     print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    if args.critic_checkpoint is not None:
-        # Load pretrained critic for sparse reward
-        critic_state = torch.load(args.critic_checkpoint, map_location=device)
-        agent.critic.load_state_dict(critic_state)
-        print(f"  Loaded pretrained critic: {args.critic_checkpoint}")
-    elif args.reset_critic:
-        # Reinitialize critic — pretrained critic learned dense reward values,
-        # which are wrong for sparse reward and cause policy collapse.
-        from data.data_collection.ppo import layer_init
-        h = args.critic_hidden_dim
-        obs_dim = np.array(envs.single_observation_space.shape).prod()
-        layers = [layer_init(nn.Linear(obs_dim, h)), nn.Tanh()]
-        for _ in range(args.critic_num_layers - 1):
-            layers += [layer_init(nn.Linear(h, h)), nn.Tanh()]
-        layers.append(layer_init(nn.Linear(h, 1)))
-        agent.critic = nn.Sequential(*layers).to(device)
-        n_params = sum(p.numel() for p in agent.critic.parameters())
-        print(f"  Critic reset: {args.critic_num_layers}x{h} ({n_params:,} params)")
+    # Load optimal policy for MC re-rollouts (frozen, not trained)
+    optimal_agent = Agent(envs).to(device)
+    optimal_agent.load_state_dict(torch.load(args.optimal_checkpoint, map_location=device))
+    optimal_agent.eval()
+    print(f"  Loaded optimal policy: {args.optimal_checkpoint}")
 
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # Only optimize actor parameters (actor_mean + actor_logstd)
+    actor_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd]
+    optimizer = optim.Adam(actor_params, lr=args.learning_rate, eps=1e-5)
+    print(f"  Actor params: {sum(p.numel() for p in actor_params):,}")
 
     action_low = torch.from_numpy(envs.single_action_space.low).to(device)
     action_high = torch.from_numpy(envs.single_action_space.high).to(device)
@@ -213,28 +187,25 @@ if __name__ == "__main__":
     def clip_action(a):
         return torch.clamp(a.detach(), action_low, action_high)
 
-    # ── MC re-rollout helpers (for mc_samples > 1) ────────────────────
-    use_mc_rerollout = args.mc_samples > 1
+    # ── MC re-rollout helpers ──────────────────────────────────────────
+    _zero_action = torch.zeros(
+        args.num_envs, *envs.single_action_space.shape, device=device
+    )
 
-    if use_mc_rerollout:
-        _zero_action = torch.zeros(
-            args.num_envs, *envs.single_action_space.shape, device=device
-        )
+    def _clone_state(state_dict):
+        """Deep clone a nested state dict of tensors."""
+        if isinstance(state_dict, dict):
+            return {k: _clone_state(v) for k, v in state_dict.items()}
+        return state_dict.clone()
 
-        def _clone_state(state_dict):
-            """Deep clone a nested state dict of tensors."""
-            if isinstance(state_dict, dict):
-                return {k: _clone_state(v) for k, v in state_dict.items()}
-            return state_dict.clone()
-
-        def _restore_state(state_dict, seed=None):
-            """Restore env state with PhysX contact warmup."""
-            envs.reset(seed=seed if seed is not None else args.seed)
-            envs.base_env.set_state_dict(state_dict)
-            envs.base_env.step(_zero_action)
-            envs.base_env.set_state_dict(state_dict)
-            envs.base_env._elapsed_steps[:] = 0
-            return envs.base_env.get_obs()
+    def _restore_state(state_dict, seed=None):
+        """Restore env state with PhysX contact warmup."""
+        envs.reset(seed=seed if seed is not None else args.seed)
+        envs.base_env.set_state_dict(state_dict)
+        envs.base_env.step(_zero_action)
+        envs.base_env.set_state_dict(state_dict)
+        envs.base_env._elapsed_steps[:] = 0
+        return envs.base_env.get_obs()
 
     # ── Logger ─────────────────────────────────────────────────────────
     writer = SummaryWriter(f"runs/{run_name}")
@@ -256,7 +227,6 @@ if __name__ == "__main__":
     logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
     rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
-    values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     # ── Training loop ──────────────────────────────────────────────────
     global_step = 0
@@ -265,7 +235,6 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs, device=device)
 
     for iteration in range(1, args.num_iterations + 1):
-        final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
 
         # ── Evaluation ─────────────────────────────────────────────
@@ -307,20 +276,17 @@ if __name__ == "__main__":
                     f"runs/{run_name}/ckpt_{iteration}.pt",
                 )
 
-        # ── Rollout ────────────────────────────────────────────────
+        # ── Rollout (save states for re-rollout) ──────────────────
         rollout_t0 = time.time()
-        if use_mc_rerollout:
-            saved_states = []
+        saved_states = []
         for step in range(args.num_steps):
             global_step += args.num_envs
-            if use_mc_rerollout:
-                saved_states.append(_clone_state(envs.base_env.get_state_dict()))
+            saved_states.append(_clone_state(envs.base_env.get_state_dict()))
             obs[step] = next_obs
             dones[step] = next_done
 
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action, logprob, _, _ = agent.get_action_and_value(next_obs)
             actions[step] = action
             logprobs[step] = logprob
 
@@ -336,127 +302,102 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         f"train/{k}", v[done_mask].float().mean(), global_step
                     )
-                with torch.no_grad():
-                    final_values[
-                        step,
-                        torch.arange(args.num_envs, device=device)[done_mask],
-                    ] = agent.get_value(
-                        infos["final_observation"][done_mask]
-                    ).view(-1)
 
         rollout_time = time.time() - rollout_t0
 
-        # ── Compute advantages ─────────────────────────────────────
-        if use_mc_rerollout:
-            # MC_M: re-rollout from each (s_t, a_t) M times via state save/restore
-            end_state = _clone_state(envs.base_env.get_state_dict())
-            end_elapsed = envs.base_env._elapsed_steps.clone()
-            end_obs = next_obs.clone()
-            end_done = next_done.clone()
+        # ── MC re-rollout: estimate Q(s,a) and V(s) separately ───
+        end_state = _clone_state(envs.base_env.get_state_dict())
+        end_elapsed = envs.base_env._elapsed_steps.clone()
+        end_obs = next_obs.clone()
+        end_done = next_done.clone()
 
-            rerollout_t0 = time.time()
-            mc_returns = torch.zeros((args.num_steps, args.num_envs), device=device)
+        rerollout_t0 = time.time()
+        mc_q = torch.zeros((args.num_steps, args.num_envs), device=device)
+        mc_v = torch.zeros((args.num_steps, args.num_envs), device=device)
 
-            with torch.no_grad():
-                for t in range(args.num_steps):
-                    step_rets = []
-                    for m in range(args.mc_samples):
-                        obs_r = _restore_state(saved_states[t], seed=args.seed + m)
+        with torch.no_grad():
+            for t in tqdm(range(args.num_steps), desc=f"  MC re-rollout iter {iteration}", leave=False):
+                # ── Estimate Q^π*(s_t, a_t): take a_t, then follow π* ──
+                q_rets = []
+                for m in range(args.mc_samples):
+                    obs_r = _restore_state(saved_states[t], seed=args.seed + m)
 
-                        # Take the same action as in the original rollout
-                        obs_r, rew, term, trunc, _ = envs.step(clip_action(actions[t]))
-                        ep_rews = [rew.view(-1) * args.reward_scale]
-                        env_done = (term | trunc).view(-1).bool()
+                    # Take the SAME action as current policy's rollout
+                    obs_r, rew, term, trunc, _ = envs.step(clip_action(actions[t]))
+                    ep_rews = [rew.view(-1) * args.reward_scale]
+                    env_done = (term | trunc).view(-1).bool()
 
-                        # Follow policy until all envs done
-                        for _ in range(args.max_episode_steps - 1):
-                            if env_done.all():
-                                break
-                            a = agent.get_action(obs_r, deterministic=False)
-                            obs_r, rew, term, trunc, _ = envs.step(clip_action(a))
-                            ep_rews.append(
-                                rew.view(-1) * args.reward_scale * (~env_done).float()
-                            )
-                            env_done = env_done | (term | trunc).view(-1).bool()
+                    # Follow optimal policy until done
+                    for _ in range(args.max_episode_steps - 1):
+                        if env_done.all():
+                            break
+                        a = optimal_agent.get_action(obs_r, deterministic=False)
+                        obs_r, rew, term, trunc, _ = envs.step(clip_action(a))
+                        ep_rews.append(
+                            rew.view(-1) * args.reward_scale * (~env_done).float()
+                        )
+                        env_done = env_done | (term | trunc).view(-1).bool()
 
-                        # Discounted return (backward sum)
-                        ret = torch.zeros(args.num_envs, device=device)
-                        for s in reversed(range(len(ep_rews))):
-                            ret = ep_rews[s] + args.gamma * ret
-                        step_rets.append(ret)
+                    ret = torch.zeros(args.num_envs, device=device)
+                    for s in reversed(range(len(ep_rews))):
+                        ret = ep_rews[s] + args.gamma * ret
+                    q_rets.append(ret)
 
-                    mc_returns[t] = torch.stack(step_rets).mean(dim=0)
+                mc_q[t] = torch.stack(q_rets).mean(dim=0)
 
-            rerollout_time = time.time() - rerollout_t0
+                # ── Estimate V^π*(s_t): sample action from π*, then follow π* ──
+                v_rets = []
+                for m in range(args.mc_samples):
+                    obs_r = _restore_state(saved_states[t], seed=args.seed + args.mc_samples + m)
 
-            # Restore end-of-rollout state for next iteration
-            _restore_state(end_state, seed=args.seed)
-            envs.base_env._elapsed_steps[:] = end_elapsed
-            next_obs = end_obs
-            next_done = end_done
+                    # Sample action from OPTIMAL policy (not current policy's a_t)
+                    a_opt = optimal_agent.get_action(obs_r, deterministic=False)
+                    obs_r, rew, term, trunc, _ = envs.step(clip_action(a_opt))
+                    ep_rews = [rew.view(-1) * args.reward_scale]
+                    env_done = (term | trunc).view(-1).bool()
 
-            advantages = mc_returns - values
-            returns = mc_returns
+                    # Follow optimal policy until done
+                    for _ in range(args.max_episode_steps - 1):
+                        if env_done.all():
+                            break
+                        a = optimal_agent.get_action(obs_r, deterministic=False)
+                        obs_r, rew, term, trunc, _ = envs.step(clip_action(a))
+                        ep_rews.append(
+                            rew.view(-1) * args.reward_scale * (~env_done).float()
+                        )
+                        env_done = env_done | (term | trunc).view(-1).bool()
 
-            writer.add_scalar("time/rerollout", rerollout_time, global_step)
-        else:
-            # Standard GAE/MC1 advantage computation
-            with torch.no_grad():
-                next_value = agent.get_value(next_obs).reshape(1, -1)
-                advantages = torch.zeros_like(rewards)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        next_not_done = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        next_not_done = 1.0 - dones[t + 1]
-                        nextvalues = values[t + 1]
-                    real_next_values = next_not_done * nextvalues + final_values[t]
-                    delta = rewards[t] + args.gamma * real_next_values - values[t]
-                    advantages[t] = lastgaelam = (
-                        delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
-                    )
-                returns = advantages + values
+                    ret = torch.zeros(args.num_envs, device=device)
+                    for s in reversed(range(len(ep_rews))):
+                        ret = ep_rews[s] + args.gamma * ret
+                    v_rets.append(ret)
+
+                mc_v[t] = torch.stack(v_rets).mean(dim=0)
+
+        rerollout_time = time.time() - rerollout_t0
+
+        # Restore end-of-rollout state for next iteration
+        _restore_state(end_state, seed=args.seed)
+        envs.base_env._elapsed_steps[:] = end_elapsed
+        next_obs = end_obs
+        next_done = end_done
+
+        # Advantage = Q^π*(s_t, a_t) - V^π*(s_t)
+        advantages = mc_q - mc_v
+
+        writer.add_scalar("time/rerollout", rerollout_time, global_step)
+        writer.add_scalar("charts/mc_q_mean", mc_q.mean().item(), global_step)
+        writer.add_scalar("charts/mc_v_mean", mc_v.mean().item(), global_step)
+        writer.add_scalar("charts/advantage_mean", advantages.mean().item(), global_step)
+        writer.add_scalar("charts/advantage_std", advantages.std().item(), global_step)
 
         # ── Flatten batch ──────────────────────────────────────────
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
 
-        # ── Critic warmup: train only value function, skip policy ──
-        if iteration <= args.warmup_iters:
-            agent.train()
-            update_t0 = time.time()
-            for epoch in range(args.update_epochs):
-                perm = torch.randperm(args.batch_size, device=device)
-                for start in range(0, args.batch_size, args.minibatch_size):
-                    mb_inds = perm[start : start + args.minibatch_size]
-                    newvalue = agent.get_value(b_obs[mb_inds]).view(-1)
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-                    optimizer.zero_grad()
-                    v_loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                    optimizer.step()
-            update_time = time.time() - update_t0
-
-            y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-            print(
-                f"  [warmup {iteration}/{args.warmup_iters}] "
-                f"v_loss={v_loss.item():.6f}, explained_var={explained_var:.4f}"
-            )
-            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-            writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            writer.add_scalar("time/rollout", rollout_time, global_step)
-            writer.add_scalar("time/update", update_time, global_step)
-            continue
-
-        # ── PPO update ─────────────────────────────────────────────
+        # ── PPO update (actor only) ───────────────────────────────
         agent.train()
         b_inds = np.arange(args.batch_size)
         clipfracs = []
@@ -468,7 +409,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                _, newlogprob, entropy, _ = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -489,24 +430,19 @@ if __name__ == "__main__":
                         mb_advantages.std() + 1e-8
                     )
 
-                # Policy loss
+                # Policy loss (no value loss)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(
                     ratio, 1 - args.clip_coef, 1 + args.clip_coef
                 )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
-                newvalue = newvalue.view(-1)
-                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                # Total loss
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(actor_params, args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
@@ -515,16 +451,10 @@ if __name__ == "__main__":
         update_time = time.time() - update_t0
 
         # ── Logging ────────────────────────────────────────────────
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
         sps = int(global_step / (time.time() - start_time))
         writer.add_scalar("charts/SPS", sps, global_step)
         writer.add_scalar("time/rollout", rollout_time, global_step)
