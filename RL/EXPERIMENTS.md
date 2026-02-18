@@ -28,10 +28,10 @@ We compare two key dimensions:
 Standard scale: batch=25,600, update_epochs=4, target_kl=0.1.
 Both GAE and MC1 are **on-policy** (advantage computed from current policy rollout).
 
-| Method | Source | 100k | 500k | 1M | Peak SR | Steps to 100% |
-|--------|--------|------|------|-----|---------|---------------|
+| Method | Source | ~128k | ~512k | ~1M | Peak SR | Steps to 100% |
+|--------|--------|-------|-------|------|---------|---------------|
 | **GAE** (λ=0.9) | on-policy | 54.2% | 93.1% | 97.4% | 99.3% | never |
-| **MC1** (λ=1.0) | on-policy | 46.2% | 94.1% | 98.8% | **100%** | 1.2M |
+| **MC1** (λ=1.0) | on-policy | 56.5% | 94.1% | 98.8% | **100%** | 1.2M |
 
 - Both reach ~98-99% SR, MC1 slightly faster to peak
 - MC1 is GAE with λ=1.0 (no bootstrapping, pure MC return minus baseline)
@@ -94,14 +94,16 @@ Uses **optimal policy (ckpt_301)** for MC re-rollouts to estimate:
 
 No critic network trained. Actor-only updates.
 
-### MC Q-V + PPO update (50 envs x 100 steps)
+### MC Q-V + PPO update (mixed configs, see notes)
 
-| Config | MC samples | 5k | 15k | 25k | 35k | 45k | Peak |
-|--------|-----------|-----|------|------|------|------|------|
-| mc1_qv_optimal | 1 | 73.2% | 70.8% | 78.4% | 83.4% | 86.6% | 90.0% |
-| mc1_qv_parallel (run 1) | 1 | 61.7% | 78.3% | 85.2% | 81.0% | 91.0% | 91.0% |
-| mc1_qv_parallel (run 2) | 1 | 69.2% | 80.6% | 87.4% | 89.0% | **94.8%** | **95.8%** |
-| mc16_qv_parallel | 16 | 68.9% | 78.6% | 90.5% | 92.6% | - | 93.9% |
+| Config | MC samples | Envs×Steps | 5k | 15k | 25k | 35k | 45k | Peak |
+|--------|-----------|------------|-----|------|------|------|------|------|
+| mc1_qv_optimal | 1 | 50×100 | 73.2% | 70.8% | 78.4% | 83.4% | 86.6% | 90.0% |
+| mc1_qv_parallel | 1 | unknown | 61.7% | 78.3% | 85.2% | 81.0% | 91.0% | 91.0% |
+| mc5_qv_par (mislabeled mc1) | **5** | 100×50 | 69.2% | 80.6% | 87.4% | 89.0% | **94.8%** | **95.8%** |
+| mc16_qv_parallel | 16 | 100×50 | 68.9% | 78.6% | 90.5% | 92.6% | - | 93.9% |
+
+Note: `mc5_qv_par` run name is `mc1_qv_par` but experiment log confirms mc_samples=5.
 
 ### MC Q-V + AWR update (100 envs x 50 steps, epoch=200)
 
@@ -140,9 +142,10 @@ Raw MC return as advantage (without Q-V subtraction) has **too much variance**.
 | Config | Epochs | 5k | 15k | 25k | 35k | 45k |
 |--------|--------|-----|------|------|------|------|
 | GAE 100env epoch=100 | 100 | 60.0% | 72.5% | 78.3% | 86.7% | **92.0%** |
-| GAE 100env warmup=10 | 20 | 61.4% | 57.1% | 52.7% | 56.1% | 66.9% |
+| GAE 100env warmup=10 | 20 | 61.4%* | 57.1%* | 52.7%* | 56.1%* | 66.9%* |
 
-The warmup=10 run eventually reaches 98.8% but needs **370k steps** (vs 45k for MC AWR).
+\* warmup=10 run uses eval_freq=2 and total_timesteps>>50k; columns show values at matching iteration counts, not step counts.
+This run eventually reaches 98.8% but needs **370k steps** (vs 45k for MC AWR).
 
 ---
 
@@ -155,14 +158,14 @@ All at ~50k total timesteps, ~1000 trajectories, starting from 62.7% SR:
 | 1 | GAE (λ=0.9) | on-policy | PPO (epoch=20) | 74.8% | 93.2% | 93.2% |
 | 2 | GAE (λ=0.9) | on-policy | PPO (epoch=100) | 78.3% | 92.0% | 92.0% |
 | 3 | MC1 (λ=1.0) | on-policy | PPO (epoch=20) | 80.9% | 89.0% | 89.0% |
-| 4 | MC1 Q-V | optimal π* | PPO (epoch=20) | 87.4% | **94.8%** | **95.8%** |
+| 4 | MC5 Q-V | optimal π* | PPO (epoch=100) | 87.4% | **94.8%** | **95.8%** |
 | 5 | MC16 Q-V | optimal π* | PPO (epoch=200) | 90.5% | - | 93.9% |
 | 6 | **MC16 Q-V** | optimal π* | AWR (epoch=200) | 96.4% | **98.8%** | **98.8%** |
 
 ### Key findings
 
 1. **Optimal-policy MC > On-policy GAE** when using Q-V advantage:
-   - MC1 Q-V optimal (94.8%) > GAE on-policy (93.2%) with same PPO update
+   - MC5 Q-V optimal (94.8%, 100env, epoch=100) > GAE on-policy (93.2%, 50env, epoch=20)
    - MC16 AWR optimal (**98.8%**) >> GAE on-policy (93.2%)
 
 2. **On-policy MC1 < On-policy GAE** in data-efficient regime:
@@ -179,7 +182,7 @@ All at ~50k total timesteps, ~1000 trajectories, starting from 62.7% SR:
    - V(s) baseline dramatically reduces variance
 
 5. **More MC samples help but diminishing returns**:
-   - MC1 PPO → MC16 AWR: 94.8% → 98.8% (+4%)
+   - MC5 PPO → MC16 AWR: 94.8% → 98.8% (+4%)
    - MC16 PPO: 93.9% (not better than MC16 AWR due to PPO clipping bottleneck)
 
 6. **AWR beta=0.3 converges fastest**:
@@ -233,7 +236,8 @@ GAE (learned V)           93.2% (PPO, 50env)         N/A
 
 MC1 (raw return - V)      89.0% (PPO, 50env)         77.4% (raw, no Q-V)
 
-MC1 Q-V                   N/A                         90.0-94.8% (PPO, 50env)
+MC1 Q-V                   N/A                         90.0% (PPO, mc1, 50env)
+MC5 Q-V                   N/A                         94.8% (PPO, mc5, 100env)
 
 MC16 Q-V                  N/A                         98.8% (AWR, 100env)  ← BEST
 
