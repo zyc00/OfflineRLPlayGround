@@ -4,42 +4,57 @@ Offline-to-online RL finetuning research platform built on [ManiSkill](https://g
 
 ## Experiment Plan
 
-**Established finding**: MC-N (large N) + AWR achieves highly data-efficient online finetuning (MC16 AWR 98.8% @ 50k steps), significantly outperforming PPO.
+**Established finding**: MC-N (large N) + AWR achieves highly data-efficient online finetuning (MC16 AWR **99.2%** @ 50k steps with beta=0.5), significantly outperforming PPO (92.0%).
 
-### Phase 1: How Much Does Online Finetuning Actually Help?
+### Phase 1: How Much Does Online Finetuning Actually Help? — COMPLETED
 
 **Core question**: Compare pure offline vs offline-to-online — is the online improvement worth the extra environment interaction cost?
 
-| Experiment | Method | Goal |
-|------------|--------|------|
-| 1a | Pure offline (AWR/IQL on offline data) | Establish offline-only baseline |
-| 1b | Offline + online MC16 AWR (current best) | Quantify incremental gain from online phase |
-| 1c | Varying online budget (10k/25k/50k steps) | Plot online budget vs SR curve, find the cost-effectiveness inflection point |
+| Experiment | Method | Status | Result |
+|------------|--------|--------|--------|
+| 1a | Pure offline AWR (one-shot data, fixed training) | **DONE** | 85.3% peak (mc5 beta=1.0) |
+| 1b | Online MC16 AWR (iterative re-rollout, best config) | **DONE** | **99.2%** peak (mc16 beta=0.5) |
+| 1c | On-policy AWR (no oracle, current policy re-rollout) | **DONE** | 95.1% peak (mc5 beta=0.5) |
 
-**Expected output**: Online budget vs Success Rate curve, clearly answering "how much online interaction yields how much improvement".
+**Conclusions**:
+- Online iterative re-rollout adds **+14%** over offline (99.2% vs 85.3%) — the iterative data adaptation is the critical ingredient
+- Optimal policy re-rollout adds **+4%** over on-policy (99.2% vs 95.1%) — access to pi* is helpful but not essential
+- On-policy AWR (95.1%) still outperforms GAE PPO (92.0%) — AWR update rule tolerates many more gradient steps than PPO
+- Offline AWR plateaus quickly and is unstable — fixed dataset doesn't adapt to improving policy
+- More MC samples of a suboptimal policy doesn't help: on-policy mc5 ≈ mc16 (~95%)
 
-### Phase 2: How to Train an Optimal Critic?
+### Phase 2: How to Train an Optimal Critic? — COMPLETED (negative result)
 
 **Core question**: The current MC Q-V method relies on an optimal policy for re-rollout, which is unavailable in practice. Can we train a critic from pure offline data that approximates the optimal critic?
 
-**Evaluation metric**: How closely the trained critic's advantage approximates optimal-policy MC Q-V advantage (the oracle advantage verified to improve efficiency).
+**Evaluation metric**: Spearman rho of learned advantage vs MC oracle advantage (within-state action ranking quality).
 
-| Experiment | Method | Evaluation |
-|------------|--------|------------|
-| 2a | Q-learning variants (CQL, IQL with aggressive tau) | Spearman ρ vs MC oracle ranking |
-| 2b | TD(N) with large N + offline data | Can large N compensate for bootstrapping error? |
-| 2c | NN regression on MC targets (larger networks / better losses) | Upper bound exploration beyond current SNR bottleneck |
-| 2d | Replace oracle re-rollout with trained critic for AWR finetuning | End-to-end validation: critic quality → finetuning SR |
+| Experiment | Method | Status | Result |
+|------------|--------|--------|--------|
+| 2a | IQL Q-learning (tau=0.5, with heavy tuning) | **DONE** | rho=0.18 (vs GAE 0.93). Q-net learns V(s) well but cannot resolve action-dependent residual (SNR ~1:500) |
+| 2b | TD(N) with large N | **DONE** | TD(20): rho=0.96, TD(5): 0.34, TD(1): 0.07. Large N works but requires trajectory rollout (defeats purpose of offline critic) |
+| 2c | NN regression on MC targets | **DONE** | Regression destroys ranking: 0.93→0.02. Heavy tuning (10x512, scale=20, 4000ep) gets 0.73, still below GAE (0.86) |
+| 2d | V* (optimal critic) for PPO finetuning | **DONE** | V* 83.3% vs V^pi_expert 93.2% — distribution mismatch: V* trained on pi* states doesn't generalize to pi_0 states |
 
-**Known challenges**:
-- Action-dependent signal in Q(s,a) (SNR ~1:500) is dwarfed by state-dependent signal
-- NN MSE regression destroys within-state ranking (0.931 → 0.023)
-- IQL Q-net after heavy tuning only reaches ρ=0.18, far below GAE (ρ=0.93)
+**Conclusions**:
+- **Learned V(s) is excellent; learned Q(s,a) cannot rank actions** — the SNR problem (cross-state variance 500x > within-state variance) is fundamental, not a capacity issue
+- **GAE with trajectory rollouts is the best practical method** (rho=0.93) — uses V only for bootstrapping, not action discrimination
+- **NN MSE regression on any target destroys ranking** (0.93→0.02) — MSE doesn't prioritize within-state ordering
+- **Heavy tuning can partially rescue Q regression** (0.01→0.73 with MC targets, 0.01→0.18 with TD targets), but **GAE always wins** without needing a Q-network
+- **V* suffers from distribution mismatch** — training a generalizable optimal critic from offline data remains an open problem
+- **Larger networks don't help** — 256/512/1024 hidden dims all yield similar Q ranking (~0.01)
 
-**Potential directions**:
-- Contrastive/ranking loss instead of MSE to directly optimize within-state ordering
-- Two-stage training: first learn V(s), then learn residual A(s,a) = Q - V
-- Leverage action diversity in offline data to construct pairwise comparisons
+### Phase 3: Next Directions (TODO)
+
+**Open questions from Phase 1-2 findings**:
+
+| Direction | Motivation |
+|-----------|-----------|
+| Contrastive/ranking loss for Q | MSE destroys ranking — directly optimize within-state action ordering |
+| Two-stage V then A=Q-V | V is easy to learn (rho=0.96); isolate the hard residual A(s,a) |
+| Pairwise action comparisons from offline data | Leverage action diversity without needing absolute Q values |
+| Generalized V* across state distributions | Solve distribution mismatch: train on diverse policy states |
+| AWR with learned (non-oracle) advantage | Bridge gap: on-policy AWR (95%) → oracle AWR (99%) using better offline critic |
 
 ## Setup
 
@@ -60,7 +75,9 @@ RL/                          # Training scripts (entry points)
   ppo_finetune.py            # PPO finetuning (GAE or MC advantage)
   mc_finetune.py             # MC Q-V advantage + PPO update
   mc_finetune_parallel.py    # Parallel MC re-rollout + PPO
-  mc_finetune_awr_parallel.py  # Parallel MC + AWR update
+  mc_finetune_awr_parallel.py  # Parallel MC + AWR update (optimal policy)
+  mc_finetune_awr_onpolicy.py  # Parallel MC + AWR (current policy)
+  mc_finetune_awr_offline.py   # Offline AWR (fixed dataset)
   mc_finetune_awr_recap.py   # Parallel MC + RECAP-style AWR
   iql_finetune.py            # PPO with IQL/SARSA-learned Q,V
   awr_finetune.py            # AWR finetuning (actor-critic)
@@ -239,15 +256,73 @@ Actor-only training with oracle advantage from optimal policy re-rollouts.
 - AWR converges faster than PPO (no importance ratio drift, tolerates more epochs)
 - MC re-rollout advantage > GAE advantage (~3-6% gap)
 
+### 5. AWR Ablation: Beta, MC Samples, Gamma (100 envs, 50k timesteps)
+
+Systematic hyperparameter sweep for AWR with optimal-policy MC Q-V advantage. Base config: 100 envs, 50 steps, update_epochs=200, gamma=0.8.
+
+**Beta sweep** (mc16, gamma=0.8):
+
+| beta | Peak SR | Final SR |
+|------|---------|----------|
+| 0.1 | 97.5% | 96.8% |
+| 0.3 | 98.8% | 98.8% |
+| **0.5** | **99.2%** | 97.7% |
+| 1.0 | 98.8% | 98.8% |
+| 2.0 | 98.0% | 96.5% |
+
+**MC samples sweep** (beta=0.5, gamma=0.8):
+
+| mc_samples | Peak SR | Final SR |
+|------------|---------|----------|
+| 1 | 97.5% | 94.9% |
+| 5 | 98.0% | 95.2% |
+| **16** | **99.2%** | 97.7% |
+
+**Gamma sweep** (mc16, beta=0.5):
+
+| gamma | Peak SR | Final SR |
+|-------|---------|----------|
+| **0.8** | **99.2%** | 97.7% |
+| 0.9 | 99.05% | 99.05% |
+| 0.95 | 97.95% | 97.06% |
+| 0.99 | 97.52% | 97.52% |
+
+- AWR is robust across beta (97.5%–99.2%). Best: beta=0.5 (sweet spot between greedy and uniform)
+- More MC samples = better advantage estimation: mc1 (97.5%) → mc16 (99.2%)
+- gamma=0.8 optimal for 50-step episodes; gamma=0.9 best stability (peak=final=99.05%)
+- Best config: **mc16, beta=0.5, gamma=0.8 → 99.2% peak SR**
+
+### 6. Online vs Offline vs On-Policy AWR
+
+Tests three axes: (1) iterative online re-rollout vs one-shot offline training, (2) optimal policy vs current policy for MC re-rollout.
+
+| Method | Re-rollout Policy | Data | mc_samples | Peak SR | Final SR |
+|--------|-------------------|------|------------|---------|----------|
+| **Online AWR** | optimal (pi*) | iterative | 16 | **99.2%** | 97.7% |
+| **Online AWR** | optimal (pi*) | iterative | 5 | 98.0% | 95.2% |
+| On-policy AWR | current (pi) | iterative | 5 | 95.1% | 95.1% |
+| On-policy AWR | current (pi) | iterative | 16 | 94.9% | 94.6% |
+| GAE PPO | - | iterative | - | 92.0% | 92.0% |
+| Offline AWR | optimal (pi*) | fixed | 5 | 85.3% | 77.5% |
+| Offline AWR | optimal (pi*) | fixed | 16 | 81.0% | 79.7% |
+
+- **Online >> Offline**: iterative re-rollout adds ~14% (99.2% vs 85.3%)
+- **Optimal >> On-policy**: using pi* for re-rollouts adds ~4% (99.2% vs 95.1%)
+- On-policy mc5 ≈ mc16 (~95%) — more samples of a suboptimal policy doesn't help
+- On-policy AWR (~95%) still beats standard GAE PPO (92.0%)
+- Key insight: the iterative re-rollout (adapting data to improving policy) is the critical ingredient, not just the AWR loss
+
 ### Summary: Best Configs by Regime
 
 | Regime | Best Method | Peak SR | Total Timesteps |
 |--------|-------------|---------|-----------------|
 | Large-scale | MC1 PPO (gamma=0.8) | 100% | 2M |
 | Data-efficient (PPO) | GAE + pretrained critic | 93.2% | 50k |
-| Data-efficient (AWR) | MC16 AWR (actor-only) | **98.8%** | 50k |
+| Data-efficient (AWR) | MC16 AWR (beta=0.5, actor-only) | **99.2%** | 50k |
+| On-policy AWR (no oracle) | On-policy MC AWR | 95.1% | 50k |
+| Offline AWR | Offline MC5 AWR | 85.3% | 50k (one-shot) |
 
-### 5. Action Ranking Quality: Which Advantage Estimator Ranks Actions Correctly?
+### 7. Action Ranking Quality: Which Advantage Estimator Ranks Actions Correctly?
 
 Offline analysis: for each eval state, sample K=8 actions, estimate advantage with different methods, measure Spearman rho against MC ground truth (M=10 rollouts). Scripts in `methods/gae/rank_*.py`.
 
@@ -336,7 +411,9 @@ IQL's Q-network improves with tuning but plateaus at ~0.18 (vs MC regression's 0
 
 ## Research Questions
 
-1. How do different advantage estimators (GAE vs MC vs IQL) compare for offline-to-online finetuning?
-2. Does explicitly pushing away bad actions (RECAP) outperform soft down-weighting (AWR)?
-3. What role does the policy (deterministic vs stochastic) play in real-world RL?
-4. How does advantage estimation quality scale with MC samples?
+1. **How do different advantage estimators compare for finetuning?** — ANSWERED: MC Q-V (oracle) >> GAE > MC1. AWR update rule >> PPO for data efficiency. Best: MC16 AWR = 99.2% @ 50k steps.
+2. **Does online finetuning help over offline?** — ANSWERED: +14% (99.2% vs 85.3%). Iterative data adaptation is the critical ingredient.
+3. **Is access to optimal policy necessary?** — ANSWERED: +4% benefit (99.2% vs 95.1%). Helpful but not essential — on-policy AWR still beats GAE PPO.
+4. **Can we learn Q(s,a) that ranks actions from offline data?** — ANSWERED (negative): SNR problem is fundamental. Q-net learns V(s) (r=0.96) but cannot resolve A(s,a) (rho=0.01→0.18 with heavy tuning). GAE with V-only is always better.
+5. Does explicitly pushing away bad actions (RECAP) outperform soft down-weighting (AWR)? — OPEN
+6. How does advantage estimation quality scale with MC samples? — ANSWERED: mc1 (97.5%) → mc16 (99.2%). More samples help with optimal policy, but not with suboptimal policy.
