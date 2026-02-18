@@ -263,11 +263,37 @@ The Q-network learns V(s) well but cannot resolve the tiny action-dependent resi
 | 8 | 0.701 | 0.696 | 0.671 |
 | 16 | 1.000 | 0.997 | 0.931 |
 
+**Can heavy tuning fix Q regression? (rank_qv_regression):**
+
+MC-supervised Q regression with aggressive tuning (scale_factor=20, action_repeat=8, normalize, 10-layer 512-dim network, 4000 epochs):
+
+| Config | Q-V ranking (mean) | Q-V ranking (med) | GAE ranking (mean) | GAE ranking (med) |
+|--------|-------|--------|-------|--------|
+| Default (3x256, 200ep) | -0.011 | 0.024 | 0.723 | 0.905 |
+| **Tuned** (10x512, norm, repeat=8, scale=20, 4000ep) | **0.726** | **0.898** | **0.862** | **0.952** |
+
+Q ranking improved from random to 0.73/0.90, but still below GAE (0.86/0.95). Required 2.4M params on 3712 samples (645x overparameterized) + MC ground-truth targets.
+
+**Can IQL match MC via tuning? (rank_iql_tune):**
+
+IQL's TD-based training with same tuning knobs — the practical question is whether TD bootstrapping can match MC regression:
+
+| Config | Q_nn-V_nn (mean) | Q_nn-V_nn (med) | GAE w/ IQL V |
+|--------|---------|---------|------------|
+| Default IQL (3x256, 10ep) | -0.009 | 0.000 | 0.872 |
+| +norm, scale=5, repeat=4, nstep=5 | 0.101 | 0.084 | 0.944 |
+| +scale=20, 10x512, repeat=8, nstep=1, 4000ep | 0.149 | 0.143 | 0.955 |
+| +nstep=10 | 0.154 | 0.156 | 0.958 |
+| +nstep=50 | 0.176 | 0.190 | 0.962 |
+
+IQL's Q-network improves with tuning but plateaus at ~0.18 (vs MC regression's 0.73). TD bootstrapping corrupts V during training (V loss goes UP), limiting Q quality. Meanwhile, GAE with IQL's V reaches 0.96 without any Q-network.
+
 **Key conclusions:**
 1. **Learned V(s) is excellent; learned Q(s,a) cannot rank actions** — the SNR problem is fundamental, not a capacity issue
 2. **GAE(lambda=0.95) with trajectory rollouts** is the best practical method (rho=0.931) — it uses V only for bootstrapping, not action discrimination
 3. **NN MSE regression on any target** destroys ranking quality (0.931 -> 0.023) — the regression objective doesn't prioritize within-state ordering
 4. **Single rollout (M=1) is unreliable** for all methods (~0.3) — need M>=8 for decent ranking with sparse rewards
+5. **Heavy tuning can partially fix Q regression** (0.01 -> 0.73 with MC targets, 0.01 -> 0.18 with TD targets), but **GAE always wins** without needing a Q-network at all
 
 ## Research Questions
 
