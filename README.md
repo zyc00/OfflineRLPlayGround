@@ -136,6 +136,78 @@ tensorboard --logdir runs/
 
 Key metrics: `eval/success_rate`, `charts/advantage_mean`, `losses/policy_loss`, `charts/pos_ratio` (RECAP).
 
+## Experiment Results
+
+All experiments finetune from `ckpt_101` (62.7% SR) on PickCube-v1 with sparse reward. Optimal policy for MC re-rollout: `ckpt_301` (99% SR).
+
+### 1. Large-Scale PPO (512 envs, 2M timesteps)
+
+Standard scale training. Batch=25,600, update_epochs=4, target_kl=0.1.
+
+| Method | gamma | Iter 5 | Iter 10 | Iter 25 | Peak SR | Final SR |
+|--------|-------|--------|---------|---------|---------|----------|
+| GAE | 0.8 | 55.6% | 90.0% | 99.2% | 99.3% (i50) | 98.6% |
+| MC1 | 0.8 | 67.6% | 84.1% | 99.6% | **100%** (i35) | 98.3% |
+| GAE | 0.99 | 46.2% | 69.9% | 98.4% | **100%** (i35) | 99.6% |
+| MC1 | 0.99 | 25.4% | 34.4% | 73.5% | 100% (i60) | 100% |
+
+- gamma=0.8 converges much faster early; gamma=0.99 is more stable at convergence
+- MC1 with gamma=0.99 suffers from high variance in MC returns
+
+### 2. Data-Efficient PPO (50 envs, 50k timesteps, ~10 iterations)
+
+High UTD regime: update_epochs=20, target_kl=100 (disabled), batch=5,000.
+
+| Method | Advantage | Critic | Iter 5 | Iter 10 |
+|--------|-----------|--------|--------|---------|
+| GAE | GAE(lambda=0.9) | pretrained V^pi | 74.8% | **93.2%** |
+| GAE | GAE(lambda=0.9) | reset | 73.4% | 90.7% |
+| MC1 | MC(lambda=1.0) | pretrained V^pi | 69.9% | 89.0% |
+| GAE | GAE(lambda=0.9) | V* (optimal) | 66.2% | 83.3% |
+| MC1 | MC(lambda=1.0) | reset | 62.6% | 82.1% |
+
+- Pretrained critic consistently ~3% better than reset
+- GAE > MC1 in data-efficient regime (bias-variance tradeoff helps)
+- V* worse than V^pi_expert due to distribution mismatch
+
+### 3. Data-Efficient: Gamma & Regression Tricks (50 envs, 50k timesteps)
+
+| Config | gamma | Critic | Scale | Iter 10 |
+|--------|-------|--------|-------|---------|
+| Pretrained | 0.8 | pretrained | 1.0 | **93.2%** |
+| Reset | 0.8 | 3x256 reset | 1.0 | 90.7% |
+| Pretrained | 0.99 | pretrained | 1.0 | 85.2% |
+| Reset | 0.99 | reset | 1.0 | 81.0% |
+| Scale 20 | 0.8 | 3x256 reset | 20.0 | 87.7% |
+| Big critic | 0.8 | 10x512 reset | 1.0 | 89.7% |
+| Both | 0.8 | 10x512 reset | 20.0 | 81.2% |
+
+- gamma=0.99 is 5-8% worse in data-efficient regime
+- Regression tricks (reward scaling, big critic) do NOT help online PPO
+- Big critic + scale combined is worst (overfits small batch)
+
+### 4. MC Q-V Parallel Re-rollout (100 envs, 50k timesteps)
+
+Actor-only training with oracle advantage from optimal policy re-rollouts.
+
+| Method | MC samples | Update | Epochs | Iter 5 | Iter 10 | Peak SR |
+|--------|------------|--------|--------|--------|---------|---------|
+| MC16 AWR | 16 | AWR | 200 | 94.2% | **98.8%** | **98.8%** |
+| MC5 PPO | 5 | PPO | 100 | 80.6% | 94.8% | 95.8% |
+| GAE PPO | - | PPO | 100 | 74.3% | 92.0% | 92.0% |
+
+- **MC16 AWR is the best data-efficient result: 98.8%** with only 50k timesteps
+- AWR converges faster than PPO (no importance ratio drift, tolerates more epochs)
+- MC re-rollout advantage > GAE advantage (~3-6% gap)
+
+### Summary: Best Configs by Regime
+
+| Regime | Best Method | Peak SR | Total Timesteps |
+|--------|-------------|---------|-----------------|
+| Large-scale | MC1 PPO (gamma=0.8) | 100% | 2M |
+| Data-efficient (PPO) | GAE + pretrained critic | 93.2% | 50k |
+| Data-efficient (AWR) | MC16 AWR (actor-only) | **98.8%** | 50k |
+
 ## Research Questions
 
 1. How do different advantage estimators (GAE vs MC vs IQL) compare for offline-to-online finetuning?
