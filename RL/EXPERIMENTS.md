@@ -105,10 +105,24 @@ No critic network trained. Actor-only updates.
 
 ### MC Q-V + AWR update (100 envs x 50 steps, epoch=200)
 
-| Config | MC samples | 5k | 15k | 25k | 35k | 45k | Peak |
-|--------|-----------|-----|------|------|------|------|------|
-| mc5_awr (run 1) | 5+AWR | 76.1% | 94.2% | 90.7% | 94.3% | - | 95.5% |
-| mc5_awr (best) | 5+AWR | 77.9% | 91.5% | 96.4% | 96.6% | **98.8%** | **98.8%** |
+Note: run names `mc5_awr` are mislabeled — actual mc_samples=16 (confirmed in experiment log).
+
+| Config | MC samples | AWR beta | 5k | 15k | 25k | 35k | 45k | Peak |
+|--------|-----------|----------|-----|------|------|------|------|------|
+| MC16 AWR beta=1.0 (run 1) | 16 | 1.0 | 76.1% | 94.2% | 90.7% | 94.3% | - | 95.5% |
+| **MC16 AWR beta=1.0** (best) | 16 | 1.0 | 77.9% | 91.5% | 96.4% | 96.6% | **98.8%** | **98.8%** |
+
+### AWR beta sweep (MC16 Q-V, 100 envs x 50 steps, epoch=200)
+
+| AWR beta | 5k | 15k | 25k | 35k | 45k | Peak |
+|----------|-----|------|------|------|------|------|
+| **0.1** | 73.2% | 92.0% | 92.1% | 97.5% | 96.8% | 97.5% |
+| **0.3** | 81.4% | **98.4%** | 97.7% | 98.0% | **98.8%** | **98.8%** |
+| **1.0** (default) | 77.9% | 91.5% | 96.4% | 96.6% | **98.8%** | **98.8%** |
+
+- beta=0.3 converges fastest (98.4% at iter 3 / 15k steps)
+- beta=0.1 is more greedy, slightly less stable (peak 97.5%)
+- beta=1.0 and 0.3 both reach 98.8% final, but 0.3 gets there earlier
 
 ### Raw MC advantage (no Q-V regression) — FAILS
 
@@ -143,13 +157,13 @@ All at ~50k total timesteps, ~1000 trajectories, starting from 62.7% SR:
 | 3 | MC1 (λ=1.0) | on-policy | PPO (epoch=20) | 80.9% | 89.0% | 89.0% |
 | 4 | MC1 Q-V | optimal π* | PPO (epoch=20) | 87.4% | **94.8%** | **95.8%** |
 | 5 | MC16 Q-V | optimal π* | PPO (epoch=200) | 90.5% | - | 93.9% |
-| 6 | MC5 Q-V | optimal π* | AWR (epoch=200) | 96.4% | **98.8%** | **98.8%** |
+| 6 | **MC16 Q-V** | optimal π* | AWR (epoch=200) | 96.4% | **98.8%** | **98.8%** |
 
 ### Key findings
 
 1. **Optimal-policy MC > On-policy GAE** when using Q-V advantage:
    - MC1 Q-V optimal (94.8%) > GAE on-policy (93.2%) with same PPO update
-   - MC5 AWR optimal (**98.8%**) >> GAE on-policy (93.2%)
+   - MC16 AWR optimal (**98.8%**) >> GAE on-policy (93.2%)
 
 2. **On-policy MC1 < On-policy GAE** in data-efficient regime:
    - MC1 on-policy (89.0%) < GAE on-policy (93.2%)
@@ -165,8 +179,13 @@ All at ~50k total timesteps, ~1000 trajectories, starting from 62.7% SR:
    - V(s) baseline dramatically reduces variance
 
 5. **More MC samples help but diminishing returns**:
-   - MC1 → MC5 + AWR: 94.8% → 98.8% (+4%)
-   - MC16 PPO: 93.9% (not better than MC5 AWR due to PPO clipping bottleneck)
+   - MC1 PPO → MC16 AWR: 94.8% → 98.8% (+4%)
+   - MC16 PPO: 93.9% (not better than MC16 AWR due to PPO clipping bottleneck)
+
+6. **AWR beta=0.3 converges fastest**:
+   - beta=0.3: 98.4% at 15k steps (iter 3)
+   - beta=1.0: 91.5% at 15k steps → needs more iterations
+   - beta=0.1: slightly too greedy, peaks at 97.5%
 
 ---
 
@@ -216,16 +235,17 @@ MC1 (raw return - V)      89.0% (PPO, 50env)         77.4% (raw, no Q-V)
 
 MC1 Q-V                   N/A                         90.0-94.8% (PPO, 50env)
 
-MC5 Q-V                   N/A                         98.8% (AWR, 100env)  ← BEST
+MC16 Q-V                  N/A                         98.8% (AWR, 100env)  ← BEST
 
 MC16 Q-V                  N/A                         93.9% (PPO, 100env)
 ```
 
-**Bottom line**: Optimal-policy MC Q-V + AWR (98.8%) significantly outperforms on-policy GAE (92-93%) in the data-efficient regime (~1000 trajectories). The key ingredients are:
+**Bottom line**: Optimal-policy MC16 Q-V + AWR (98.8%) significantly outperforms on-policy GAE (92-93%) in the data-efficient regime (~1000 trajectories). The key ingredients are:
 1. Optimal policy for accurate Q/V estimation (not on-policy MC)
 2. Q-V subtraction for variance reduction (not raw MC return)
 3. AWR update rule (not PPO) to fully exploit accurate advantages
-4. Multiple MC samples (MC5) for stable advantage estimates
+4. MC16 samples for stable advantage estimates
+5. AWR beta=0.3 for fastest convergence (98.4% at 15k steps)
 
 ## Scripts
 
@@ -253,8 +273,13 @@ python -m RL.ppo_finetune --num_envs 50 --num_steps 100 \
   --eval_freq 1 --total_timesteps 50000 \
   --critic_checkpoint runs/pretrained_critic_sparse.pt
 
-# Data-efficient MC Q-V + AWR (best result)
-python -m RL.mc_finetune_awr_parallel --mc_samples 5 \
-  --num_envs 100 --num_steps 50 --num_minibatches 10 \
+# Data-efficient MC16 Q-V + AWR (best result, 98.8%)
+python -m RL.mc_finetune_awr_parallel --mc_samples 16 \
+  --num_envs 100 --num_steps 50 --num_minibatches 5 \
+  --update_epochs 200 --eval_freq 1 --total_timesteps 50000
+
+# MC16 AWR with beta=0.3 (fastest convergence, 98.4% at 15k)
+python -m RL.mc_finetune_awr_parallel --mc_samples 16 --awr_beta 0.3 \
+  --num_envs 100 --num_steps 50 --num_minibatches 5 \
   --update_epochs 200 --eval_freq 1 --total_timesteps 50000
 ```
