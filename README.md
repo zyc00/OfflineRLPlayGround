@@ -2,6 +2,45 @@
 
 Offline-to-online RL finetuning research platform built on [ManiSkill](https://github.com/haosulab/ManiSkill). Compares advantage estimation methods (GAE, MC, IQL/SARSA) and policy update rules (PPO, AWR, RECAP) for finetuning pretrained manipulation policies.
 
+## Experiment Plan
+
+**Established finding**: MC-N (large N) + AWR achieves highly data-efficient online finetuning (MC16 AWR 98.8% @ 50k steps), significantly outperforming PPO.
+
+### Phase 1: How Much Does Online Finetuning Actually Help?
+
+**Core question**: Compare pure offline vs offline-to-online — is the online improvement worth the extra environment interaction cost?
+
+| Experiment | Method | Goal |
+|------------|--------|------|
+| 1a | Pure offline (AWR/IQL on offline data) | Establish offline-only baseline |
+| 1b | Offline + online MC16 AWR (current best) | Quantify incremental gain from online phase |
+| 1c | Varying online budget (10k/25k/50k steps) | Plot online budget vs SR curve, find the cost-effectiveness inflection point |
+
+**Expected output**: Online budget vs Success Rate curve, clearly answering "how much online interaction yields how much improvement".
+
+### Phase 2: How to Train an Optimal Critic?
+
+**Core question**: The current MC Q-V method relies on an optimal policy for re-rollout, which is unavailable in practice. Can we train a critic from pure offline data that approximates the optimal critic?
+
+**Evaluation metric**: How closely the trained critic's advantage approximates optimal-policy MC Q-V advantage (the oracle advantage verified to improve efficiency).
+
+| Experiment | Method | Evaluation |
+|------------|--------|------------|
+| 2a | Q-learning variants (CQL, IQL with aggressive tau) | Spearman ρ vs MC oracle ranking |
+| 2b | TD(N) with large N + offline data | Can large N compensate for bootstrapping error? |
+| 2c | NN regression on MC targets (larger networks / better losses) | Upper bound exploration beyond current SNR bottleneck |
+| 2d | Replace oracle re-rollout with trained critic for AWR finetuning | End-to-end validation: critic quality → finetuning SR |
+
+**Known challenges**:
+- Action-dependent signal in Q(s,a) (SNR ~1:500) is dwarfed by state-dependent signal
+- NN MSE regression destroys within-state ranking (0.931 → 0.023)
+- IQL Q-net after heavy tuning only reaches ρ=0.18, far below GAE (ρ=0.93)
+
+**Potential directions**:
+- Contrastive/ranking loss instead of MSE to directly optimize within-state ordering
+- Two-stage training: first learn V(s), then learn residual A(s,a) = Q - V
+- Leverage action diversity in offline data to construct pairwise comparisons
+
 ## Setup
 
 ```bash
@@ -294,45 +333,6 @@ IQL's Q-network improves with tuning but plateaus at ~0.18 (vs MC regression's 0
 3. **NN MSE regression on any target** destroys ranking quality (0.931 -> 0.023) — the regression objective doesn't prioritize within-state ordering
 4. **Single rollout (M=1) is unreliable** for all methods (~0.3) — need M>=8 for decent ranking with sparse rewards
 5. **Heavy tuning can partially fix Q regression** (0.01 -> 0.73 with MC targets, 0.01 -> 0.18 with TD targets), but **GAE always wins** without needing a Q-network at all
-
-## Experiment Plan
-
-**Established finding**: MC-N (large N) + AWR achieves highly data-efficient online finetuning (MC16 AWR 98.8% @ 50k steps), significantly outperforming PPO.
-
-### Phase 1: How Much Does Online Finetuning Actually Help?
-
-**Core question**: Compare pure offline vs offline-to-online — is the online improvement worth the extra environment interaction cost?
-
-| Experiment | Method | Goal |
-|------------|--------|------|
-| 1a | Pure offline (AWR/IQL on offline data) | Establish offline-only baseline |
-| 1b | Offline + online MC16 AWR (current best) | Quantify incremental gain from online phase |
-| 1c | Varying online budget (10k/25k/50k steps) | Plot online budget vs SR curve, find the cost-effectiveness inflection point |
-
-**Expected output**: Online budget vs Success Rate curve, clearly answering "how much online interaction yields how much improvement".
-
-### Phase 2: How to Train an Optimal Critic?
-
-**Core question**: The current MC Q-V method relies on an optimal policy for re-rollout, which is unavailable in practice. Can we train a critic from pure offline data that approximates the optimal critic?
-
-**Evaluation metric**: How closely the trained critic's advantage approximates optimal-policy MC Q-V advantage (the oracle advantage verified to improve efficiency).
-
-| Experiment | Method | Evaluation |
-|------------|--------|------------|
-| 2a | Q-learning variants (CQL, IQL with aggressive tau) | Spearman ρ vs MC oracle ranking |
-| 2b | TD(N) with large N + offline data | Can large N compensate for bootstrapping error? |
-| 2c | NN regression on MC targets (larger networks / better losses) | Upper bound exploration beyond current SNR bottleneck |
-| 2d | Replace oracle re-rollout with trained critic for AWR finetuning | End-to-end validation: critic quality → finetuning SR |
-
-**Known challenges**:
-- Action-dependent signal in Q(s,a) (SNR ~1:500) is dwarfed by state-dependent signal
-- NN MSE regression destroys within-state ranking (0.931 → 0.023)
-- IQL Q-net after heavy tuning only reaches ρ=0.18, far below GAE (ρ=0.93)
-
-**Potential directions**:
-- Contrastive/ranking loss instead of MSE to directly optimize within-state ordering
-- Two-stage training: first learn V(s), then learn residual A(s,a) = Q - V
-- Leverage action diversity in offline data to construct pairwise comparisons
 
 ## Research Questions
 
