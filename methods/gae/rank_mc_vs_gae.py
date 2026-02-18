@@ -992,6 +992,26 @@ if __name__ == "__main__":
     del train_dataset
 
     # -------------------------------------------------------------------
+    # 2.5 Get timestep for each eval state
+    # -------------------------------------------------------------------
+    print("\nExtracting timesteps for eval states...")
+    eval_dataset_tmp = OfflineRLDataset([args.eval_dataset_path], False, False)
+    eval_trajectories_for_ts = eval_dataset_tmp.extract_trajectories(
+        num_envs=args.dataset_num_envs, gamma=args.gamma
+    )
+
+    eval_timesteps = torch.zeros(N, dtype=torch.long)
+    for traj in eval_trajectories_for_ts:
+        flat_indices = traj["flat_indices"]
+        for local_t, global_idx in enumerate(flat_indices.tolist()):
+            eval_timesteps[global_idx] = local_t
+
+    unique_ts = eval_timesteps.unique()
+    print(f"  Timesteps: min={eval_timesteps.min().item()}, max={eval_timesteps.max().item()}, "
+          f"unique={len(unique_ts)}")
+    del eval_dataset_tmp, eval_trajectories_for_ts
+
+    # -------------------------------------------------------------------
     # 3. GAE(MC): Train V(s) on MC returns from training set → GAE adv
     # -------------------------------------------------------------------
     critic_mc = train_value_mc(
@@ -1068,6 +1088,34 @@ if __name__ == "__main__":
           f"std={gae_boot_1t.std():.4f}")
 
     # -------------------------------------------------------------------
+    # 5.5 V(t) timestep baseline
+    # -------------------------------------------------------------------
+    print("\nComputing V(t) timestep baseline...")
+
+    # V(t): for each timestep, average V_mc over all states at that timestep
+    max_timestep = eval_timesteps.max().item() + 1
+    v_timestep_values = torch.zeros(max_timestep)
+    for t in range(max_timestep):
+        mask = (eval_timesteps == t)
+        if mask.any():
+            v_timestep_values[t] = v_mc[mask].mean()
+        else:
+            v_timestep_values[t] = v_mc.mean()  # fallback
+
+    # Each eval state's V(t)
+    v_t_per_state = v_timestep_values[eval_timesteps]  # (N,)
+
+    # Advantage = Q_mc(s, a) - V(t)
+    vt_advantages = q_mc - v_t_per_state.unsqueeze(1)  # (N, K)
+
+    print(f"  V(t) values: mean={v_timestep_values.mean():.4f}, std={v_timestep_values.std():.4f}")
+    print(f"  V(t) A(s,a): mean={vt_advantages.mean():.4f}, std={vt_advantages.std():.4f}")
+
+    # Compare V(t) vs V_mc(s)
+    v_diff = (v_t_per_state - v_mc).abs()
+    print(f"  |V(t) - V_mc(s)|: mean={v_diff.mean():.4f}, max={v_diff.max():.4f}")
+
+    # -------------------------------------------------------------------
     # 6. Train IQL(s) → compute IQL advantages on same sampled actions
     # -------------------------------------------------------------------
     n_rollout_transitions = sum(t["states"].shape[0] for t in trajectories)
@@ -1088,6 +1136,7 @@ if __name__ == "__main__":
     print(f"  MC  V(s):       mean={v_mc.mean():.4f}, std={v_mc.std():.4f}")
     print(f"  GAE(MC) V(s):   mean={v_gae_mc.mean():.4f}, std={v_gae_mc.std():.4f}")
     print(f"  GAE(Boot) V(s): mean={v_gae_boot.mean():.4f}, std={v_gae_boot.std():.4f}")
+    print(f"  V(t):           mean={v_timestep_values.mean():.4f}, std={v_timestep_values.std():.4f}")
     for label, val in iql_results.items():
         if label.endswith("_V"):
             iql_v = val
@@ -1104,6 +1153,8 @@ if __name__ == "__main__":
     print(f"    MC vs GAE(MC):        {r_mc_gaemc:.4f}")
     print(f"    MC vs GAE(Boot):      {r_mc_gaeboot:.4f}")
     print(f"    GAE(MC) vs GAE(Boot): {r_gaemc_gaeboot:.4f}")
+    r_mc_vt, _ = sp_stats.pearsonr(v_mc_np, v_t_per_state.numpy())
+    print(f"    MC vs V(t):           {r_mc_vt:.4f}")
     for label, val in iql_results.items():
         if label.endswith("_V"):
             iql_v_np = val.numpy()
@@ -1137,6 +1188,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------
     methods_dict = {
         "MC": mc_advantages.numpy(),
+        "V(t)": vt_advantages.numpy(),
         "GAE(MC)": gae_mc_advantages.numpy(),
         "GAE(MC,1traj)": gae_mc_1t.numpy(),
         "GAE(Bootstrap)": gae_boot_advantages.numpy(),
@@ -1177,6 +1229,9 @@ if __name__ == "__main__":
         "gae_mc_1traj_advantages": gae_mc_1t,
         "gae_boot_advantages": gae_boot_advantages,
         "gae_boot_1traj_advantages": gae_boot_1t,
+        "v_timestep_values": v_timestep_values,
+        "vt_advantages": vt_advantages,
+        "eval_timesteps": eval_timesteps,
         "sampled_actions": sampled_actions,
         "metrics": metrics,
     }

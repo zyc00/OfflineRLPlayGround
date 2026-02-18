@@ -288,7 +288,7 @@ if __name__ == "__main__":
             for _ in range(args.max_episode_steps):
                 with torch.no_grad():
                     eval_obs, _, eval_term, eval_trunc, eval_infos = eval_envs.step(
-                        agent.get_action(eval_obs, deterministic=False)
+                        agent.get_action(eval_obs, deterministic=True)
                     )
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]

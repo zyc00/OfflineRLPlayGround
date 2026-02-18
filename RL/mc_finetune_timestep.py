@@ -1,22 +1,25 @@
-"""PPO finetuning with Q-V regression advantage estimation.
+"""PPO finetuning with V(t) timestep baseline — parallel re-rollout.
 
-Each iteration:
-  1. Rollout (collect trajectories)
-  2. Compute MC returns (backward discounted sum, λ=1.0)
-  3. Regress Q(s,a) and V(s) on MC returns (supervised MSE)
-  4. Advantage = Q(s,a) - V(s)
-  5. PPO update (actor + critic for bootstrapping)
+Estimates advantage = Q^π*(s_t, a_t) - V(t) where V(t) is the mean Q value
+across all envs at timestep t (not state-dependent). This serves as a naive
+baseline to quantify the contribution of state-dependent value estimation.
 
-If Q/V regression is perfect, Q(s,a)-V(s) ≈ G_t - E[G|s_t], theoretically
-equivalent to MC1. This tests whether the regression bottleneck matters for
-PPO policy improvement.
+Only Q is estimated via MC re-rollouts (all replicas used for Q, no V estimation).
+  - Q^π*(s_t, a_t): from s_t take a_t (current policy), then follow π* → MC return
+  - V(t) = mean_i Q^π*(s_t^i, a_t^i) across envs i
+
+No critic is trained. Actor-only PPO.
 
 Usage:
-  python -m RL.sarsa_finetune
-  python -m RL.sarsa_finetune --regression_epochs 100
+  # MC5 parallel (default)
+  python -m RL.mc_finetune_timestep --mc_samples 5
+
+  # Data-efficient setting
+  python -m RL.mc_finetune_timestep --mc_samples 5 --num_envs 50 --num_steps 100 \
+    --num_minibatches 5 --update_epochs 20 --target_kl 100.0 --eval_freq 1 \
+    --total_timesteps 50000 --num_mc_envs 500
 """
 
-import copy
 import os
 import random
 import time
@@ -31,14 +34,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
+from tqdm import tqdm
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 from torch.utils.tensorboard import SummaryWriter
 
-from data.data_collection.ppo import Agent, layer_init
-from methods.iql.iql import QNetwork
+from data.data_collection.ppo import Agent
 
 
 @dataclass
@@ -46,36 +49,29 @@ class Args:
     # Finetuning
     checkpoint: str = "runs/pickcube_ppo/ckpt_101.pt"
     """pretrained checkpoint to finetune from"""
-    reset_critic: bool = True
-    """reset critic weights (needed when finetuning with different reward mode)"""
-    critic_checkpoint: Optional[str] = None
-    """pretrained critic checkpoint (overrides reset_critic)"""
-
-    # Q-V regression
-    regression_epochs: int = 50
-    """epochs to regress Q and V on MC returns each iteration"""
-    regression_lr: float = 3e-4
-    """learning rate for Q/V regression"""
-    regression_batch_size: int = 256
-    """batch size for Q/V regression"""
+    optimal_checkpoint: str = "runs/pickcube_ppo/ckpt_301.pt"
+    """optimal/converged policy for MC re-rollouts"""
+    mc_samples: int = 5
+    """number of MC re-rollout samples per (s,a) for Q estimation."""
 
     # Environment
     env_id: str = "PickCube-v1"
     num_envs: int = 512
     num_eval_envs: int = 128
+    num_mc_envs: int = 0
+    """MC re-rollout envs. 0 = auto (num_envs * 2 * mc_samples). Must be divisible by num_envs."""
     reward_mode: str = "sparse"
     control_mode: str = "pd_joint_delta_pos"
     max_episode_steps: int = 50
 
-    # PPO hyperparameters
+    # PPO hyperparameters (actor only)
     gamma: float = 0.8
     learning_rate: float = 3e-4
     num_steps: int = 50
-    """rollout length per iteration (= max_episode_steps for full episodes)"""
+    """rollout length per iteration"""
     num_minibatches: int = 32
     update_epochs: int = 4
     clip_coef: float = 0.2
-    vf_coef: float = 0.5
     ent_coef: float = 0.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.1
@@ -86,8 +82,6 @@ class Args:
     total_timesteps: int = 2_000_000
     eval_freq: int = 5
     """evaluate every N iterations"""
-    warmup_iters: int = 0
-    """iterations to train critic only (no policy update)."""
     seed: int = 1
     cuda: bool = True
 
@@ -105,22 +99,31 @@ class Args:
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
-    # Always use MC returns (GAE with lambda=1.0)
-    gae_lambda = 1.0
+    # Auto-compute num_mc_envs if not set
+    if args.num_mc_envs == 0:
+        args.num_mc_envs = args.num_envs * 2 * args.mc_samples
+
+    # Validate MC env allocation
+    assert args.num_mc_envs % args.num_envs == 0, (
+        f"num_mc_envs ({args.num_mc_envs}) must be divisible by num_envs ({args.num_envs})"
+    )
+    samples_per_env = args.num_mc_envs // args.num_envs
+    q_samples_per_env = min(samples_per_env, 2 * args.mc_samples)
 
     args.batch_size = args.num_envs * args.num_steps
     args.minibatch_size = args.batch_size // args.num_minibatches
     args.num_iterations = args.total_timesteps // args.batch_size
 
     if args.exp_name is None:
-        args.exp_name = "qv_regression_ppo"
+        args.exp_name = f"mc{args.mc_samples}_vt"
     run_name = f"{args.exp_name}__seed{args.seed}__{int(time.time())}"
 
-    print(f"=== PPO Finetuning (Q-V Regression) ===")
+    print(f"=== PPO Finetuning with V(t) Baseline (MC{args.mc_samples}, parallel) ===")
     print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  Reward: {args.reward_mode}")
-    print(f"  Regression epochs: {args.regression_epochs}, lr: {args.regression_lr}")
-    print(f"  Envs: {args.num_envs}, Steps: {args.num_steps}")
+    print(f"  Optimal policy: {args.optimal_checkpoint}")
+    print(f"  Reward: {args.reward_mode}, gamma: {args.gamma}")
+    print(f"  MC samples: {args.mc_samples}, q_samples_per_env: {q_samples_per_env}")
+    print(f"  Envs: {args.num_envs}, MC envs: {args.num_mc_envs}, Steps: {args.num_steps}")
     print(f"  Batch: {args.batch_size}, Minibatch: {args.minibatch_size}")
     print(f"  Iterations: {args.num_iterations}")
 
@@ -146,10 +149,13 @@ if __name__ == "__main__":
     eval_envs = gym.make(
         args.env_id, num_envs=args.num_eval_envs, **env_kwargs,
     )
+    # MC re-rollout dedicated envs (no video recording needed)
+    mc_envs_raw = gym.make(args.env_id, num_envs=args.num_mc_envs, **env_kwargs)
 
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
+        mc_envs_raw = FlattenActionSpaceWrapper(mc_envs_raw)
 
     if args.capture_video:
         eval_output_dir = f"runs/{run_name}/videos"
@@ -171,31 +177,29 @@ if __name__ == "__main__":
         ignore_terminations=False,
         record_metrics=True,
     )
+    mc_envs = ManiSkillVectorEnv(
+        mc_envs_raw, args.num_mc_envs,
+        ignore_terminations=False,
+        record_metrics=False,
+    )
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
 
-    # ── Agent setup ────────────────────────────────────────────────────
+    # ── Agent setup (actor only — critic exists but is not trained) ────
     agent = Agent(envs).to(device)
     agent.load_state_dict(torch.load(args.checkpoint, map_location=device))
     print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    if args.critic_checkpoint is not None:
-        critic_state = torch.load(args.critic_checkpoint, map_location=device)
-        agent.critic.load_state_dict(critic_state)
-        print(f"  Loaded pretrained critic: {args.critic_checkpoint}")
-    elif args.reset_critic:
-        agent.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 1)),
-        ).to(device)
-        print("  Critic reset (fresh init for sparse reward)")
+    # Load optimal policy for MC re-rollouts (frozen, not trained)
+    optimal_agent = Agent(envs).to(device)
+    optimal_agent.load_state_dict(torch.load(args.optimal_checkpoint, map_location=device))
+    optimal_agent.eval()
+    print(f"  Loaded optimal policy: {args.optimal_checkpoint}")
 
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # Only optimize actor parameters (actor_mean + actor_logstd)
+    actor_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd]
+    optimizer = optim.Adam(actor_params, lr=args.learning_rate, eps=1e-5)
+    print(f"  Actor params: {sum(p.numel() for p in actor_params):,}")
 
     action_low = torch.from_numpy(envs.single_action_space.low).to(device)
     action_high = torch.from_numpy(envs.single_action_space.high).to(device)
@@ -203,20 +207,47 @@ if __name__ == "__main__":
     def clip_action(a):
         return torch.clamp(a.detach(), action_low, action_high)
 
-    # ── Q/V regression networks (separate from Agent's critic) ─────────
-    obs_dim = np.array(envs.single_observation_space.shape).prod()
-    act_dim = np.prod(envs.single_action_space.shape)
+    # ── Rollout env helpers ────────────────────────────────────────────
+    _zero_action = torch.zeros(
+        args.num_envs, *envs.single_action_space.shape, device=device
+    )
 
-    q_net = QNetwork(obs_dim, act_dim).to(device)
-    v_net = nn.Sequential(
-        layer_init(nn.Linear(obs_dim, 256)),
-        nn.Tanh(),
-        layer_init(nn.Linear(256, 256)),
-        nn.Tanh(),
-        layer_init(nn.Linear(256, 256)),
-        nn.Tanh(),
-        layer_init(nn.Linear(256, 1)),
-    ).to(device)
+    def _clone_state(state_dict):
+        """Deep clone a nested state dict of tensors."""
+        if isinstance(state_dict, dict):
+            return {k: _clone_state(v) for k, v in state_dict.items()}
+        return state_dict.clone()
+
+    def _restore_state(state_dict, seed=None):
+        """Restore rollout env state with PhysX contact warmup."""
+        envs.reset(seed=seed if seed is not None else args.seed)
+        envs.base_env.set_state_dict(state_dict)
+        envs.base_env.step(_zero_action)
+        envs.base_env.set_state_dict(state_dict)
+        envs.base_env._elapsed_steps[:] = 0
+        return envs.base_env.get_obs()
+
+    # ── MC env helpers ─────────────────────────────────────────────────
+    _mc_zero_action = torch.zeros(
+        args.num_mc_envs, *envs.single_action_space.shape, device=device
+    )
+
+    def _expand_state(state_dict, repeats):
+        """Recursively repeat_interleave all tensors in state dict."""
+        if isinstance(state_dict, dict):
+            return {k: _expand_state(v, repeats) for k, v in state_dict.items()}
+        if isinstance(state_dict, torch.Tensor) and state_dict.dim() > 0:
+            return state_dict.repeat_interleave(repeats, dim=0)
+        return state_dict
+
+    def _restore_mc_state(state_dict, seed=None):
+        """Restore MC env state with PhysX contact warmup."""
+        mc_envs.reset(seed=seed if seed is not None else args.seed)
+        mc_envs.base_env.set_state_dict(state_dict)
+        mc_envs.base_env.step(_mc_zero_action)
+        mc_envs.base_env.set_state_dict(state_dict)
+        mc_envs.base_env._elapsed_steps[:] = 0
+        return mc_envs.base_env.get_obs()
 
     # ── Logger ─────────────────────────────────────────────────────────
     writer = SummaryWriter(f"runs/{run_name}")
@@ -238,7 +269,6 @@ if __name__ == "__main__":
     logprobs = torch.zeros((args.num_steps, args.num_envs), device=device)
     rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
-    values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     # ── Training loop ──────────────────────────────────────────────────
     global_step = 0
@@ -247,7 +277,6 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs, device=device)
 
     for iteration in range(1, args.num_iterations + 1):
-        final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
 
         # ── Evaluation ─────────────────────────────────────────────
@@ -289,16 +318,17 @@ if __name__ == "__main__":
                     f"runs/{run_name}/ckpt_{iteration}.pt",
                 )
 
-        # ── Rollout ────────────────────────────────────────────────
+        # ── Rollout (save states for re-rollout) ──────────────────
         rollout_t0 = time.time()
+        saved_states = []
         for step in range(args.num_steps):
             global_step += args.num_envs
+            saved_states.append(_clone_state(envs.base_env.get_state_dict()))
             obs[step] = next_obs
             dones[step] = next_done
 
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action, logprob, _, _ = agent.get_action_and_value(next_obs)
             actions[step] = action
             logprobs[step] = logprob
 
@@ -314,137 +344,90 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         f"train/{k}", v[done_mask].float().mean(), global_step
                     )
-                with torch.no_grad():
-                    final_values[
-                        step,
-                        torch.arange(args.num_envs, device=device)[done_mask],
-                    ] = agent.get_value(
-                        infos["final_observation"][done_mask]
-                    ).view(-1)
-
-            next_done = (terminations | truncations).float()
 
         rollout_time = time.time() - rollout_t0
 
-        # ── Compute MC returns (GAE with λ=1.0) ───────────────────
+        # ── Parallel MC re-rollout: estimate Q(s,a) only ─────────
+        end_state = _clone_state(envs.base_env.get_state_dict())
+        end_elapsed = envs.base_env._elapsed_steps.clone()
+        end_obs = next_obs.clone()
+        end_done = next_done.clone()
+
+        rerollout_t0 = time.time()
+        mc_q = torch.zeros((args.num_steps, args.num_envs), device=device)
+
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            advantages_mc = torch.zeros_like(rewards)
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    next_not_done = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    next_not_done = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                real_next_values = next_not_done * nextvalues + final_values[t]
-                delta = rewards[t] + args.gamma * real_next_values - values[t]
-                advantages_mc[t] = lastgaelam = (
-                    delta + args.gamma * gae_lambda * next_not_done * lastgaelam
+            for t in tqdm(range(args.num_steps), desc=f"  MC re-rollout iter {iteration}", leave=False):
+                # 1. Expand num_envs states → num_mc_envs
+                expanded_state = _expand_state(saved_states[t], samples_per_env)
+
+                # 2. Restore to mc_envs
+                mc_obs = _restore_mc_state(expanded_state, seed=args.seed + t)
+
+                # 3. Build first actions — all replicas do Q estimation
+                first_actions = torch.zeros(
+                    args.num_mc_envs, *envs.single_action_space.shape, device=device
                 )
-            returns = advantages_mc + values  # MC returns (G_t)
+                for i in range(args.num_envs):
+                    base = i * samples_per_env
+                    first_actions[base : base + q_samples_per_env] = actions[t][i]
+
+                # 4. All num_mc_envs step first action in parallel
+                mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(first_actions))
+                all_rews = [rew.view(-1) * args.reward_scale]
+                env_done = (term | trunc).view(-1).bool()
+
+                # 5. Follow optimal policy until all done
+                for _ in range(args.max_episode_steps - 1):
+                    if env_done.all():
+                        break
+                    a = optimal_agent.get_action(mc_obs, deterministic=False)
+                    mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(a))
+                    all_rews.append(
+                        rew.view(-1) * args.reward_scale * (~env_done).float()
+                    )
+                    env_done = env_done | (term | trunc).view(-1).bool()
+
+                # 6. Compute discounted returns
+                ret = torch.zeros(args.num_mc_envs, device=device)
+                for s in reversed(range(len(all_rews))):
+                    ret = all_rews[s] + args.gamma * ret
+
+                # 7. Reshape and average Q replicas
+                ret = ret.view(args.num_envs, samples_per_env)
+                mc_q[t] = ret[:, :q_samples_per_env].mean(dim=1)
+
+        rerollout_time = time.time() - rerollout_t0
+
+        # Restore end-of-rollout state for next iteration
+        _restore_state(end_state, seed=args.seed)
+        envs.base_env._elapsed_steps[:] = end_elapsed
+        next_obs = end_obs
+        next_done = end_done
+
+        # V(t): mean Q across all envs at each timestep
+        v_timestep = mc_q.mean(dim=1)  # (num_steps,)
+
+        # Advantage = Q(s_t, a_t) - V(t)
+        advantages = mc_q - v_timestep.unsqueeze(1)
+
+        print(f"  V(t): min={v_timestep.min().item():.4f}, max={v_timestep.max().item():.4f}, "
+              f"mean={v_timestep.mean().item():.4f}")
+
+        writer.add_scalar("time/rerollout", rerollout_time, global_step)
+        writer.add_scalar("charts/mc_q_mean", mc_q.mean().item(), global_step)
+        writer.add_scalar("charts/v_timestep_mean", v_timestep.mean().item(), global_step)
+        writer.add_scalar("charts/v_timestep_std", v_timestep.std().item(), global_step)
+        writer.add_scalar("charts/advantage_mean", advantages.mean().item(), global_step)
+        writer.add_scalar("charts/advantage_std", advantages.std().item(), global_step)
 
         # ── Flatten batch ──────────────────────────────────────────
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        b_advantages = advantages.reshape(-1)
 
-        # ── Regress Q and V on MC returns ──────────────────────────
-        regression_t0 = time.time()
-        N = args.batch_size
-
-        # Re-initialize Q/V each iteration (learn from scratch on current data)
-        q_net = QNetwork(obs_dim, act_dim).to(device)
-        v_net = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 1)),
-        ).to(device)
-
-        q_opt = optim.Adam(q_net.parameters(), lr=args.regression_lr, eps=1e-5)
-        v_opt = optim.Adam(v_net.parameters(), lr=args.regression_lr, eps=1e-5)
-
-        reg_inds = np.arange(N)
-        for reg_epoch in range(args.regression_epochs):
-            np.random.shuffle(reg_inds)
-            for start in range(0, N, args.regression_batch_size):
-                mb = reg_inds[start:start + args.regression_batch_size]
-                mb_obs = b_obs[mb]
-                mb_act = b_actions[mb]
-                mb_ret = b_returns[mb]
-
-                # Q regression
-                q_pred = q_net(mb_obs, mb_act).squeeze(-1)
-                q_loss = 0.5 * ((q_pred - mb_ret) ** 2).mean()
-                q_opt.zero_grad()
-                q_loss.backward()
-                nn.utils.clip_grad_norm_(q_net.parameters(), args.max_grad_norm)
-                q_opt.step()
-
-                # V regression
-                v_pred = v_net(mb_obs).squeeze(-1)
-                v_loss = 0.5 * ((v_pred - mb_ret) ** 2).mean()
-                v_opt.zero_grad()
-                v_loss.backward()
-                nn.utils.clip_grad_norm_(v_net.parameters(), args.max_grad_norm)
-                v_opt.step()
-
-        q_net.eval()
-        v_net.eval()
-        regression_time = time.time() - regression_t0
-
-        # Compute Q-V advantages
-        with torch.no_grad():
-            q_vals = q_net(b_obs, b_actions).squeeze(-1)
-            v_vals = v_net(b_obs).squeeze(-1)
-            b_advantages = q_vals - v_vals
-
-        # Log regression quality
-        writer.add_scalar("regression/q_loss", q_loss.item(), global_step)
-        writer.add_scalar("regression/v_loss", v_loss.item(), global_step)
-        writer.add_scalar("regression/q_mean", q_vals.mean().item(), global_step)
-        writer.add_scalar("regression/v_mean", v_vals.mean().item(), global_step)
-        writer.add_scalar("regression/adv_mean", b_advantages.mean().item(), global_step)
-        writer.add_scalar("regression/adv_std", b_advantages.std().item(), global_step)
-        writer.add_scalar("time/regression", regression_time, global_step)
-
-        # ── Critic warmup: train only value function, skip policy ──
-        if iteration <= args.warmup_iters:
-            agent.train()
-            update_t0 = time.time()
-            perm = torch.randperm(args.batch_size, device=device)
-            for epoch in range(args.update_epochs):
-                for start in range(0, args.batch_size, args.minibatch_size):
-                    mb_inds = perm[start : start + args.minibatch_size]
-                    newvalue = agent.get_value(b_obs[mb_inds]).view(-1)
-                    v_loss_critic = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-                    optimizer.zero_grad()
-                    v_loss_critic.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                    optimizer.step()
-            update_time = time.time() - update_t0
-
-            y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-            print(
-                f"  [warmup {iteration}/{args.warmup_iters}] "
-                f"v_loss={v_loss_critic.item():.6f}, explained_var={explained_var:.4f}"
-            )
-            writer.add_scalar("losses/value_loss", v_loss_critic.item(), global_step)
-            writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            writer.add_scalar("time/rollout", rollout_time, global_step)
-            writer.add_scalar("time/update", update_time, global_step)
-            continue
-
-        # ── PPO update ─────────────────────────────────────────────
+        # ── PPO update (actor only) ───────────────────────────────
         agent.train()
         b_inds = np.arange(args.batch_size)
         clipfracs = []
@@ -456,7 +439,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                _, newlogprob, entropy, _ = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -477,24 +460,19 @@ if __name__ == "__main__":
                         mb_advantages.std() + 1e-8
                     )
 
-                # Policy loss
+                # Policy loss (no value loss)
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(
                     ratio, 1 - args.clip_coef, 1 + args.clip_coef
                 )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss (Agent's critic — for bootstrapping next iteration)
-                newvalue = newvalue.view(-1)
-                v_loss_critic = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                # Total loss
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss_critic * args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(actor_params, args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
@@ -503,16 +481,10 @@ if __name__ == "__main__":
         update_time = time.time() - update_t0
 
         # ── Logging ────────────────────────────────────────────────
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-
-        writer.add_scalar("losses/value_loss", v_loss_critic.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
         sps = int(global_step / (time.time() - start_time))
         writer.add_scalar("charts/SPS", sps, global_step)
         writer.add_scalar("time/rollout", rollout_time, global_step)
@@ -526,3 +498,4 @@ if __name__ == "__main__":
     writer.close()
     envs.close()
     eval_envs.close()
+    mc_envs.close()

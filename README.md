@@ -283,7 +283,7 @@ Systematic hyperparameter sweep for AWR with optimal-policy MC Q-V advantage. Ba
 | gamma | Peak SR | Final SR |
 |-------|---------|----------|
 | **0.8** | **99.2%** | 97.7% |
-| 0.9 | 99.05% | 99.05% |
+| 0.9 | 99.05% | 98.8% |
 | 0.95 | 97.95% | 97.06% |
 | 0.99 | 97.52% | 97.52% |
 
@@ -300,6 +300,7 @@ Tests three axes: (1) iterative online re-rollout vs one-shot offline training, 
 |--------|-------------------|------|------------|---------|----------|
 | **Online AWR** | optimal (pi*) | iterative | 16 | **99.2%** | 97.7% |
 | **Online AWR** | optimal (pi*) | iterative | 5 | 98.0% | 95.2% |
+| On-policy AWR | current (pi) | iterative | 1 | 95.5% | 94.5% |
 | On-policy AWR | current (pi) | iterative | 5 | 95.1% | 95.1% |
 | On-policy AWR | current (pi) | iterative | 16 | 94.9% | 94.6% |
 | GAE PPO | - | iterative | - | 92.0% | 92.0% |
@@ -307,9 +308,9 @@ Tests three axes: (1) iterative online re-rollout vs one-shot offline training, 
 | Offline AWR | optimal (pi*) | fixed | 16 | 81.0% | 79.7% |
 
 - **Online >> Offline**: iterative re-rollout adds ~14% (99.2% vs 85.3%)
-- **Optimal >> On-policy**: using pi* for re-rollouts adds ~4% (99.2% vs 95.1%)
-- On-policy mc5 ≈ mc16 (~95%) — more samples of a suboptimal policy doesn't help
-- On-policy AWR (~95%) still beats standard GAE PPO (92.0%)
+- **Optimal >> On-policy**: using pi* for re-rollouts adds ~4% (99.2% vs 95.5%)
+- **On-policy mc1 AWR (95.5%) vs GAE PPO (92.0%)**: direct comparison — both use on-policy data with 1 sample, but AWR tolerates 200 update epochs vs PPO's 4, explaining the +3.5% gap
+- On-policy mc1 ≈ mc5 ≈ mc16 (~95%) — more samples of a suboptimal policy doesn't help
 - Key insight: the iterative re-rollout (adapting data to improving policy) is the critical ingredient, not just the AWR loss
 
 ### Summary: Best Configs by Regime
@@ -319,7 +320,7 @@ Tests three axes: (1) iterative online re-rollout vs one-shot offline training, 
 | Large-scale | MC1 PPO (gamma=0.8) | 100% | 2M |
 | Data-efficient (PPO) | GAE + pretrained critic | 93.2% | 50k |
 | Data-efficient (AWR) | MC16 AWR (beta=0.5, actor-only) | **99.2%** | 50k |
-| On-policy AWR (no oracle) | On-policy MC AWR | 95.1% | 50k |
+| On-policy AWR (no oracle) | On-policy MC AWR | 95.5% | 50k |
 | Offline AWR | Offline MC5 AWR | 85.3% | 50k (one-shot) |
 
 ### 7. Action Ranking Quality: Which Advantage Estimator Ranks Actions Correctly?
