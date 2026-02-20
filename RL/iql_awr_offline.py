@@ -22,7 +22,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import Literal, Optional
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
@@ -96,6 +96,8 @@ class Args:
     max_grad_norm: float = 0.5
     norm_adv: bool = True
     reward_scale: float = 1.0
+    advantage_mode: Literal["iql", "random", "reversed"] = "iql"
+    """iql=normal IQL advantages, random=random noise, reversed=negate IQL advantages"""
 
     # Training
     num_iterations: int = 100
@@ -430,6 +432,14 @@ if __name__ == "__main__":
     # Free IQL networks (no longer needed)
     del q_net, v_net
     torch.cuda.empty_cache()
+
+    # ── Advantage ablation ─────────────────────────────────────────────
+    if args.advantage_mode == "random":
+        print("  [ABLATION] Replacing IQL advantages with random noise")
+        b_advantages = torch.randn_like(b_advantages)
+    elif args.advantage_mode == "reversed":
+        print("  [ABLATION] Reversing IQL advantages (negating)")
+        b_advantages = -b_advantages
 
     # ── Precompute AWR weights (fixed, not updated) ────────────────────
     if args.norm_adv:

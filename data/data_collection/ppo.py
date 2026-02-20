@@ -103,6 +103,8 @@ class Args:
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
     finite_horizon_gae: bool = False
+    ema_decay: float = 0.0
+    """EMA decay for actor weights. 0 = disabled, e.g. 0.99 or 0.999."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -357,12 +359,46 @@ if __name__ == "__main__":
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
 
+    # ── Actor EMA ──────────────────────────────────────────────────────
+    use_ema = args.ema_decay > 0
+    if use_ema:
+        # Store EMA of actor_mean and actor_logstd parameters
+        ema_state = {
+            k: v.clone() for k, v in agent.state_dict().items()
+            if k.startswith("actor_mean.") or k.startswith("actor_logstd")
+        }
+        print(f"  Actor EMA enabled: decay={args.ema_decay}, {len(ema_state)} params")
+
+        @torch.no_grad()
+        def update_ema():
+            d = args.ema_decay
+            for k in ema_state:
+                ema_state[k].mul_(d).add_(agent.state_dict()[k], alpha=1 - d)
+
+        @torch.no_grad()
+        def swap_to_ema():
+            """Swap agent actor weights to EMA, return backup."""
+            backup = {}
+            sd = agent.state_dict()
+            for k in ema_state:
+                backup[k] = sd[k].clone()
+            agent.load_state_dict({**sd, **ema_state}, strict=True)
+            return backup
+
+        @torch.no_grad()
+        def swap_from_ema(backup):
+            """Restore agent actor weights from backup."""
+            sd = agent.state_dict()
+            agent.load_state_dict({**sd, **backup}, strict=True)
+
     for iteration in range(1, args.num_iterations + 1):
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
         if iteration % args.eval_freq == 1:
             print("Evaluating")
+            if use_ema:
+                ema_backup = swap_to_ema()
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
@@ -392,8 +428,14 @@ if __name__ == "__main__":
                 break
         if args.save_model and iteration % args.eval_freq == 1:
             model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
-            torch.save(agent.state_dict(), model_path)
+            if use_ema:
+                # Save EMA actor weights in checkpoint
+                torch.save(agent.state_dict(), model_path)
+            else:
+                torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
+        if use_ema and iteration % args.eval_freq == 1:
+            swap_from_ema(ema_backup)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
@@ -564,6 +606,8 @@ if __name__ == "__main__":
                 break
 
         update_time = time.time() - update_time
+        if use_ema:
+            update_ema()
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -594,7 +638,12 @@ if __name__ == "__main__":
     if not args.evaluate:
         if args.save_model:
             model_path = f"runs/{run_name}/final_ckpt.pt"
-            torch.save(agent.state_dict(), model_path)
+            if use_ema:
+                ema_backup = swap_to_ema()
+                torch.save(agent.state_dict(), model_path)
+                swap_from_ema(ema_backup)
+            else:
+                torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
         logger.close()
     envs.close()

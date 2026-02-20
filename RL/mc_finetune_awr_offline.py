@@ -96,6 +96,10 @@ class Args:
     capture_video: bool = True
     save_model: bool = True
 
+    # Data caching
+    cache_path: Optional[str] = None
+    """Path to cache offline data (obs, actions, mc_q, mc_v). If exists, skip data collection + MC re-rollout."""
+
     # Computed at runtime
     batch_size: int = 0
     minibatch_size: int = 0
@@ -153,17 +157,16 @@ if __name__ == "__main__":
         max_episode_steps=args.max_episode_steps,
     )
 
+    use_cache = args.cache_path and os.path.exists(args.cache_path)
+
     envs = gym.make(args.env_id, num_envs=args.num_envs, **env_kwargs)
     eval_envs = gym.make(
         args.env_id, num_envs=args.num_eval_envs, **env_kwargs,
     )
-    # MC re-rollout dedicated envs (no video recording needed)
-    mc_envs_raw = gym.make(args.env_id, num_envs=args.num_mc_envs, **env_kwargs)
 
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
-        mc_envs_raw = FlattenActionSpaceWrapper(mc_envs_raw)
 
     if args.capture_video:
         eval_output_dir = f"runs/{run_name}/videos"
@@ -185,11 +188,17 @@ if __name__ == "__main__":
         ignore_terminations=False,
         record_metrics=True,
     )
-    mc_envs = ManiSkillVectorEnv(
-        mc_envs_raw, args.num_mc_envs,
-        ignore_terminations=False,
-        record_metrics=False,
-    )
+
+    # MC envs only needed when not loading from cache
+    if not use_cache:
+        mc_envs_raw = gym.make(args.env_id, num_envs=args.num_mc_envs, **env_kwargs)
+        if isinstance(mc_envs_raw.action_space, gym.spaces.Dict):
+            mc_envs_raw = FlattenActionSpaceWrapper(mc_envs_raw)
+        mc_envs = ManiSkillVectorEnv(
+            mc_envs_raw, args.num_mc_envs,
+            ignore_terminations=False,
+            record_metrics=False,
+        )
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
 
@@ -198,11 +207,12 @@ if __name__ == "__main__":
     agent.load_state_dict(torch.load(args.checkpoint, map_location=device))
     print(f"  Loaded checkpoint: {args.checkpoint}")
 
-    # Load optimal policy for MC re-rollouts (frozen, not trained)
-    optimal_agent = Agent(envs).to(device)
-    optimal_agent.load_state_dict(torch.load(args.optimal_checkpoint, map_location=device))
-    optimal_agent.eval()
-    print(f"  Loaded optimal policy: {args.optimal_checkpoint}")
+    # Optimal policy only needed when not loading from cache
+    if not use_cache:
+        optimal_agent = Agent(envs).to(device)
+        optimal_agent.load_state_dict(torch.load(args.optimal_checkpoint, map_location=device))
+        optimal_agent.eval()
+        print(f"  Loaded optimal policy: {args.optimal_checkpoint}")
 
     # Only optimize actor parameters (actor_mean + actor_logstd)
     actor_params = list(agent.actor_mean.parameters()) + [agent.actor_logstd]
@@ -215,45 +225,41 @@ if __name__ == "__main__":
     def clip_action(a):
         return torch.clamp(a.detach(), action_low, action_high)
 
-    # ── Rollout env helpers ────────────────────────────────────────────
-    _zero_action = torch.zeros(
-        args.num_envs, *envs.single_action_space.shape, device=device
-    )
+    # ── Helpers (only needed when not loading from cache) ──────────────
+    if not use_cache:
+        _zero_action = torch.zeros(
+            args.num_envs, *envs.single_action_space.shape, device=device
+        )
 
-    def _clone_state(state_dict):
-        """Deep clone a nested state dict of tensors."""
-        if isinstance(state_dict, dict):
-            return {k: _clone_state(v) for k, v in state_dict.items()}
-        return state_dict.clone()
+        def _clone_state(state_dict):
+            if isinstance(state_dict, dict):
+                return {k: _clone_state(v) for k, v in state_dict.items()}
+            return state_dict.clone()
 
-    # ── MC env helpers ─────────────────────────────────────────────────
-    _mc_zero_action = torch.zeros(
-        args.num_mc_envs, *envs.single_action_space.shape, device=device
-    )
+        _mc_zero_action = torch.zeros(
+            args.num_mc_envs, *envs.single_action_space.shape, device=device
+        )
 
-    def _expand_state(state_dict, repeats):
-        """Recursively repeat_interleave all tensors in state dict."""
-        if isinstance(state_dict, dict):
-            return {k: _expand_state(v, repeats) for k, v in state_dict.items()}
-        if isinstance(state_dict, torch.Tensor) and state_dict.dim() > 0:
-            return state_dict.repeat_interleave(repeats, dim=0)
-        return state_dict
+        def _expand_state(state_dict, repeats):
+            if isinstance(state_dict, dict):
+                return {k: _expand_state(v, repeats) for k, v in state_dict.items()}
+            if isinstance(state_dict, torch.Tensor) and state_dict.dim() > 0:
+                return state_dict.repeat_interleave(repeats, dim=0)
+            return state_dict
 
-    def _restore_mc_state(state_dict, seed=None):
-        """Restore MC env state with PhysX contact warmup."""
-        mc_envs.reset(seed=seed if seed is not None else args.seed)
-        mc_envs.base_env.set_state_dict(state_dict)
-        mc_envs.base_env.step(_mc_zero_action)
-        mc_envs.base_env.set_state_dict(state_dict)
-        mc_envs.base_env._elapsed_steps[:] = 0
-        return mc_envs.base_env.get_obs()
+        def _restore_mc_state(state_dict, seed=None):
+            mc_envs.reset(seed=seed if seed is not None else args.seed)
+            mc_envs.base_env.set_state_dict(state_dict)
+            mc_envs.base_env.step(_mc_zero_action)
+            mc_envs.base_env.set_state_dict(state_dict)
+            mc_envs.base_env._elapsed_steps[:] = 0
+            return mc_envs.base_env.get_obs()
 
-    # Precompute V-replica indices for gathering obs
-    v_indices = []
-    for i in range(args.num_envs):
-        base = i * samples_per_env
-        v_indices.extend(range(base + args.mc_samples, base + 2 * args.mc_samples))
-    v_indices = torch.tensor(v_indices, device=device, dtype=torch.long)
+        v_indices = []
+        for i in range(args.num_envs):
+            base = i * samples_per_env
+            v_indices.extend(range(base + args.mc_samples, base + 2 * args.mc_samples))
+        v_indices = torch.tensor(v_indices, device=device, dtype=torch.long)
 
     # ── Logger ─────────────────────────────────────────────────────────
     writer = SummaryWriter(f"runs/{run_name}")
@@ -263,112 +269,134 @@ if __name__ == "__main__":
         + "\n".join(f"|{k}|{v}|" for k, v in vars(args).items()),
     )
 
-    # ── Storage (no logprobs needed for AWR) ───────────────────────────
-    obs = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
-        device=device,
-    )
-    actions = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape,
-        device=device,
-    )
-    rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
-    dones = torch.zeros((args.num_steps, args.num_envs), device=device)
-
     # ══════════════════════════════════════════════════════════════════
-    #  One-time data collection (using initial policy)
+    #  Load cached data or collect + MC re-rollout
     # ══════════════════════════════════════════════════════════════════
-    agent.eval()
-    print("\nCollecting offline dataset...")
+    if args.cache_path and os.path.exists(args.cache_path):
+        print(f"\n  Loading cached offline data from {args.cache_path}...")
+        cache = torch.load(args.cache_path, map_location=device)
+        obs = cache["obs"]
+        actions = cache["actions"]
+        mc_q = cache["mc_q"]
+        mc_v = cache["mc_v"]
+        advantages = mc_q - mc_v
+        print(f"  Loaded: obs={list(obs.shape)}, actions={list(actions.shape)}, mc_q={list(mc_q.shape)}")
+        rollout_time = 0.0
+        rerollout_time = 0.0
+    else:
+        # ── Storage (no logprobs needed for AWR) ───────────────────────────
+        obs = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
+            device=device,
+        )
+        actions = torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_action_space.shape,
+            device=device,
+        )
+        rewards = torch.zeros((args.num_steps, args.num_envs), device=device)
+        dones = torch.zeros((args.num_steps, args.num_envs), device=device)
 
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_done = torch.zeros(args.num_envs, device=device)
+        # ── One-time data collection (using initial policy) ────────────────
+        agent.eval()
+        print("\nCollecting offline dataset...")
 
-    rollout_t0 = time.time()
-    saved_states = []
-    for step in range(args.num_steps):
-        saved_states.append(_clone_state(envs.base_env.get_state_dict()))
-        obs[step] = next_obs
-        dones[step] = next_done
+        next_obs, _ = envs.reset(seed=args.seed)
+        next_done = torch.zeros(args.num_envs, device=device)
+
+        rollout_t0 = time.time()
+        saved_states = []
+        for step in range(args.num_steps):
+            saved_states.append(_clone_state(envs.base_env.get_state_dict()))
+            obs[step] = next_obs
+            dones[step] = next_done
+
+            with torch.no_grad():
+                action = agent.get_action(next_obs, deterministic=False)
+            actions[step] = action
+
+            next_obs, reward, terminations, truncations, infos = envs.step(
+                clip_action(action)
+            )
+            next_done = (terminations | truncations).float()
+            rewards[step] = reward.view(-1) * args.reward_scale
+
+        rollout_time = time.time() - rollout_t0
+
+        # ── One-time MC re-rollout: estimate Q(s,a) and V(s) ──────────────
+        print("Computing advantages via MC re-rollout...")
+
+        rerollout_t0 = time.time()
+        mc_q = torch.zeros((args.num_steps, args.num_envs), device=device)
+        mc_v = torch.zeros((args.num_steps, args.num_envs), device=device)
 
         with torch.no_grad():
-            action = agent.get_action(next_obs, deterministic=False)
-        actions[step] = action
+            for t in tqdm(range(args.num_steps), desc="  MC re-rollout", leave=False):
+                # 1. Expand num_envs states → num_mc_envs
+                expanded_state = _expand_state(saved_states[t], samples_per_env)
 
-        next_obs, reward, terminations, truncations, infos = envs.step(
-            clip_action(action)
-        )
-        next_done = (terminations | truncations).float()
-        rewards[step] = reward.view(-1) * args.reward_scale
+                # 2. Restore to mc_envs
+                mc_obs = _restore_mc_state(expanded_state, seed=args.seed + t)
 
-    rollout_time = time.time() - rollout_t0
-
-    # ══════════════════════════════════════════════════════════════════
-    #  One-time MC re-rollout: estimate Q(s,a) and V(s)
-    # ══════════════════════════════════════════════════════════════════
-    print("Computing advantages via MC re-rollout...")
-
-    rerollout_t0 = time.time()
-    mc_q = torch.zeros((args.num_steps, args.num_envs), device=device)
-    mc_v = torch.zeros((args.num_steps, args.num_envs), device=device)
-
-    with torch.no_grad():
-        for t in tqdm(range(args.num_steps), desc="  MC re-rollout", leave=False):
-            # 1. Expand num_envs states → num_mc_envs
-            expanded_state = _expand_state(saved_states[t], samples_per_env)
-
-            # 2. Restore to mc_envs
-            mc_obs = _restore_mc_state(expanded_state, seed=args.seed + t)
-
-            # 3. Build first actions (num_mc_envs, action_dim)
-            first_actions = torch.zeros(
-                args.num_mc_envs, *envs.single_action_space.shape, device=device
-            )
-
-            # Q replicas: copy current policy's action
-            for i in range(args.num_envs):
-                base = i * samples_per_env
-                first_actions[base : base + args.mc_samples] = actions[t][i]
-
-            # V replicas: sample action from optimal policy
-            v_obs = mc_obs[v_indices]
-            first_actions[v_indices] = optimal_agent.get_action(
-                v_obs, deterministic=False
-            )
-
-            # 4. All num_mc_envs step first action in parallel
-            mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(first_actions))
-            all_rews = [rew.view(-1) * args.reward_scale]
-            env_done = (term | trunc).view(-1).bool()
-
-            # 5. Follow optimal policy until all done
-            for _ in range(args.max_episode_steps - 1):
-                if env_done.all():
-                    break
-                a = optimal_agent.get_action(mc_obs, deterministic=False)
-                mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(a))
-                all_rews.append(
-                    rew.view(-1) * args.reward_scale * (~env_done).float()
+                # 3. Build first actions (num_mc_envs, action_dim)
+                first_actions = torch.zeros(
+                    args.num_mc_envs, *envs.single_action_space.shape, device=device
                 )
-                env_done = env_done | (term | trunc).view(-1).bool()
 
-            # 6. Compute discounted returns
-            ret = torch.zeros(args.num_mc_envs, device=device)
-            for s in reversed(range(len(all_rews))):
-                ret = all_rews[s] + args.gamma * ret
+                # Q replicas: copy current policy's action
+                for i in range(args.num_envs):
+                    base = i * samples_per_env
+                    first_actions[base : base + args.mc_samples] = actions[t][i]
 
-            # 7. Reshape (num_mc_envs,) → (num_envs, samples_per_env) and average
-            ret = ret.view(args.num_envs, samples_per_env)
-            mc_q[t] = ret[:, :args.mc_samples].mean(dim=1)
-            mc_v[t] = ret[:, args.mc_samples : 2 * args.mc_samples].mean(dim=1)
+                # V replicas: sample action from optimal policy
+                v_obs = mc_obs[v_indices]
+                first_actions[v_indices] = optimal_agent.get_action(
+                    v_obs, deterministic=False
+                )
 
-    rerollout_time = time.time() - rerollout_t0
+                # 4. All num_mc_envs step first action in parallel
+                mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(first_actions))
+                all_rews = [rew.view(-1) * args.reward_scale]
+                env_done = (term | trunc).view(-1).bool()
 
-    # Free saved states (no longer needed)
-    del saved_states
+                # 5. Follow optimal policy until all done
+                for _ in range(args.max_episode_steps - 1):
+                    if env_done.all():
+                        break
+                    a = optimal_agent.get_action(mc_obs, deterministic=False)
+                    mc_obs, rew, term, trunc, _ = mc_envs.step(clip_action(a))
+                    all_rews.append(
+                        rew.view(-1) * args.reward_scale * (~env_done).float()
+                    )
+                    env_done = env_done | (term | trunc).view(-1).bool()
 
-    # Advantage = Q^π*(s_t, a_t) - V^π*(s_t)
-    advantages = mc_q - mc_v
+                # 6. Compute discounted returns
+                ret = torch.zeros(args.num_mc_envs, device=device)
+                for s in reversed(range(len(all_rews))):
+                    ret = all_rews[s] + args.gamma * ret
+
+                # 7. Reshape (num_mc_envs,) → (num_envs, samples_per_env) and average
+                ret = ret.view(args.num_envs, samples_per_env)
+                mc_q[t] = ret[:, :args.mc_samples].mean(dim=1)
+                mc_v[t] = ret[:, args.mc_samples : 2 * args.mc_samples].mean(dim=1)
+
+        rerollout_time = time.time() - rerollout_t0
+
+        # Free saved states and MC envs (no longer needed)
+        del saved_states
+        mc_envs.close()
+        del mc_envs
+
+        # Advantage = Q^π*(s_t, a_t) - V^π*(s_t)
+        advantages = mc_q - mc_v
+
+        # ── Save cache ─────────────────────────────────────────────────
+        if args.cache_path:
+            os.makedirs(os.path.dirname(args.cache_path) or ".", exist_ok=True)
+            torch.save({
+                "obs": obs.cpu(), "actions": actions.cpu(),
+                "mc_q": mc_q.cpu(), "mc_v": mc_v.cpu(),
+            }, args.cache_path)
+            print(f"  Cached offline data to {args.cache_path}")
 
     # ── Flatten batch (fixed, not updated) ─────────────────────────────
     b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -495,4 +523,3 @@ if __name__ == "__main__":
     writer.close()
     envs.close()
     eval_envs.close()
-    mc_envs.close()

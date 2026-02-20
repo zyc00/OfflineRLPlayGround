@@ -292,9 +292,11 @@ Systematic hyperparameter sweep for AWR with optimal-policy MC Q-V advantage. Ba
 - gamma=0.8 optimal for 50-step episodes; gamma=0.9 best stability (peak=final=99.05%)
 - Best config: **mc16, beta=0.5, gamma=0.8 → 99.2% peak SR**
 
-### 6. Online vs Offline vs On-Policy AWR
+### 6. Online vs Offline vs On-Policy AWR (ckpt_101, stochastic eval)
 
 Tests three axes: (1) iterative online re-rollout vs one-shot offline training, (2) optimal policy vs current policy for MC re-rollout.
+
+> **Note**: These results used ckpt_101 (det SR~99%) with stochastic eval. See Section 8 for updated results with a weaker checkpoint and deterministic eval.
 
 | Method | Re-rollout Policy | Data | mc_samples | Peak SR | Final SR |
 |--------|-------------------|------|------------|---------|----------|
@@ -313,7 +315,7 @@ Tests three axes: (1) iterative online re-rollout vs one-shot offline training, 
 - On-policy mc1 ≈ mc5 ≈ mc16 (~95%) — more samples of a suboptimal policy doesn't help
 - Key insight: the iterative re-rollout (adapting data to improving policy) is the critical ingredient, not just the AWR loss
 
-### Summary: Best Configs by Regime
+### Summary: Best Configs by Regime (ckpt_101)
 
 | Regime | Best Method | Peak SR | Total Timesteps |
 |--------|-------------|---------|-----------------|
@@ -409,6 +411,65 @@ IQL's Q-network improves with tuning but plateaus at ~0.18 (vs MC regression's 0
 3. **NN MSE regression on any target** destroys ranking quality (0.931 -> 0.023) — the regression objective doesn't prioritize within-state ordering
 4. **Single rollout (M=1) is unreliable** for all methods (~0.3) — need M>=8 for decent ranking with sparse rewards
 5. **Heavy tuning can partially fix Q regression** (0.01 -> 0.73 with MC targets, 0.01 -> 0.18 with TD targets), but **GAE always wins** without needing a Q-network at all
+
+### 8. V2: Weak Checkpoint + Deterministic Eval
+
+**Methodology change**: All previous experiments (Sections 1-6) used `ckpt_101` (deterministic SR≈99%) with stochastic eval. The high starting point masked true method differences and eval noise was ~12% per checkpoint. V2 experiments fix both issues:
+- **Checkpoint**: `ckpt_76_logstd-1.5` (deterministic SR=43.8%) — genuinely weak starting policy
+- **Eval**: `deterministic=True` — eliminates action sampling noise, ~1% eval variance
+
+**γ=0.8 main comparison** (100 envs, 50k timesteps):
+
+| Method | Re-rollout | mc | Peak SR | Final SR |
+|--------|-----------|-----|---------|----------|
+| **MC16 AWR** | optimal (pi*) | 16 | **99.1%** | **99.1%** |
+| MC16 AWR | on-policy (pi) | 16 | 96.7% | 95.0% |
+| GAE PPO | - | - | 82.4% | 71.7% |
+| MC1 AWR | optimal (pi*) | 1 | 78.3% | 70.3% |
+| MC1 AWR | on-policy (pi) | 1 | 74.6% | 69.6% |
+
+**Gamma sweep** (MC16 optimal vs GAE PPO):
+
+| gamma | MC16 optimal | GAE PPO |
+|-------|-------------|---------|
+| **0.8** | **99.1% / 99.1%** | 82.4% / 71.7% |
+| 0.95 | 98.7% / 97.7% | 76.7% / 76.1% |
+| 0.99 | 77.0% / 77.0% | **92.1% / 91.2%** |
+
+**Key findings (V2)**:
+- **MC16 >> MC1**: 99.1% vs 78.3% (+21%). Multi-sample MC is critical — single sample variance is too high
+- **Optimal >> On-policy**: 99.1% vs 95.0% (+4%). Oracle helps but not essential
+- **AWR >> GAE PPO at γ=0.8**: 95.0% vs 71.7% (+23%). Massive gap now visible with weak starting point
+- **γ=0.99 reversal**: GAE (92.1%) > MC16 optimal (77.0%). High gamma + sparse reward → MC return variance explodes, GAE's bootstrapping is more stable
+- **GAE prefers high gamma**: GAE improves 71.7% → 76.7% → 92.1% as γ increases (0.8 → 0.95 → 0.99). MC AWR shows opposite trend
+- **Weak checkpoint reveals true gaps**: AWR vs GAE gap is 23% (vs 3% with ckpt_101). The strong starting point previously compressed all methods into a narrow range
+
+**V2 offline AWR** (fixed dataset, 128 envs × 200 steps = 25,600 batch, update_epochs=4, beta=1.0):
+
+| Method | Re-rollout | mc | Peak SR | Final SR |
+|--------|-----------|-----|---------|----------|
+| **IQL** AWR | IQL Q-V | - | **91.6%** | 67.2% |
+| MC16 AWR | optimal (pi*) | 16 | 88.2% | 84.3% |
+| MC16 AWR | on-policy (pi_0) | 16 | 83.3% | 75.0% |
+| MC1 AWR | optimal (pi*) | 1 | 77.7% | 60.6% |
+| MC1 AWR | on-policy (pi_0) | 1 | 72.5% | 72.0% |
+
+**Key findings (V2 offline)**:
+- **IQL peaks highest** (91.6%) but collapses to 67.2% — fast initial learning from diverse IQL training data, but unstable on fixed finetune data
+- **MC16 optimal is most stable**: 88.2% peak, 84.3% final (best final SR). Offline optimal advantage + large batch avoids collapse
+- **Online >> Offline**: online MC16 optimal (99.1%) vs offline (88.2%), gap of +11%
+- **All offline methods oscillate heavily** — no new data to correct compounding errors
+
+### Summary: Best Configs by Regime (V2, deterministic eval)
+
+| Regime | Best Method | Peak SR | Total Timesteps |
+|--------|-------------|---------|-----------------|
+| Large-scale | MC1 PPO (gamma=0.8) | 100% | 2M |
+| Online AWR (oracle) | MC16 AWR optimal (gamma=0.8) | **99.1%** | 50k |
+| Online AWR (no oracle) | MC16 on-policy AWR | 96.7% | 50k |
+| GAE PPO (best gamma) | GAE PPO (gamma=0.99) | 92.1% | 50k |
+| Offline (best peak) | IQL AWR | 91.6% | 25.6k (one-shot) |
+| Offline (best final) | MC16 optimal AWR | 84.3% | 25.6k (one-shot) |
 
 ## Research Questions
 

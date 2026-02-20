@@ -1234,3 +1234,467 @@ Problem: ckpt_101's deterministic SR is too high (~99%), meaning the mean action
 
 ---
 
+## [V2: Online AWR & GAE — Deterministic Eval, Weak Checkpoint] - 2026-02-18 16:00
+
+### Overview
+Re-run key online finetuning experiments with two critical fixes:
+1. **Weaker starting checkpoint**: `ckpt_76_logstd-1.5` (det SR=43.8%, stoch SR≈51%) instead of ckpt_101 (det SR=99%)
+2. **Deterministic evaluation**: `deterministic=True` in eval loop, eliminating ~12% eval noise from action sampling
+
+Tests: optimal vs on-policy AWR, MC16 vs MC1, GAE PPO, and gamma sweep (0.8/0.95/0.99).
+
+### Shared Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | runs/pickcube_ppo/ckpt_76_logstd-1.5.pt |
+| initial det SR | 43.8% |
+| num_envs | 100 |
+| num_eval_envs | 128 |
+| num_steps | 50 |
+| batch_size | 5,000 |
+| num_minibatches | 5 |
+| eval deterministic | **True** |
+| total_timesteps | 50,000 |
+| AWR: update_epochs | 200 |
+| AWR: awr_beta | 0.5 |
+| GAE: update_epochs | 100 |
+| GAE: target_kl | 100.0 (disabled) |
+
+### Commands
+```bash
+# All 9 experiments run via run_v2_all.sh
+CKPT="runs/pickcube_ppo/ckpt_76_logstd-1.5.pt"
+COMMON_AWR="--awr_beta 0.5 --num_envs 100 --num_steps 50 --num_minibatches 5 --update_epochs 200 --eval_freq 1 --total_timesteps 50000"
+COMMON_GAE="--num_envs 100 --num_steps 50 --num_minibatches 5 --update_epochs 100 --target_kl 100.0 --eval_freq 1 --total_timesteps 50000"
+
+# gamma=0.8
+python -m RL.mc_finetune_awr_parallel --checkpoint $CKPT --mc_samples 16 $COMMON_AWR --exp_name v2_mc16_optimal_det
+python -m RL.mc_finetune_awr_parallel --checkpoint $CKPT --mc_samples 1 $COMMON_AWR --exp_name v2_mc1_optimal_det
+python -m RL.mc_finetune_awr_onpolicy --checkpoint $CKPT --mc_samples 16 $COMMON_AWR --exp_name v2_mc16_onpolicy_det
+python -m RL.mc_finetune_awr_onpolicy --checkpoint $CKPT --mc_samples 1 $COMMON_AWR --exp_name v2_mc1_onpolicy_det
+python -m RL.ppo_finetune --checkpoint $CKPT $COMMON_GAE --exp_name v2_gae_det
+
+# gamma sweep
+python -m RL.mc_finetune_awr_parallel --checkpoint $CKPT --mc_samples 16 --gamma 0.95 $COMMON_AWR --exp_name v2_mc16_optimal_g095_det
+python -m RL.ppo_finetune --checkpoint $CKPT --gamma 0.95 $COMMON_GAE --exp_name v2_gae_g095_det
+python -m RL.mc_finetune_awr_parallel --checkpoint $CKPT --mc_samples 16 --gamma 0.99 $COMMON_AWR --exp_name v2_mc16_optimal_g099_det
+python -m RL.ppo_finetune --checkpoint $CKPT --gamma 0.99 $COMMON_GAE --exp_name v2_gae_g099_det
+```
+
+### Results — γ=0.8 Main Comparison
+
+| Experiment | Method | MC | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak | Final |
+|------------|--------|-----|------|------|------|------|------|------|------|------|------|-------|------|-------|
+| v2_mc16_optimal_det | optimal AWR | 16 | 43.8 | 81.0 | 87.9 | 96.1 | 98.6 | 96.3 | 97.6 | 96.9 | 97.9 | **99.1** | **99.1%** | **99.1%** |
+| v2_mc16_onpolicy_det | on-policy AWR | 16 | 43.8 | 67.7 | 81.0 | 87.9 | 90.6 | 94.8 | 95.1 | 96.6 | **96.7** | 95.0 | 96.7% | 95.0% |
+| v2_mc1_optimal_det | optimal AWR | 1 | 43.8 | 51.9 | 55.2 | 71.0 | 69.9 | 76.4 | 77.4 | **78.3** | 76.6 | 70.3 | 78.3% | 70.3% |
+| v2_mc1_onpolicy_det | on-policy AWR | 1 | 43.8 | 47.7 | 64.1 | 69.4 | 67.6 | 69.4 | **74.6** | 66.7 | 73.0 | 69.6 | 74.6% | 69.6% |
+| v2_gae_det | GAE PPO | - | 43.8 | 52.6 | 52.3 | 64.1 | 80.3 | 76.9 | 73.3 | **82.4** | 79.4 | 71.7 | 82.4% | 71.7% |
+
+### Results — Gamma Sweep (MC16 optimal vs GAE PPO)
+
+| gamma | Method | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak | Final |
+|-------|--------|------|------|------|------|------|------|------|------|------|-------|------|-------|
+| 0.8 | MC16 optimal | 43.8 | 81.0 | 87.9 | 96.1 | 98.6 | 96.3 | 97.6 | 96.9 | 97.9 | 99.1 | **99.1%** | **99.1%** |
+| 0.8 | GAE PPO | 43.8 | 52.6 | 52.3 | 64.1 | 80.3 | 76.9 | 73.3 | 82.4 | 79.4 | 71.7 | 82.4% | 71.7% |
+| 0.95 | MC16 optimal | 43.8 | 71.0 | 91.0 | 96.5 | 91.5 | 94.9 | 97.1 | 97.3 | 98.7 | 97.7 | 98.7% | 97.7% |
+| 0.95 | GAE PPO | 43.8 | 45.4 | 49.6 | 58.1 | 60.3 | 65.6 | 69.6 | 75.2 | 76.7 | 76.1 | 76.7% | 76.1% |
+| 0.99 | MC16 optimal | 43.8 | 56.6 | 60.7 | 61.2 | 69.0 | 64.9 | 66.2 | 66.2 | 69.6 | 77.0 | 77.0% | 77.0% |
+| 0.99 | GAE PPO | 43.8 | 58.0 | 66.4 | 73.3 | 72.3 | 83.7 | 85.8 | 87.6 | 92.1 | 91.2 | 92.1% | 91.2% |
+
+### Run Dirs
+- `runs/v2_mc16_optimal_det__seed1__1771449642`
+- `runs/v2_mc1_optimal_det__seed1__1771451334`
+- `runs/v2_mc16_onpolicy_det__seed1__1771452128`
+- `runs/v2_mc1_onpolicy_det__seed1__1771453853`
+- `runs/v2_gae_det__seed1__1771454881`
+- `runs/v2_mc16_optimal_g095_det__seed1__1771455206`
+- `runs/v2_gae_g095_det__seed1__1771456940`
+- `runs/v2_mc16_optimal_g099_det__seed1__1771457068`
+- `runs/v2_gae_g099_det__seed1__1771458679`
+
+### Notes
+- **MC16 >> MC1** (γ=0.8): mc16 optimal 99.1% vs mc1 optimal 78.3% (+21%). Multi-sample MC is critical for stable advantage estimation.
+- **Optimal >> On-policy** (mc16): 99.1% vs 95.0% (+4%). Oracle re-rollout helps but is not essential.
+- **AWR >> GAE PPO** (γ=0.8): mc16 on-policy AWR 95.0% vs GAE PPO 71.7% (+23%). AWR's 200 update epochs >> PPO's 100 epochs.
+- **GAE PPO is unstable at γ=0.8**: oscillates 52-82%, final=71.7%. Low gamma + sparse reward → noisy TD targets.
+- **γ=0.99 reversal**: GAE PPO (92.1%) > MC16 optimal (77.0%). High gamma + sparse reward → MC return variance explodes, AWR advantage is noisy. GAE's bootstrapping provides stability.
+- **MC1 is unstable**: both mc1 optimal (78.3%) and mc1 onpolicy (74.6%) oscillate and decay. Single-sample MC variance is too high for reliable learning.
+- **vs ckpt_101 experiments**: Results are now more discriminative — starting from 43.8% instead of ~63% (stochastic) reveals true method differences. The 23% gap between AWR and GAE was masked before.
+
+---
+
+## [V2 Offline: MC & IQL AWR — Deterministic Eval, Weak Checkpoint] - 2026-02-18 17:30
+
+### Overview
+Offline AWR baselines with weak checkpoint. One-shot data collection + fixed-dataset training. Tests: optimal vs on-policy MC re-rollout (MC16/MC1) and IQL advantage.
+
+### Shared Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | runs/pickcube_ppo/ckpt_76_logstd-1.5.pt |
+| initial det SR | 43.8% |
+| num_envs | 128 |
+| num_steps | 200 |
+| batch_size | 25,600 |
+| num_minibatches | 32 |
+| update_epochs | 4 |
+| awr_beta | 1.0 |
+| gamma | 0.8 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| eval deterministic | **True** |
+
+### Commands
+```bash
+CKPT="runs/pickcube_ppo/ckpt_76_logstd-1.5.pt"
+OPTIMAL="runs/pickcube_ppo/ckpt_301.pt"
+COMMON="--awr_beta 1.0 --num_envs 128 --num_steps 200 --num_minibatches 32 --update_epochs 4 --num_iterations 100 --eval_freq 5"
+
+python -m RL.mc_finetune_awr_offline --checkpoint $CKPT --optimal_checkpoint $OPTIMAL --mc_samples 16 $COMMON --exp_name v2_offline_mc16_optimal_det
+python -m RL.mc_finetune_awr_offline --checkpoint $CKPT --optimal_checkpoint $OPTIMAL --mc_samples 1 $COMMON --exp_name v2_offline_mc1_optimal_det
+python -m RL.mc_finetune_awr_offline --checkpoint $CKPT --optimal_checkpoint $CKPT --mc_samples 16 $COMMON --exp_name v2_offline_mc16_onpolicy_det
+python -m RL.mc_finetune_awr_offline --checkpoint $CKPT --optimal_checkpoint $CKPT --mc_samples 1 $COMMON --exp_name v2_offline_mc1_onpolicy_det
+python -m RL.iql_awr_offline --checkpoint $CKPT --awr_beta 1.0 --num_envs 128 --num_steps 200 --num_minibatches 32 --update_epochs 4 --num_iterations 100 --eval_freq 5 --exp_name v2_offline_iql_det
+```
+
+### Results
+
+| Experiment | Method | mc | i1 | i5 | i10 | i15 | i20 | i25 | i50 | i75 | i100 | Peak | Final |
+|------------|--------|-----|------|------|------|------|------|------|------|------|-------|------|-------|
+| v2_offline_mc16_optimal | optimal AWR | 16 | 42.3 | 60.2 | 67.2 | 71.6 | 66.4 | **88.2** | 61.8 | 80.5 | 84.3 | **88.2%** | 84.3% |
+| v2_offline_mc16_onpolicy | on-policy AWR | 16 | 50.4 | 65.4 | 64.4 | 71.6 | 81.8 | 74.1 | 77.9 | 69.9 | 75.0 | 83.3% | 75.0% |
+| v2_offline_mc1_optimal | optimal AWR | 1 | 45.0 | 61.1 | 53.0 | 53.5 | 53.4 | 70.1 | 63.4 | 64.7 | 60.6 | 77.7% | 60.6% |
+| v2_offline_mc1_onpolicy | on-policy AWR | 1 | 53.7 | 57.7 | 63.4 | 66.7 | 66.2 | 70.7 | 72.5 | 47.7 | 72.0 | 72.5% | 72.0% |
+| v2_offline_iql | IQL AWR | - | 49.6 | 82.4 | 83.7 | **91.6** | 76.3 | 78.3 | 77.0 | 83.7 | 67.2 | **91.6%** | 67.2% |
+
+### Run Dirs
+- `runs/v2_offline_mc16_optimal_det__seed1__1771461325`
+- `runs/v2_offline_mc1_optimal_det__seed1__1771462319`
+- `runs/v2_offline_mc16_onpolicy_det__seed1__1771462805`
+- `runs/v2_offline_mc1_onpolicy_det__seed1__1771463659`
+- `runs/v2_offline_iql_det__seed1__1771464158`
+
+### Notes
+- **IQL peaks highest (91.6%)** but collapses to 67.2%. Fast initial learning from diverse IQL training data (5 checkpoint mix), but unstable on fixed finetune data.
+- **MC16 optimal has best final (84.3%)** — most stable offline method. Optimal re-rollout advantage is higher quality for sustained learning.
+- **Online >> Offline**: online MC16 optimal 99.1% vs offline 88.2% — iterative data refresh adds +11%.
+- **MC16 >> MC1 in offline too**: mc16 optimal 88.2% vs mc1 optimal 77.7% (+10.5%). Multi-sample MC advantage is critical regardless of online/offline.
+- **All offline methods oscillate 15-25%** — no fresh data to correct policy drift on fixed dataset.
+- **Surprise: IQL > MC16 in peak but worse in final** — IQL's advantage from diverse training data (mixed policy levels) gives fast initial boost but doesn't sustain.
+
+---
+
+## [V3 Offline: MC16 Optimal (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.mc_finetune_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --optimal_checkpoint runs/pickcube_ppo/ckpt_301.pt --mc_samples 16 --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_mc16_optimal`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_mc16_optimal__seed1__1771475724
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| optimal_checkpoint | ckpt_301.pt (~99% SR) |
+| mc_samples | 16 |
+| awr_beta | 1.0 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| minibatch_size | 800 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| awr_max_weight | 20.0 |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 93.8% (iter 70) |
+| final_SR | 84.2% |
+| avg_SR(50-100) | 87.2% |
+| std_SR(50-100) | 3.9% |
+| advantage_mean | -0.0697 |
+| advantage_std | 0.0900 |
+| advantage_pos% | 16.2% |
+| training_time | 793.3s |
+
+### Notes
+- 4x data scaling (102,400 vs 25,600 in v2). Avg(50-100) improved +3.0% over v2 (84.2% → 87.2%).
+- Peak reached 93.8% — highest among all offline experiments so far.
+- Std actually slightly increased vs v2 (2.4% → 3.9%), suggesting oscillation is training instability not eval noise.
+- Still the best offline method overall.
+
+---
+
+## [V3 Offline: MC1 Optimal (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.mc_finetune_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --optimal_checkpoint runs/pickcube_ppo/ckpt_301.pt --mc_samples 1 --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_mc1_optimal`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_mc1_optimal__seed1__1771479557
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| optimal_checkpoint | ckpt_301.pt (~99% SR) |
+| mc_samples | 1 |
+| awr_beta | 1.0 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 75.9% (iter 70) |
+| final_SR | 64.1% |
+| avg_SR(50-100) | 68.6% |
+| std_SR(50-100) | 5.6% |
+| advantage_mean | -0.0699 |
+| advantage_std | 0.1465 |
+| advantage_pos% | 17.7% |
+| training_time | 792.2s |
+
+### Notes
+- MC1 confirms that single-sample MC advantage is much noisier (std=0.1465 vs MC16's 0.0900).
+- 4x data improved avg(50-100) by +3.8% over v2 (64.8% → 68.6%).
+- Still ~18.6% behind MC16 optimal — multi-sample MC remains critical.
+
+---
+
+## [V3 Offline: MC16 Onpolicy (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.mc_finetune_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --optimal_checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --mc_samples 16 --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_mc16_onpolicy`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_mc16_onpolicy__seed1__1771481367
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| optimal_checkpoint | ckpt_76_logstd-1.5.pt (same as initial — onpolicy) |
+| mc_samples | 16 |
+| awr_beta | 1.0 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 89.5% (iter 70) |
+| final_SR | 84.6% |
+| avg_SR(50-100) | 83.8% |
+| std_SR(50-100) | 3.9% |
+| advantage_mean | 0.0001 |
+| advantage_std | 0.0928 |
+| advantage_pos% | 40.7% |
+| training_time | 794.4s |
+
+### Notes
+- Onpolicy MC16 is only 3.4% behind optimal MC16 in avg(50-100) (83.8% vs 87.2%).
+- Advantage mean≈0 (centered) with 40.7% positive — well-calibrated since rollout policy = initial policy.
+- With 4x data, the gap between optimal and onpolicy narrows. The "optimal critic" advantage is smaller at scale.
+
+---
+
+## [V3 Offline: MC1 Onpolicy (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.mc_finetune_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --optimal_checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --mc_samples 1 --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_mc1_onpolicy`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_mc1_onpolicy__seed1__1771484628
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| optimal_checkpoint | ckpt_76_logstd-1.5.pt (same as initial — onpolicy) |
+| mc_samples | 1 |
+| awr_beta | 1.0 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 76.0% (iter 35) |
+| final_SR | 70.5% |
+| avg_SR(50-100) | 67.4% |
+| std_SR(50-100) | 4.3% |
+| advantage_mean | 0.0001 |
+| advantage_std | 0.1976 |
+| advantage_pos% | 28.8% |
+| training_time | 790.5s |
+
+### Notes
+- Weakest MC variant but still improved +2.0% avg over v2 with 4x data.
+- High advantage std (0.1976) from single MC sample makes learning noisy.
+
+---
+
+## [V3 Offline: IQL (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.iql_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_iql`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_iql__seed1__1771486474
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| awr_beta | 1.0 |
+| iql_expectile_tau | 0.7 |
+| iql_epochs | 200 |
+| iql_nstep | 1 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 84.6% (iter 30) |
+| final_SR | 76.5% |
+| avg_SR(50-100) | 78.9% |
+| std_SR(50-100) | 3.4% |
+| IQL_advantage_mean | -0.0253 |
+| IQL_advantage_std | 0.0208 |
+| IQL_advantage_pos% | 9.4% |
+| IQL_training_time | 75.0s |
+| total_training_time | 794.2s |
+
+### Notes
+- **Major improvement over v2**: The v2 IQL collapsed from 91.4% peak → 67.2% final (24% drop). V3 IQL is much more stable: 84.6% peak → 76.5% final (8% drop).
+- Avg(50-100) jumped from 72.4% → 78.9% (+6.5%) — the biggest gain among all methods from 4x data.
+- Std decreased from 4.5% → 3.4% — the only method where oscillation actually reduced.
+- 4x data primarily helped by providing enough training signal for the IQL Q/V networks to generalize better.
+
+---
+
+## [V3 Offline: IQL nstep5 (4x data, 4x eval)] - 2026-02-19 00:08
+
+**Command**: `python -u -m RL.iql_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --iql_nstep 5 --awr_beta 1.0 --num_envs 128 --num_steps 800 --num_minibatches 128 --update_epochs 4 --num_iterations 100 --eval_freq 5 --num_eval_envs 512 --exp_name v3_offline_iql_nstep5`
+**Git**: 98fa4a7 (main)
+**Run Dir**: runs/v3_offline_iql_nstep5__seed1__1771487374
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| awr_beta | 1.0 |
+| iql_expectile_tau | 0.7 |
+| iql_epochs | 200 |
+| iql_nstep | 5 |
+| num_envs | 128 |
+| num_steps | 800 |
+| batch_size | 102,400 (4x v2) |
+| num_minibatches | 128 |
+| update_epochs | 4 |
+| num_iterations | 100 |
+| eval_freq | 5 |
+| num_eval_envs | 512 (4x v2) |
+| norm_adv | True |
+| gamma | 0.8 |
+| reward | sparse |
+| eval | deterministic |
+
+### Results
+| Metric | Value |
+|--------|-------|
+| peak_SR | 85.0% (iter 35) |
+| final_SR | 78.1% |
+| avg_SR(50-100) | 77.7% |
+| std_SR(50-100) | 3.2% |
+| IQL_advantage_mean | -0.0182 |
+| IQL_advantage_std | 0.0299 |
+| IQL_advantage_pos% | 17.7% |
+| IQL_training_time | 75.4s |
+| total_training_time | 800.5s |
+
+### Notes
+- Nstep5 has higher advantage diversity (pos%=17.7% vs 9.4% for nstep=1) but didn't outperform base IQL.
+- Avg(50-100) actually dropped vs v2 nstep5 (80.7% → 77.7%, -3.0%). This is surprising — nstep5 may have been overfitting less with smaller data.
+- With 4x data, base IQL (78.9%) slightly edges out nstep5 IQL (77.7%).
+
+---
+
+## [V3 Offline Batch Summary: 4x Data + 4x Eval] - 2026-02-19 00:08
+
+**Script**: `bash run_v3_offline.sh`
+**Git**: 98fa4a7 (main)
+**Motivation**: Increase offline dataset from 25,600 to 102,400 samples and eval envs from 128 to 512 to reduce noise and improve training stability.
+
+### Comparison: V3 (102,400 samples, 512 eval) vs V2 (25,600 samples, 128 eval)
+
+| Experiment | V2 Avg(50-100) | V3 Avg(50-100) | Δ Avg | V2 Std | V3 Std | Δ Std |
+|---|---|---|---|---|---|---|
+| MC16 optimal | 84.2% | **87.2%** | +3.0% | 2.4% | 3.9% | +1.5% |
+| MC16 onpolicy | 83.2% | **83.8%** | +0.7% | 2.2% | 3.9% | +1.7% |
+| IQL | 72.4% | **78.9%** | **+6.5%** | 4.5% | **3.4%** | **-1.1%** |
+| IQL nstep5 | 80.7% | 77.7% | -3.0% | 2.4% | 3.2% | +0.8% |
+| MC1 optimal | 64.8% | **68.6%** | +3.8% | 5.3% | 5.6% | +0.3% |
+| MC1 onpolicy | 65.4% | **67.4%** | +2.0% | 2.4% | 4.3% | +1.9% |
+
+### V3 Ranking by Avg(50-100)
+| Rank | Method | Avg(50-100) | Std | Final |
+|---|---|---|---|---|
+| 1 | MC16 optimal | 87.2% | 3.9% | 84.2% |
+| 2 | MC16 onpolicy | 83.8% | 3.9% | 84.6% |
+| 3 | IQL | 78.9% | 3.4% | 76.5% |
+| 4 | IQL nstep5 | 77.7% | 3.2% | 78.1% |
+| 5 | MC1 optimal | 68.6% | 5.6% | 64.1% |
+| 6 | MC1 onpolicy | 67.4% | 4.3% | 70.5% |
+
+### Key Takeaways
+- **IQL stability dramatically improved**: V2 IQL collapsed from 91.4% → 67.2% (24% drop). V3 IQL: 84.6% → 76.5% (8% drop). Avg improved +6.5%. This is the biggest win from 4x data.
+- **MC16 optimal remains the best**: 87.2% avg, consistent across both v2 and v3.
+- **Oscillation is training instability, not eval noise**: Despite 4x eval envs, std did NOT decrease for most methods (some increased). The oscillation comes from overfitting/underfitting cycles on fixed offline data, not from eval sampling noise.
+- **MC16 >> MC1**: The gap persists at ~18% — multi-sample MC advantage estimation is the key differentiator.
+- **IQL nstep5 didn't benefit from 4x data**: Possible that nstep5 already had enough signal from multi-step TD at smaller scale, or that the larger dataset diluted its advantage.
+
+---
+
