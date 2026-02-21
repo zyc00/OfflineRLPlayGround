@@ -1698,3 +1698,425 @@ python -m RL.iql_awr_offline --checkpoint $CKPT --awr_beta 1.0 --num_envs 128 --
 
 ---
 
+## IQL Debug: Approximation Error Analysis + Reward Scaling + N-step TD - 2026-02-20 07:46
+
+**Goal**: Diagnose IQL bottleneck — is it data quality or method limitation? Test reward scaling and n-step TD as potential fixes.
+
+**Git**: 81d116d (main)
+**Settings**: v2 (128 envs × 200 steps = 25,600 batch), ckpt_76_logstd-1.5
+
+### Exp 1a: IQL Fit Analysis (mc_only — best possible data)
+
+**Command**: `python -u -m RL.iql_fit_analysis --iql_data_mode mc_only --num_steps 200 --iql_max_transitions 100000 --cache_path cache/iql_fit_mc_data_v2.pt --output runs/iql_fit_mc_only_v2.png`
+**Output**: `runs/iql_fit_mc_only_v2.png`, `runs/iql_fit_mc_only_v2.pt`
+
+| Parameter | Value |
+|-----------|-------|
+| iql_data_mode | mc_only |
+| mc_samples | 16 |
+| gamma | 0.8 |
+| iql_expectile_tau | 0.7 |
+| iql_epochs | 200 (ran all 200) |
+| iql_batch_size | 256 |
+| iql_max_transitions | 100,000 (subsampled from 6.5M) |
+| MC re-rollout time | 809.5s |
+| IQL training time | 205.1s |
+
+**IQL outputs**: Q mean=0.4571, std=0.2774 | V mean=0.4779, std=0.2753 | A mean=-0.0208, std=0.0534
+
+| Metric | Pearson r | Spearman rho | RMSE |
+|--------|-----------|-------------|------|
+| Q(s,a) | 0.7273 | 0.7251 | 0.1842 |
+| V(s) | 0.8140 | 0.8164 | 0.1833 |
+| **A(s,a)** | **0.2578** | **0.2908** | **0.1177** |
+
+### Exp 1b: IQL Fit Analysis (offline_only — baseline data)
+
+**Command**: `python -u -m RL.iql_fit_analysis --iql_data_mode offline_only --num_steps 200 --cache_path cache/iql_fit_mc_data_v2.pt --output runs/iql_fit_offline_only_v2.png`
+**Output**: `runs/iql_fit_offline_only_v2.png`
+
+| Parameter | Value |
+|-----------|-------|
+| iql_data_mode | offline_only |
+| iql_expectile_tau | 0.7 |
+| iql_epochs | 200 |
+| IQL training time | 56.2s |
+
+**IQL outputs**: Q mean=0.0688, std=0.0619 | V mean=0.0703, std=0.0569 | A mean=-0.0014, std=0.0202
+
+| Metric | Pearson r | Spearman rho | RMSE |
+|--------|-----------|-------------|------|
+| Q(s,a) | 0.2802 | 0.3263 | 0.3526 |
+| V(s) | 0.3321 | 0.3616 | 0.4331 |
+| **A(s,a)** | **0.1293** | **0.1451** | **0.1085** |
+
+### Exp 2a: IQL reward_scale=10
+
+**Command**: `python -u -m RL.iql_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --reward_scale 10.0 --awr_beta 1.0 --num_envs 128 --num_steps 200 --num_minibatches 32 --update_epochs 4 --num_iterations 100 --eval_freq 5 --exp_name v2_offline_iql_rs10`
+**Run Dir**: `runs/v2_offline_iql_rs10__seed1__1771601108/`
+
+| Parameter | Value |
+|-----------|-------|
+| reward_scale | 10.0 |
+| iql_expectile_tau | 0.7 |
+| iql_nstep | 1 |
+| awr_beta | 1.0 |
+| IQL early stop | epoch 181 |
+| Total training time | 243.0s |
+
+**IQL outputs**: Q mean=0.9478, std=1.4489 | A mean=-0.0977, std=0.3666
+**IQL Advantage on finetune data**: mean=-0.0701, std=0.3768, pos%=31.3%
+
+| Iter | SR% |
+|------|-----|
+| 1 | 49.6 |
+| 5 | 82.0 |
+| 10 | 74.8 |
+| 15 | 74.8 |
+| 20 | 79.0 |
+| 25 | 75.2 |
+| 30 | 76.9 |
+| **35** | **85.0** |
+| 40 | 82.6 |
+| 45 | 71.7 |
+| 50 | 78.5 |
+| 55 | 65.4 |
+| 60 | 74.8 |
+| 65 | 73.7 |
+| 70 | 76.5 |
+| 75 | 73.3 |
+| 80 | 72.9 |
+| 85 | 77.7 |
+| 90 | 70.1 |
+| 95 | 76.9 |
+| 100 | 71.9 |
+
+### Exp 3b: IQL nstep=5 + reward_scale=10
+
+**Command**: `python -u -m RL.iql_awr_offline --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --iql_nstep 5 --reward_scale 10.0 --awr_beta 1.0 --num_envs 128 --num_steps 200 --num_minibatches 32 --update_epochs 4 --num_iterations 100 --eval_freq 5 --exp_name v2_offline_iql_nstep5_rs10`
+**Run Dir**: `runs/v2_offline_iql_nstep5_rs10__seed1__1771601458/`
+
+| Parameter | Value |
+|-----------|-------|
+| reward_scale | 10.0 |
+| iql_nstep | 5 |
+| iql_expectile_tau | 0.7 |
+| awr_beta | 1.0 |
+| IQL early stop | epoch 98 |
+| Total training time | 243.9s |
+
+**IQL outputs**: Q mean=0.6680, std=1.4366 | A mean=-0.1142, std=0.4809
+**IQL Advantage on finetune data**: mean=-0.0300, std=0.4012, pos%=42.6%
+
+| Iter | SR% |
+|------|-----|
+| 1 | 49.6 |
+| 5 | 63.8 |
+| 10 | 77.9 |
+| 15 | 67.2 |
+| 20 | 65.6 |
+| 25 | **78.5** |
+| 30 | 59.8 |
+| 35 | 67.7 |
+| 40 | 63.8 |
+| 45 | 66.2 |
+| 50 | 64.4 |
+| 55 | 58.2 |
+| 60 | 67.4 |
+| 65 | 62.1 |
+| 70 | 68.4 |
+| 75 | 65.7 |
+| 80 | 60.9 |
+| 85 | 70.7 |
+| 90 | 72.6 |
+| 95 | 70.5 |
+| 100 | 66.9 |
+
+### Comparison Table
+
+| Experiment | Peak SR | Avg SR (iter 50-100) | A(s,a) rho | pos% | A std |
+|------------|---------|---------------------|-----------|------|-------|
+| **v2 pure IQL** (baseline) | 91.6% | ~74% | 0.15 (offline) | 9.5% | 0.021 |
+| **Exp 2a: rs10** | 85.0% | ~74% | — | 31.3% | 0.377 |
+| **Exp 3b: nstep5+rs10** | 78.5% | ~65% | — | 42.6% | 0.401 |
+| **Fit: mc_only** | — | — | **0.29** | — | — |
+| **Fit: offline_only** | — | — | **0.15** | — | — |
+
+### Notes
+
+- **Core finding: IQL approximation error is the fundamental bottleneck**. Even with perfect MC data (ground truth Q*), IQL advantage A(s,a) ranking is poor (rho=0.29). The Q-V subtraction amplifies errors: RMSE=0.12 >> A std=0.05, making the signal-to-noise ratio very low.
+- **Reward scaling (×10) did NOT help SR**: While it improved pos% (9.5% → 31.3%) and advantage magnitude, peak SR was slightly worse (85% vs 91.6% baseline). Larger advantage std = more noise in AWR weights, offsetting any benefit.
+- **nstep5 + rs10 combined was WORST**: Peak 78.5%, average ~65%. The combination amplifies instability without fixing the fundamental ranking problem.
+- **mc_only vs offline_only fit analysis**: mc_only roughly doubled A rho (0.29 vs 0.15), confirming data quality matters, but 0.29 is still far too low for effective action ranking. The method itself cannot resolve fine-grained within-state action differences.
+- **Implication**: Tricks like reward scaling and n-step TD cannot fix IQL's fundamental Q-V subtraction problem. For offline advantage estimation, direct methods (MC rollout, GAE with good V) remain necessary.
+
+---
+
+## [V(s) Correlation Analysis: Optimal MC vs On-policy MC vs IQL V] - 2026-02-20 17:29
+
+**Command**: `python -u -m RL.v_correlation_analysis --cache_path runs/v_corr_cache.pt`
+**Git**: 81d116d (main)
+**Script**: `RL/v_correlation_analysis.py`
+**Output**: `runs/v_correlation.png`, `runs/v_correlation.pt`, `runs/v_corr_cache.pt` (MC cache)
+
+### Overview
+Compare 5 value functions evaluated at the **same 102,400 states** (800 steps × 128 envs from ckpt_76 rollout):
+- V^{π*}_{MC16}: MC16 estimate using optimal policy (ckpt_301)
+- V^{π*}_{MC1}: single-sample MC (optimal)
+- V^{π_on}_{MC16}: MC16 estimate using rollout policy (ckpt_76)
+- V^{π_on}_{MC1}: single-sample MC (on-policy)
+- V_IQL: IQL V trained on offline multi-checkpoint data (5 checkpoints × 200 episodes)
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| rollout_policy | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| optimal_policy | ckpt_301.pt |
+| mc_samples | 16 |
+| num_envs | 128 |
+| num_mc_envs | 4096 (128 × 2 × 16) |
+| num_steps | 800 |
+| gamma | 0.8 |
+| reward_mode | sparse |
+| iql_expectile_tau | 0.7 |
+| iql_epochs | 200 (early stop at 65) |
+| iql_data_checkpoints | ckpt_1, 51, 101, 201, 301 |
+| iql_episodes_per_ckpt | 200 |
+| iql_offline_num_envs | 512 |
+| offline_transitions | 85,504 (3,103 trajectories) |
+| MC re-rollout time | 7,593s (~2h7m) |
+
+### V(s) Statistics
+| Value Function | Mean | Std | Min | Max |
+|----------------|------|-----|-----|-----|
+| V^{π*}_{MC16} | 0.4189 | 0.2983 | 0.0000 | 1.0000 |
+| V^{π*}_{MC1} | 0.4190 | 0.3114 | 0.0000 | 1.0000 |
+| V^{π_on}_{MC16} | 0.0555 | 0.0936 | 0.0000 | 0.6832 |
+| V^{π_on}_{MC1} | 0.0559 | 0.1667 | 0.0000 | 1.0000 |
+| V_IQL | 0.0893 | 0.0352 | -0.1870 | 0.2171 |
+
+### Pearson r Correlation Matrix
+| | V*_MC16 | V*_MC1 | V^on_MC16 | V^on_MC1 | V_IQL |
+|---|---|---|---|---|---|
+| V*_MC16 | 1.0000 | 0.9579 | 0.7107 | 0.4030 | 0.3137 |
+| V*_MC1 | 0.9579 | 1.0000 | 0.6800 | 0.3831 | 0.3011 |
+| V^on_MC16 | 0.7107 | 0.6800 | 1.0000 | 0.5634 | 0.0337 |
+| V^on_MC1 | 0.4030 | 0.3831 | 0.5634 | 1.0000 | 0.0184 |
+| V_IQL | 0.3137 | 0.3011 | 0.0337 | 0.0184 | 1.0000 |
+
+### Spearman ρ Correlation Matrix
+| | V*_MC16 | V*_MC1 | V^on_MC16 | V^on_MC1 | V_IQL |
+|---|---|---|---|---|---|
+| V*_MC16 | 1.0000 | 0.9676 | 0.7150 | 0.2258 | 0.3395 |
+| V*_MC1 | 0.9676 | 1.0000 | 0.6892 | 0.2178 | 0.3413 |
+| V^on_MC16 | 0.7150 | 0.6892 | 1.0000 | 0.4373 | 0.2093 |
+| V^on_MC1 | 0.2258 | 0.2178 | 0.4373 | 1.0000 | 0.0927 |
+| V_IQL | 0.3395 | 0.3413 | 0.2093 | 0.0927 | 1.0000 |
+
+### V_IQL Stratified by V* (Does IQL track optimal value?)
+| V* range | n | V* mean | V^on mean | V_IQL mean | IQL/V* |
+|----------|---|---------|-----------|------------|--------|
+| [0.00, 0.05) | 12,243 | 0.022 | 0.000 | 0.048 | 2.23 |
+| [0.05, 0.10) | 7,816 | 0.074 | 0.002 | 0.069 | 0.93 |
+| [0.10, 0.20) | 11,658 | 0.148 | 0.003 | 0.085 | 0.58 |
+| [0.20, 0.40) | 21,549 | 0.308 | 0.011 | 0.101 | 0.33 |
+| [0.40, 0.60) | 18,433 | 0.494 | 0.034 | 0.104 | 0.21 |
+| [0.60, 0.80) | 14,490 | 0.698 | 0.102 | 0.097 | 0.14 |
+| [0.80, 1.00) | 16,123 | 0.893 | 0.202 | 0.094 | 0.11 |
+
+### Key Findings
+
+1. **Optimal MC is self-consistent**: V*_MC16 vs V*_MC1 ρ=0.97. The optimal policy is deterministic enough that single-sample MC captures ranking well.
+
+2. **On-policy MC is noisy**: V^on_MC16 vs V^on_MC1 ρ=0.44. The rollout policy (ckpt_76, SR=43.8%) is stochastic — single MC sample is unreliable. This explains the V2 online result: MC16 on-policy (96.7%) >> MC1 on-policy (74.6%).
+
+3. **IQL V is a near-constant function**: V_IQL std=0.035, IQR=[0.067, 0.113]. When V* ranges from 0.02 to 0.89 (45× range), V_IQL only ranges from 0.048 to 0.104 (2× range). IQL learned essentially a flat value function at out-of-distribution eval states.
+
+4. **TD from offline data learns behavior value, NOT V***: V_IQL/V* = 0.21× (should be ≈1.0 if learning V*). V_IQL/V^on = 1.61× (consistent with learning a behavior-mixture value with τ=0.7 expectile). This confirms: **offline TD (IQL) is fundamentally bounded by the behavior policy's data quality — it cannot recover V* from off-optimal-policy transitions.**
+
+5. **Critic quality is the dominant factor in online RL**: Cross-referencing with V2 online results:
+   - MC samples (16 vs 1): **+22%** (on-policy), +21% (optimal)
+   - Optimal vs on-policy: +2.4% (MC16), +3.7% (MC1)
+   - Conclusion: accurate V estimation (MC16) matters far more than having the optimal policy for re-rollout.
+
+### Code Bug Found
+`collect_offline_data` uses `done = (term | trunc).float()` as the terminal flag for IQL TD learning. Truncation (time limit) should NOT disable bootstrapping — only true termination should. Impact is small for γ=0.8 but technically incorrect.
+
+---
+
+## TD-10 Pretrain for Iterative RL (gamma=0.99) — 3 Modes Comparison - 2026-02-21 00:00
+
+**Git**: 81d116d (main)
+
+### Context
+Testing whether TD-10 pretrained V improves iterative GAE PPO at gamma=0.99. At gamma=0.99, TD(0) V learning is poor (r=0.21) due to long bootstrap chain, but TD-10 gives much better V (r=0.55). Three modes compared: pretrain first iter only, finetune every iter, retrain (reset) every iter.
+
+### Common Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt (det SR=43.8%) |
+| gamma | 0.99 |
+| gae_lambda | 0.9 |
+| td_nstep | 10 |
+| td_reward_scale | 1.0 |
+| td_epochs | 200 |
+| td_batch_size | 256 |
+| num_envs | 512 |
+| num_steps | 50 |
+| update_epochs | 4 |
+| target_kl | 0.1 |
+| total_timesteps | 2,000,000 |
+| eval | deterministic |
+
+### Experiment 1: TD-10 Pretrain (first iter only)
+
+**Command**: `python -m RL.ppo_finetune --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --gamma 0.99 --gae_lambda 0.9 --td_pretrain_v --td_nstep 10 --td_reward_scale 1.0 --td_epochs 200 --td_batch_size 256 --num_envs 512 --num_steps 50 --update_epochs 4 --target_kl 0.1 --total_timesteps 2000000 --eval_freq 5 --exp_name ppo_gae_td10_pretrain_g99 --seed 1`
+**Run Dir**: runs/ppo_gae_td10_pretrain_g99__seed1__1771659467
+
+| Iter | SR |
+|------|----|
+| 1 | 43.8% |
+| 5 | 10.2% |
+| 10 | 66.4% |
+| 15 | 79.1% |
+| 20 | 91.5% |
+| 25 | 97.0% |
+| 30 | **100.0%** |
+| 35 | 100.0% |
+| 40 | 99.6% |
+| 45-60 | 100.0% |
+| 78 | 99.6% |
+
+### Experiment 2: TD-10 Finetune (every iter)
+
+**Command**: `python -m RL.ppo_finetune --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --gamma 0.99 --gae_lambda 0.9 --td_pretrain_v --td_mode finetune --td_nstep 10 --td_reward_scale 1.0 --td_epochs 200 --td_batch_size 256 --num_envs 512 --num_steps 50 --update_epochs 4 --target_kl 0.1 --total_timesteps 2000000 --eval_freq 5 --exp_name ppo_gae_td10_finetune_g99 --seed 1`
+**Run Dir**: runs/ppo_gae_td10_finetune_g99__seed1__1771659849
+
+| Iter | SR |
+|------|----|
+| 1 | 43.8% |
+| 5-25 | 0.0% |
+| 30 | 0.8% |
+| 35 | 0.0% |
+| 40 | 2.3% |
+| 50 | 6.2% |
+| 55 | 16.4% |
+| 65 | 22.7% |
+| 70 | 25.0% |
+| 75 | **47.8%** |
+| 78 | 43.9% |
+
+### Experiment 3: TD-10 Retrain (reset every iter)
+
+**Command**: `python -m RL.ppo_finetune --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --gamma 0.99 --gae_lambda 0.9 --td_pretrain_v --td_mode retrain --td_nstep 10 --td_reward_scale 1.0 --td_epochs 200 --td_batch_size 256 --num_envs 512 --num_steps 50 --update_epochs 4 --target_kl 0.1 --total_timesteps 2000000 --eval_freq 5 --exp_name ppo_gae_td10_retrain_g99 --seed 1`
+**Run Dir**: runs/ppo_gae_td10_retrain_g99__seed1__1771659852
+
+| Iter | SR |
+|------|----|
+| 1 | 43.8% |
+| 5-55 | 0.0% |
+| 60 | **0.8%** |
+| 65-78 | 0.0% |
+
+### Summary
+
+| Mode | Peak SR | Baseline GAE | Delta |
+|------|---------|-------------|-------|
+| TD-10 pretrain (first only) | **100.0%** | 92.1% | **+7.9%** |
+| TD-10 finetune (every iter) | 47.8% | 92.1% | -44.3% |
+| TD-10 retrain (every iter) | 0.8% | 92.1% | -91.3% |
+
+### Notes
+- **TD-10 pretrain (first only) is the clear winner**: +8% over baseline GAE. Best result for GAE-based iterative RL so far.
+- **Finetune every iter collapses**: 200 epochs of TD each iteration overwrites the critic knowledge PPO accumulates through its own value loss. Policy collapses to 0%, slowly crawls back to 47.8% by iter 75.
+- **Retrain every iter completely fails**: Resetting critic from scratch each iteration means PPO can never accumulate any value learning. Permanently stuck at 0%.
+- **Key insight**: TD pretrain provides excellent V initialization, but PPO's own online critic training (via value loss in PPO update) is what maintains and improves V over time. Overwriting it every iteration is catastrophically destructive.
+- At gamma=0.99, TD-10 is needed (not TD(0)) because the bootstrap chain is 50 steps long. TD(0)+rs=10 pretrain at gamma=0.99 only achieved 91.5% (no benefit over baseline).
+
+---
+
+## [PPO Data Efficiency: Critic Warmstart + Warmup + Clip Tuning] - 2026-02-21 02:10
+
+**Git**: 81d116d (main)
+
+### Objective
+Improve online data efficiency of PPO finetuning. Metric: SR vs total env interactions.
+
+### Baseline
+```bash
+python -m RL.ppo_finetune --checkpoint runs/pickcube_ppo/ckpt_76_logstd-1.5.pt --gamma 0.99 \
+  --num_envs 100 --num_steps 50 --num_minibatches 5 --update_epochs 100 --target_kl 100.0 \
+  --eval_freq 1 --total_timesteps 50000 --exp_name v2_gae_g099_baseline
+```
+**Run Dirs**: `runs/v2_gae_g099_det__seed1__1771458679`, `runs/v2_gae_g099_baseline_s2__seed2__1771667985`, `runs/v2_gae_g099_baseline_s3__seed3__1771668119`
+
+| Seed | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|------|------|------|------|------|------|------|------|------|------|------|------|
+| 1 | 43.8 | 58.0 | 66.4 | 73.3 | 72.3 | 83.7 | 85.8 | 87.6 | **92.1** | 91.2 | 92.1 |
+| 2 | 42.2 | 58.0 | 63.8 | 61.4 | 62.8 | 58.8 | 65.9 | **78.7** | 73.5 | 77.4 | 78.7 |
+| 3 | 50.8 | 42.6 | 57.7 | 72.1 | 77.4 | 78.9 | 88.2 | 91.1 | **91.5** | 91.2 | 91.5 |
+| **Mean** | 45.6 | 52.9 | 62.6 | 68.9 | 70.8 | 73.8 | 80.0 | 85.8 | 85.7 | 86.6 | **87.4** |
+
+### Experiments Run (all share baseline settings unless noted)
+
+#### 1. GAE Pretrain 5 iters (reset critic)
+**Command**: `... --gae_pretrain_iters 5 --gae_pretrain_epochs 100 --exp_name v2_gae_g099_pretrain5`
+**Run Dir**: `runs/v2_gae_g099_pretrain5__seed1__1771665083`
+
+| i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|------|------|------|------|------|------|------|------|------|------|------|
+| 41.4 | 51.5 | 64.1 | 66.9 | 84.2 | 82.1 | 86.0 | 87.2 | 88.9 | **90.1** | 90.1 |
+
+Pretrain V corr: 0.57→0.72→0.86→0.93→0.97. Peak -2.0% vs baseline. PPO's own V training catches up quickly.
+
+#### 2. update_epochs=200
+**Run Dir**: `runs/v2_gae_g099_e200__seed1__1771665278`
+
+| i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|------|------|------|------|------|------|------|------|------|------|------|
+| 43.8 | 56.9 | 63.8 | 68.5 | 55.8 | 69.4 | 72.4 | 71.4 | 67.9 | **73.5** | 73.5 |
+
+Policy overfits to stale advantages. Collapses at i5.
+
+#### 3. num_envs=50, epochs=100 (20 iters)
+**Run Dir**: `runs/v2_gae_g099_env50__seed1__1771665536`
+Peak: **75.9%**. Oscillates badly — 100 epochs overfits on small batch (2500).
+
+#### 4. num_envs=50, epochs=50 (20 iters)
+**Run Dir**: `runs/v2_gae_g099_env50_e50__seed1__1771665810`
+Peak: **85.4%** (i20). Still climbing but hasn't converged. Under-trains per iteration.
+
+#### 5. gae_lambda=0.95
+**Run Dir**: `runs/v2_gae_g099_lam095__seed1__1771666118`
+Peak: **92.1%** (i10). Same as baseline, no improvement.
+
+#### 6. MC1 (lambda=1.0, gamma=0.99)
+**Run Dir**: `runs/v2_mc1_g099__seed1__1771666295`
+Peak: **69.9%** (i9). MC variance too high at gamma=0.99. Confirms Issue #10.
+
+#### 7. num_envs=200 (5 iters, batch=10K)
+**Run Dir**: `runs/v2_gae_g099_env200__seed1__1771666501`
+Peak: **81.3%** (i5). Not enough policy updates with only 5 iterations.
+
+#### 8. warmup=1 + clip=0.3 (reset critic)
+**Run Dirs**: `runs/v2_gae_g099_reset_warmup1_clip03_s1__seed1__1771679555`, `runs/v2_gae_g099_reset_warmup1_clip03_s2__seed2__1771679688`, `runs/v2_gae_g099_reset_warmup1_clip03_s3__seed3__1771679823`
+
+| Seed | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|------|------|------|------|------|------|------|------|------|------|------|------|
+| 1 | 43.8 | 36.7 | 73.8 | 72.9 | 69.5 | 76.5 | 76.7 | 79.1 | 81.2 | **85.7** | 85.7 |
+| 2 | 42.2 | 42.6 | 52.7 | 43.1 | 56.6 | 62.0 | 70.5 | 82.8 | 82.4 | **88.5** | 88.5 |
+| 3 | 50.8 | 40.5 | 73.3 | **73.9** | 71.7 | 68.2 | 61.4 | 66.4 | 76.9 | 73.5 | 73.9 |
+| **Mean** | 45.6 | 39.9 | 66.6 | 63.3 | 65.9 | 68.9 | 69.5 | 76.1 | 80.2 | **82.6** | **82.7** |
+
+Worse than baseline (82.7% vs 87.4%). Warmup wastes 1 iteration without policy update, clip=0.3 causes oscillation with bad V (random critic).
+
+### Notes
+- **No configuration beat the baseline** (3-seed mean 87.4%) when starting from a reset (random) critic.
+- GAE pretrain doesn't help: PPO's own 100-epoch critic training per iteration is sufficient.
+- Higher epochs (200) overfits. Smaller batches (50 envs) oscillate. MC1 at gamma=0.99 has too much variance.
+- warmup + wider clip only helps when V is already good; with random V it hurts.
+- **⚠️ no-reset_critic 不可用**: 曾尝试保留 checkpoint 中 dense reward 训练的 critic（不 reset），配合 warmup=1 + clip=0.3 达到 97.9% mean peak。但此方法依赖 PPO 预训练阶段的 dense reward critic 提供 V 初始化，对 IL policy（无 pretrained critic）不适用，不具备通用性。结论已作废，实验数据不记录。
+- **Baseline 的 100 envs / 100 epochs / 10 iters 已经是 reset critic 场景下的最优配置。**
+
+---
+

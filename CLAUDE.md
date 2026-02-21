@@ -153,14 +153,30 @@ python -m RL.iql_awr_offline --iql_expectile_tau 0.7 --awr_beta 1.0
 
 **RULE**: MC AWR use gamma=0.8, GAE PPO use gamma=0.95-0.99
 
-### 11. Regression Tricks Don't Help Online PPO
+### 11. Reward Scale: Doesn't Help Online PPO, But Helps Offline V Learning
 
-**WRONG**: Applying offline regression tricks to online PPO
+**Online PPO**: reward_scale doesn't help
 - reward_scale=20: doesn't help
 - big critic (10x512): doesn't help
 - both combined: WORST (81.2% vs 90.7% baseline)
+- REASON: Online PPO iteratively improves V, so V is already good enough for GAE
 
-**REASON**: GAE only needs V(s), not Q(s,a) - error cancellation via telescoping makes SNR tricks unnecessary
+**Offline/single-batch V learning**: reward_scale DOES help
+- TD(0)+rs10 learns V with r=0.68 vs r=0.44 without scaling (Issue #13)
+- GAE advantage ranking with different V sources (vs MC16 ground truth):
+
+| V source for GAE | A r | A ρ (ranking) |
+|-------------------|-----|---------------|
+| V_mc1 (≈traditional) | 0.357 | 0.023 |
+| V_td0 (rs=1) | 0.470 | 0.069 |
+| V_td0 (rs=10) | 0.491 | 0.100 |
+| V_mc_target (rs=10, NN upper bound) | 0.528 | 0.130 |
+| V_mc16 (oracle) | 0.627 | 0.357 |
+
+- TD+rs V gives 4-5x better advantage ranking than MC1-level V (ρ=0.10 vs 0.02)
+- But absolute ranking quality is still low (ρ<0.15) due to fundamental SNR problem (Issue #8)
+
+**RULE**: For online iterative RL, reward_scale is unnecessary. For offline/single-batch V learning, reward_scale improves V quality and downstream advantage estimation.
 
 ### 12. Batch Size for Offline AWR
 
@@ -172,6 +188,68 @@ python -m RL.iql_awr_offline --iql_expectile_tau 0.7 --awr_beta 1.0
 --num_envs 128 --num_steps 200 --num_minibatches 32 --update_epochs 4
 ```
 
+### 14. Experiment Setting Alignment
+
+**WRONG**: Running experiments with different settings from the baseline, then comparing results
+```bash
+# Baseline: num_envs=100, total_timesteps=50000 (10 iter, batch=5000)
+# New experiment: num_envs=512, total_timesteps=2000000 (78 iter, batch=25600)
+# 40x more training data → meaningless comparison
+```
+
+**CORRECT**: Always use the same settings as `run_v2_all.sh` for fair comparison
+```bash
+COMMON_GAE="--num_envs 100 --num_steps 50 --num_minibatches 5 --update_epochs 100 --target_kl 100.0 --eval_freq 1 --total_timesteps 50000"
+```
+When testing a new method, run the baseline with identical settings in the same batch to avoid misalignment.
+
+### 15. TD Pretrain Does Not Help Online GAE PPO
+
+**WRONG**: Assuming TD-pretrained V initialization improves iterative GAE PPO
+- TD-10 pretrain (first iter only): peak 78.5% vs baseline 92.1% (WORSE)
+- TD-10 finetune (every iter, critic TD only): peak 79.6% (WORSE)
+- TD-10 retrain (every iter, reset critic): peak 78.4% (WORSE)
+
+**All TD-10 variants are ~12-14% worse than baseline at gamma=0.99.**
+
+**WHY**: PPO with update_epochs=100 already trains the critic extensively each iteration (100 epochs of value loss on on-policy data). This is much more effective than TD-10's 200 epochs because:
+1. PPO's value targets (GAE returns) are computed from on-policy data with telescoping error cancellation
+2. TD-10's targets use bootstrap from a bad initial V, compounding errors
+3. TD-10 pretrain at iter 1 uses a random critic for bootstrapping → bad targets → bad initialization → hurts early iterations
+
+| Mode | Peak SR | vs Baseline |
+|------|---------|-------------|
+| Baseline GAE (gamma=0.99) | 92.1% | — |
+| TD-10 pretrain (first only) | 78.5% | -13.6% |
+| TD-10 finetune (every iter) | 79.6% | -12.5% |
+| TD-10 retrain (every iter) | 78.4% | -13.7% |
+
+**RULE**: For online iterative RL with sufficient update epochs, do NOT use TD pretrain. PPO's own critic learning is already strong enough. TD pretrain only appeared to help when using misaligned settings (78 iter vs 10 iter baseline).
+
+### 13. TD/NN V Learning: Small Signal SNR is the Bottleneck
+
+**PROBLEM**: TD(0) learns V with only r=0.44 correlation to MC16 V^π (gamma=0.8, sparse reward).
+The V range gets systematically compressed (pred_std/MC_std ≈ 33%).
+
+**ROOT CAUSE**: NN small-signal SNR, NOT TD bootstrap error.
+
+Evidence:
+- **n-step TD (1→50) doesn't help**: r stays at 0.44 regardless of n. 50-step ≈ MC, still 0.44
+- **MC target supervised regression also only r=0.49**: NN can't fit V even with perfect targets
+- **MC1 vs MC16 correlation is r=0.48**: MC16 target itself is noisy at this sample size
+- **reward_scale=10 dramatically helps TD**: r jumps 0.44→0.68 (V values become larger, NN regression-to-mean effect shrinks relatively)
+- **MC target + reward_scale=10 gives r=0.88**: NN CAN learn V when signal is large enough
+
+| Method | V r | V ρ | pred_std/MC_std |
+|--------|-----|-----|-----------------|
+| TD(0) rs=1 | 0.435 | 0.377 | 33% |
+| MC target rs=1 | 0.488 | 0.416 | 47% |
+| TD(0) rs=10 | 0.677 | 0.632 | 80% |
+| TD(0) rs=100 | 0.724 | 0.702 | 70% |
+| MC target rs=10 | 0.880 | 0.816 | 85% |
+
+**IMPLICATION**: For sparse reward with small V magnitudes, scale up rewards before TD/regression. The bottleneck is NN expressiveness at small signal levels, not the learning algorithm (TD vs MC vs n-step).
+
 ---
 
 ## Key Research Findings
@@ -181,6 +259,24 @@ python -m RL.iql_awr_offline --iql_expectile_tau 0.7 --awr_beta 1.0
 3. **MC16 >> MC1**: +21% (99.1% vs 78.3%) - multi-sample MC reduces variance
 4. **Optimal >> On-policy**: +4% (99.1% vs 96.7%) - helpful but not essential
 5. **Learned Q cannot rank actions**: SNR problem is fundamental, use GAE instead
+
+### 6. Role of Data in Iterative RL — Data Provides States, Not Learning Signal
+
+In online iterative RL (AWR/PPO), each iteration: rollout → MC re-rollout → advantages → policy update.
+
+**Transitions (s, a, r, s') only determine WHERE to evaluate (which states). The actual learning signal (advantages) comes entirely from MC re-rollout, NOT from the transitions' rewards.** The rewards in the collected transitions are never used — advantages are computed purely from re-rollout returns.
+
+This explains the relative importance of each factor:
+
+| Factor | Impact | Why |
+|--------|--------|-----|
+| MC samples (16 vs 1) | **+22%** | Re-rollout quality = advantage quality = learning signal quality |
+| Optimal vs on-policy | +3% | Re-rollout policy quality, but iterative recomputation compensates |
+| Online vs offline | +14% | Online refreshes states (on-policy); offline states become OOD |
+
+In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2) providing the learning signal (via TD → V estimate). But **TD from off-policy transitions can only learn V^{behavior}, not V\***. V correlation analysis confirmed: V_IQL(s) ≈ 0.09 (constant, ≈ behavior value), while V*(s) = 0.42 at the same states. IQL V doesn't track V* at all — when V* ranges 0.02→0.89, V_IQL only varies 0.05→0.10.
+
+**Conclusion: offline data cannot provide accurate value estimates for states outside the behavior distribution. For effective RL, the critic must come from re-rollout (MC) or bootstrapping (GAE with good V), not from offline TD learning.**
 
 ## Recording Experiments
 

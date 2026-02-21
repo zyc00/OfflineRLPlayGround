@@ -89,6 +89,22 @@ class Args:
     """evaluate every N iterations"""
     warmup_iters: int = 0
     """iterations to train critic only (no policy update). Useful with reset_critic."""
+    td_pretrain_v: bool = False
+    """Pre-train critic with TD + reward_scale before GAE computation"""
+    td_mode: Literal["first", "finetune", "retrain"] = "first"
+    """TD pretrain mode: first=first iter only, finetune=every iter keep weights, retrain=every iter reset critic"""
+    td_nstep: int = 1
+    """N-step for TD pre-training (1=TD(0), 10=TD(10), etc.)"""
+    td_reward_scale: float = 10.0
+    """Reward scale for TD pre-training (only used with td_pretrain_v)"""
+    td_epochs: int = 200
+    """Number of TD pre-training epochs per iteration"""
+    td_batch_size: int = 256
+    """Batch size for TD pre-training"""
+    gae_pretrain_iters: int = 0
+    """Iterative GAE V pre-training iterations before main loop. 0=disabled, 5=recommended."""
+    gae_pretrain_epochs: int = 100
+    """Training epochs per GAE pretrain iteration."""
     seed: int = 1
     cuda: bool = True
 
@@ -258,6 +274,117 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs), device=device)
     values = torch.zeros((args.num_steps, args.num_envs), device=device)
 
+    # ── GAE critic pre-training ───────────────────────────────────────
+    if args.gae_pretrain_iters > 0:
+        print(f"\n=== GAE Critic Pre-training ({args.gae_pretrain_iters} iters, {args.gae_pretrain_epochs} epochs each) ===")
+        pretrain_t0 = time.time()
+
+        # One rollout with behavior policy (reuse storage tensors)
+        pt_final_obs = {}  # step -> (mask, final_observation) for terminated envs
+        pt_next_obs, _ = envs.reset(seed=args.seed)
+        pt_next_done = torch.zeros(args.num_envs, device=device)
+
+        agent.eval()
+        with torch.no_grad():
+            for step in range(args.num_steps):
+                obs[step] = pt_next_obs
+                dones[step] = pt_next_done
+                action = agent.get_action(pt_next_obs, deterministic=False)
+                pt_next_obs, reward, terminations, truncations, infos = envs.step(
+                    clip_action(action)
+                )
+                pt_next_done = (terminations | truncations).float()
+                rewards[step] = reward.view(-1) * args.reward_scale
+
+                if "final_info" in infos:
+                    done_mask = infos["_final_info"]
+                    if done_mask.any():
+                        pt_final_obs[step] = (
+                            done_mask.clone(),
+                            infos["final_observation"][done_mask].clone(),
+                        )
+
+        pt_last_obs = pt_next_obs.clone()
+        pt_last_done = pt_next_done.clone()
+
+        # Iterative GAE V training with separate critic-only optimizer
+        pretrain_optimizer = optim.Adam(
+            agent.critic.parameters(), lr=args.learning_rate, eps=1e-5
+        )
+
+        for gae_iter in range(1, args.gae_pretrain_iters + 1):
+            # 1. Compute V for all obs + final_values with current critic
+            with torch.no_grad():
+                for t in range(args.num_steps):
+                    values[t] = agent.get_value(obs[t]).flatten()
+                pt_next_value = agent.get_value(pt_last_obs).reshape(1, -1)
+
+                pt_final_values = torch.zeros(
+                    (args.num_steps, args.num_envs), device=device
+                )
+                for step, (mask, fobs) in pt_final_obs.items():
+                    pt_final_values[
+                        step,
+                        torch.arange(args.num_envs, device=device)[mask],
+                    ] = agent.get_value(fobs).view(-1)
+
+            # 2. GAE computation (same logic as main loop)
+            with torch.no_grad():
+                pt_advantages = torch.zeros_like(rewards)
+                lastgaelam = 0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        next_not_done = 1.0 - pt_last_done
+                        nextvalues = pt_next_value
+                    else:
+                        next_not_done = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    real_next_values = next_not_done * nextvalues + pt_final_values[t]
+                    delta = rewards[t] + args.gamma * real_next_values - values[t]
+                    pt_advantages[t] = lastgaelam = (
+                        delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
+                    )
+                pt_returns = pt_advantages + values
+
+            # 3. Train critic on GAE returns
+            flat_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+            flat_returns = pt_returns.reshape(-1)
+            N = flat_obs.shape[0]
+
+            agent.train()
+            for epoch in range(args.gae_pretrain_epochs):
+                perm = torch.randperm(N, device=device)
+                for start in range(0, N, args.minibatch_size):
+                    mb_inds = perm[start : start + args.minibatch_size]
+                    v_pred = agent.get_value(flat_obs[mb_inds]).view(-1)
+                    v_loss = 0.5 * ((v_pred - flat_returns[mb_inds]) ** 2).mean()
+                    pretrain_optimizer.zero_grad()
+                    v_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        agent.critic.parameters(), args.max_grad_norm
+                    )
+                    pretrain_optimizer.step()
+
+            # Log V quality
+            with torch.no_grad():
+                v_pred_all = agent.get_value(flat_obs).view(-1)
+                corr = torch.corrcoef(
+                    torch.stack([v_pred_all, flat_returns])
+                )[0, 1].item()
+            print(
+                f"  GAE pretrain iter {gae_iter}/{args.gae_pretrain_iters}: "
+                f"v_loss={v_loss.item():.6f}, V-return corr={corr:.4f}"
+            )
+            writer.add_scalar("pretrain/v_loss", v_loss.item(), gae_iter)
+            writer.add_scalar("pretrain/v_return_corr", corr, gae_iter)
+
+        pretrain_time = time.time() - pretrain_t0
+        print(f"  GAE pretrain total: {pretrain_time:.1f}s")
+        writer.add_scalar("time/gae_pretrain", pretrain_time, 0)
+
+        # Recreate main optimizer so critic momentum starts fresh
+        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
     # ── Training loop ──────────────────────────────────────────────────
     global_step = 0
     start_time = time.time()
@@ -345,6 +472,147 @@ if __name__ == "__main__":
                     ).view(-1)
 
         rollout_time = time.time() - rollout_t0
+
+        # ── TD pre-train critic with reward scaling ─────────────
+        td_should_run = (
+            args.td_pretrain_v and not use_mc_rerollout and (
+                (args.td_mode == "first" and iteration <= args.warmup_iters + 1) or
+                args.td_mode in ("finetune", "retrain")
+            )
+        )
+        if td_should_run:
+            td_t0 = time.time()
+
+            # Reset critic for retrain mode
+            if args.td_mode == "retrain" and iteration > 1:
+                from data.data_collection.ppo import layer_init
+                h = args.critic_hidden_dim
+                obs_dim = np.array(envs.single_observation_space.shape).prod()
+                layers = [layer_init(nn.Linear(obs_dim, h)), nn.Tanh()]
+                for _ in range(args.critic_num_layers - 1):
+                    layers += [layer_init(nn.Linear(h, h)), nn.Tanh()]
+                layers.append(layer_init(nn.Linear(h, 1)))
+                agent.critic = nn.Sequential(*layers).to(device)
+                # Rebuild optimizer to include new critic params
+                optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+            T_steps = args.num_steps
+            E_envs = args.num_envs
+            rs = args.td_reward_scale
+            nstep = args.td_nstep
+
+            if nstep == 1:
+                # ── TD(0): semi-gradient with moving targets ──
+                flat_s = obs.reshape(-1, obs.shape[-1])
+                flat_r = rewards.reshape(-1) * rs
+                flat_ns = torch.zeros_like(obs)
+                flat_ns[:-1] = obs[1:]
+                flat_ns[-1] = next_obs
+                flat_ns = flat_ns.reshape(-1, obs.shape[-1])
+                flat_done = dones.reshape(-1)
+
+                N = flat_s.shape[0]
+                critic_optimizer = optim.Adam(
+                    agent.critic.parameters(), lr=args.learning_rate, eps=1e-5,
+                )
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    critic_optimizer, T_max=args.td_epochs, eta_min=1e-5,
+                )
+
+                agent.train()
+                for td_epoch in range(args.td_epochs):
+                    perm = torch.randperm(N, device=device)
+                    for start in range(0, N, args.td_batch_size):
+                        idx = perm[start : start + args.td_batch_size]
+                        s, r, ns, d = flat_s[idx], flat_r[idx], flat_ns[idx], flat_done[idx]
+
+                        with torch.no_grad():
+                            v_next = agent.get_value(ns).view(-1)
+                            td_target = r + args.gamma * v_next * (1.0 - d)
+
+                        v_pred = agent.get_value(s).view(-1)
+                        v_loss = 0.5 * ((v_pred - td_target) ** 2).mean()
+
+                        critic_optimizer.zero_grad()
+                        v_loss.backward()
+                        nn.utils.clip_grad_norm_(agent.critic.parameters(), args.max_grad_norm)
+                        critic_optimizer.step()
+                    scheduler.step()
+
+            else:
+                # ── N-step TD: precompute fixed targets, then regress ──
+                scaled_rewards = rewards * rs  # (T, E)
+                with torch.no_grad():
+                    all_v = torch.zeros(T_steps + 1, E_envs, device=device)
+                    for t in range(T_steps):
+                        all_v[t] = agent.get_value(obs[t]).flatten()
+                    all_v[T_steps] = agent.get_value(next_obs).flatten()
+
+                    nstep_targets = torch.zeros(T_steps, E_envs, device=device)
+                    for t in range(T_steps):
+                        G = torch.zeros(E_envs, device=device)
+                        gamma_k = torch.ones(E_envs, device=device)
+                        alive = torch.ones(E_envs, dtype=torch.bool, device=device)
+                        steps = min(nstep, T_steps - t)
+
+                        for k in range(steps):
+                            step = t + k
+                            if k > 0:
+                                just_ended = dones[step].bool() & alive
+                                alive = alive & ~just_ended
+                            G += gamma_k * scaled_rewards[step] * alive.float()
+                            gamma_k *= args.gamma
+
+                        # Bootstrap for alive envs
+                        boot_step = t + steps
+                        if boot_step < T_steps:
+                            boot_alive = alive & ~dones[boot_step].bool()
+                            G += gamma_k * all_v[boot_step] * boot_alive.float()
+                        else:
+                            G += gamma_k * all_v[T_steps] * alive.float() * (1 - next_done)
+
+                        nstep_targets[t] = G
+
+                # Flatten for training
+                flat_s = obs.reshape(-1, obs.shape[-1])
+                flat_targets = nstep_targets.reshape(-1)
+                N = flat_s.shape[0]
+
+                critic_optimizer = optim.Adam(
+                    agent.critic.parameters(), lr=args.learning_rate, eps=1e-5,
+                )
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    critic_optimizer, T_max=args.td_epochs, eta_min=1e-5,
+                )
+
+                agent.train()
+                for td_epoch in range(args.td_epochs):
+                    perm = torch.randperm(N, device=device)
+                    for start in range(0, N, args.td_batch_size):
+                        idx = perm[start : start + args.td_batch_size]
+                        v_pred = agent.get_value(flat_s[idx]).view(-1)
+                        v_loss = 0.5 * ((v_pred - flat_targets[idx]) ** 2).mean()
+
+                        critic_optimizer.zero_grad()
+                        v_loss.backward()
+                        nn.utils.clip_grad_norm_(agent.critic.parameters(), args.max_grad_norm)
+                        critic_optimizer.step()
+                    scheduler.step()
+
+            # Rescale critic back to reward_scale=1 by dividing last layer
+            with torch.no_grad():
+                last_layer = agent.critic[-1]  # nn.Linear(hidden, 1)
+                last_layer.weight.div_(rs)
+                last_layer.bias.div_(rs)
+
+            # Re-compute values with the rescaled critic
+            with torch.no_grad():
+                for step in range(args.num_steps):
+                    values[step] = agent.get_value(obs[step]).flatten()
+
+            td_time = time.time() - td_t0
+            writer.add_scalar("time/td_pretrain", td_time, global_step)
+            print(f"  TD-{nstep} pretrain: {td_time:.1f}s, rs={rs}")
 
         # ── Compute advantages ─────────────────────────────────────
         if use_mc_rerollout:
@@ -502,7 +770,9 @@ if __name__ == "__main__":
 
                 # Total loss
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                # When td_mode is finetune/retrain, critic is managed by TD only
+                effective_vf_coef = 0.0 if (args.td_pretrain_v and args.td_mode in ("finetune", "retrain")) else args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * effective_vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
