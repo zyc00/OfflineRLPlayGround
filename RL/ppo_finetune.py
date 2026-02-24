@@ -89,6 +89,8 @@ class Args:
     """evaluate every N iterations"""
     warmup_iters: int = 0
     """iterations to train critic only (no policy update). Useful with reset_critic."""
+    critic_pretrain_epochs: int = 0
+    """Per-iteration critic-only epochs BEFORE PPO. GAE recomputed after."""
     td_pretrain_v: bool = False
     """Pre-train critic with TD + reward_scale before GAE computation"""
     td_mode: Literal["first", "finetune", "retrain"] = "first"
@@ -107,6 +109,10 @@ class Args:
     """Training epochs per GAE pretrain iteration."""
     seed: int = 1
     cuda: bool = True
+
+    # Eval env overrides (needed for StackCube etc.)
+    eval_reconfiguration_freq: int = 0
+    """reconfiguration_freq for eval envs (1 for StackCube)"""
 
     # Logging
     exp_name: Optional[str] = None
@@ -166,8 +172,11 @@ if __name__ == "__main__":
     )
 
     envs = gym.make(args.env_id, num_envs=args.num_envs, **env_kwargs)
+    eval_env_kwargs = dict(env_kwargs)
+    if args.eval_reconfiguration_freq > 0:
+        eval_env_kwargs["reconfiguration_freq"] = args.eval_reconfiguration_freq
     eval_envs = gym.make(
-        args.env_id, num_envs=args.num_eval_envs, **env_kwargs,
+        args.env_id, num_envs=args.num_eval_envs, **eval_env_kwargs,
     )
 
     if isinstance(envs.action_space, gym.spaces.Dict):
@@ -723,6 +732,47 @@ if __name__ == "__main__":
             writer.add_scalar("time/rollout", rollout_time, global_step)
             writer.add_scalar("time/update", update_time, global_step)
             continue
+
+        # ── Critic pretrain (per-iteration) ──────────────────────
+        if args.critic_pretrain_epochs > 0:
+            agent.train()
+            for _cp_epoch in range(args.critic_pretrain_epochs):
+                perm = torch.randperm(args.batch_size, device=device)
+                for start in range(0, args.batch_size, args.minibatch_size):
+                    mb_inds = perm[start : start + args.minibatch_size]
+                    newvalue = agent.get_value(b_obs[mb_inds]).view(-1)
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    optimizer.zero_grad()
+                    v_loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    optimizer.step()
+
+            # Recompute GAE with improved critic
+            agent.eval()
+            with torch.no_grad():
+                values_new = torch.zeros_like(rewards)
+                for t in range(args.num_steps):
+                    values_new[t] = agent.get_value(obs[t]).view(-1)
+                next_value_new = agent.get_value(next_obs).reshape(1, -1)
+                advantages_new = torch.zeros_like(rewards)
+                lastgaelam = 0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        next_not_done = 1.0 - next_done
+                        nextvalues = next_value_new
+                    else:
+                        next_not_done = 1.0 - dones[t + 1]
+                        nextvalues = values_new[t + 1]
+                    real_next_values = next_not_done * nextvalues + final_values[t]
+                    delta = rewards[t] + args.gamma * real_next_values - values_new[t]
+                    advantages_new[t] = lastgaelam = (
+                        delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
+                    )
+                returns_new = advantages_new + values_new
+
+            b_advantages = advantages_new.reshape(-1)
+            b_returns = returns_new.reshape(-1)
+            b_values = values_new.reshape(-1)
 
         # ── PPO update ─────────────────────────────────────────────
         agent.train()

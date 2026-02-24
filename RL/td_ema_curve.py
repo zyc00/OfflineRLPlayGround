@@ -1,8 +1,9 @@
-"""Training curve: V quality vs epoch for TD+EMA, MC1, GAE across data sizes.
+"""Training curve: V quality vs epoch for TD+EMA, MC1, GAE, IQL across data sizes.
 Logs Pearson r against on-policy MC16 at regular intervals during training.
 
 Usage:
   python -u -m RL.td_ema_curve --gamma 0.99
+  python -u -m RL.td_ema_curve --gamma 0.99 --methods TD+EMA IQL
 """
 
 import copy
@@ -29,6 +30,11 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 from data.data_collection.ppo import Agent, layer_init
 
 
+def expectile_loss(diff, tau):
+    weight = torch.where(diff > 0, tau, 1.0 - tau)
+    return (weight * (diff ** 2)).mean()
+
+
 @dataclass
 class Args:
     checkpoint: str = "runs/pickcube_ppo/ckpt_76_logstd-1.5.pt"
@@ -52,6 +58,14 @@ class Args:
     """Evaluate V quality every N epochs."""
     rollout_counts: tuple[int, ...] = (1, 5, 10, 20, 50, 100)
     methods: tuple[str, ...] = ("TD+EMA", "MC1", "GAE")
+    # n-step TD
+    td_n_step: int = 1
+    """N-step for TD+EMA. 1=standard TD(0), 10=10-step, etc."""
+    # IQL
+    expectile_tau: float = 0.5
+    """Expectile for IQL V loss. 0.5=mean, >0.5=upper expectile."""
+    iql_td_n: int = 10
+    """N-step TD for IQL Q target. 1=standard TD(0), 50=full MC."""
     seed: int = 1
     env_id: str = "PickCube-v1"
     reward_mode: str = "sparse"
@@ -103,6 +117,13 @@ if __name__ == "__main__":
         layers.append(layer_init(nn.Linear(hidden_dim, 1)))
         return nn.Sequential(*layers).to(device)
 
+    def make_q_net(hidden_dim=256):
+        layers = [layer_init(nn.Linear(obs_dim + action_dim, hidden_dim)), nn.Tanh()]
+        for _ in range(args.critic_layers - 1):
+            layers += [layer_init(nn.Linear(hidden_dim, hidden_dim)), nn.Tanh()]
+        layers.append(layer_init(nn.Linear(hidden_dim, 1)))
+        return nn.Sequential(*layers).to(device)
+
     def _clone_state(sd):
         if isinstance(sd, dict):
             return {k: _clone_state(v) for k, v in sd.items()}
@@ -115,7 +136,7 @@ if __name__ == "__main__":
             return sd.repeat_interleave(repeats, dim=0)
         return sd
 
-    # ── Phase 1: Collect rollouts ──
+    # ── Phase 1: Collect rollouts (store actions for IQL) ──
     print(f"Phase 1: Collecting {max_rollouts} rollouts...")
     sys.stdout.flush()
     t0 = time.time()
@@ -123,6 +144,7 @@ if __name__ == "__main__":
 
     for ri in range(max_rollouts):
         roll_obs = torch.zeros(T, E, obs_dim, device=device)
+        roll_actions = torch.zeros(T, E, action_dim, device=device)
         roll_rewards = torch.zeros(T, E, device=device)
         roll_dones = torch.zeros(T, E, device=device)
         saved_states = [] if ri == 0 else None
@@ -137,6 +159,7 @@ if __name__ == "__main__":
                 roll_obs[step] = next_obs
                 roll_dones[step] = next_done
                 action = agent.get_action(next_obs, deterministic=False)
+                roll_actions[step] = action
                 next_obs, reward, term, trunc, _ = envs.step(clip_action(action))
                 next_done = (term | trunc).float()
                 roll_rewards[step] = reward.view(-1)
@@ -153,7 +176,7 @@ if __name__ == "__main__":
             mc1[t] = future
 
         data_pool.append(dict(
-            obs=roll_obs, rewards=roll_rewards, dones=roll_dones,
+            obs=roll_obs, actions=roll_actions, rewards=roll_rewards, dones=roll_dones,
             next_obs=next_obs.clone(), next_done=next_done.clone(),
             mc1_returns=mc1, saved_states=saved_states,
         ))
@@ -227,6 +250,7 @@ if __name__ == "__main__":
         d = data_pool[:n]
         return (
             torch.cat([x['obs'] for x in d], dim=1),
+            torch.cat([x['actions'] for x in d], dim=1),
             torch.cat([x['rewards'] for x in d], dim=1),
             torch.cat([x['dones'] for x in d], dim=1),
             torch.cat([x['next_obs'] for x in d], dim=0),
@@ -239,19 +263,60 @@ if __name__ == "__main__":
             v = critic(eval_obs.reshape(-1, obs_dim)).view(-1).cpu().numpy() / scale
         return pearsonr(v, mc16_flat)[0]
 
-    # ── TD+EMA with periodic eval ──
-    def train_td_ema(obs, rewards, dones, next_obs, next_done, mc1_ret):
+    # ── TD+EMA with periodic eval (supports n-step) ──
+    def train_td_ema(obs, actions, rewards, dones, next_obs, next_done, mc1_ret):
         Tl, El, D = obs.shape
+        rs = args.td_reward_scale
+        n = args.td_n_step
+
         flat_s = obs.reshape(-1, D)
-        flat_r = rewards.reshape(-1) * args.td_reward_scale
-        flat_ns = torch.zeros_like(obs)
-        flat_ns[:-1] = obs[1:]
-        flat_ns[-1] = next_obs
-        flat_ns = flat_ns.reshape(-1, D)
-        flat_d = torch.zeros_like(rewards)
-        flat_d[:-1] = dones[1:]
-        flat_d[-1] = next_done
-        flat_d = flat_d.reshape(-1)
+
+        if n == 1:
+            # Standard 1-step TD
+            flat_r = rewards.reshape(-1) * rs
+            flat_ns = torch.zeros_like(obs)
+            flat_ns[:-1] = obs[1:]
+            flat_ns[-1] = next_obs
+            flat_ns = flat_ns.reshape(-1, D)
+            flat_d = torch.zeros_like(rewards)
+            flat_d[:-1] = dones[1:]
+            flat_d[-1] = next_done
+            flat_d = flat_d.reshape(-1)
+            flat_nstep_ret = flat_r
+            flat_boot_obs = flat_ns
+            flat_boot_mask = args.gamma * (1 - flat_d)
+        else:
+            # N-step TD: target = sum_{k=0}^{n-1} gamma^k * r_{t+k} + gamma^n * V(s_{t+n})
+            nstep_ret = torch.zeros(Tl, El, device=device)
+            nstep_boot_obs = torch.zeros(Tl, El, D, device=device)
+            nstep_boot_mask = torch.zeros(Tl, El, device=device)
+
+            for t in range(Tl):
+                cumul = torch.zeros(El, device=device)
+                discount = torch.ones(El, device=device)
+                alive = torch.ones(El, device=device)
+                for k in range(n):
+                    step = t + k
+                    if step < Tl:
+                        cumul += discount * alive * rewards[step]
+                        if k < n - 1 and step + 1 < Tl:
+                            alive *= (1.0 - dones[step + 1])
+                        elif k < n - 1 and step + 1 == Tl:
+                            alive *= (1.0 - next_done)
+                        discount *= args.gamma
+                    else:
+                        break
+                nstep_ret[t] = cumul * rs
+                boot_step = min(t + n, Tl)
+                if boot_step < Tl:
+                    nstep_boot_obs[t] = obs[boot_step]
+                else:
+                    nstep_boot_obs[t] = next_obs
+                nstep_boot_mask[t] = discount * alive
+
+            flat_nstep_ret = nstep_ret.reshape(-1)
+            flat_boot_obs = nstep_boot_obs.reshape(-1, D)
+            flat_boot_mask = nstep_boot_mask.reshape(-1)
 
         N = flat_s.shape[0]
         mb = min(args.minibatch_size, N)
@@ -270,7 +335,8 @@ if __name__ == "__main__":
             for start in range(0, N, mb):
                 idx = perm[start:start + mb]
                 with torch.no_grad():
-                    target = flat_r[idx] + args.gamma * critic_target(flat_ns[idx]).view(-1) * (1 - flat_d[idx])
+                    v_boot = critic_target(flat_boot_obs[idx]).view(-1)
+                    target = flat_nstep_ret[idx] + flat_boot_mask[idx] * v_boot
                 loss = 0.5 * ((critic(flat_s[idx]).view(-1) - target) ** 2).mean()
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), 0.5); opt.step()
@@ -289,7 +355,7 @@ if __name__ == "__main__":
         return epochs, r_values, grad_steps_log
 
     # ── MC1 with periodic eval ──
-    def train_mc1(obs, rewards, dones, next_obs, next_done, mc1_ret):
+    def train_mc1(obs, actions, rewards, dones, next_obs, next_done, mc1_ret):
         D = obs.shape[-1]
         flat_obs = obs.reshape(-1, D)
         flat_ret = mc1_ret.reshape(-1)
@@ -322,7 +388,7 @@ if __name__ == "__main__":
         return epochs, r_values, grad_steps_log
 
     # ── GAE with periodic eval ──
-    def train_gae(obs, rewards, dones, next_obs, next_done, mc1_ret):
+    def train_gae(obs, actions, rewards, dones, next_obs, next_done, mc1_ret):
         Tl, El, D = obs.shape
         flat_obs = obs.reshape(-1, D)
         N = flat_obs.shape[0]
@@ -372,19 +438,127 @@ if __name__ == "__main__":
 
         return epochs, r_values, grad_steps_log
 
+    # ── IQL with n-step Q target + periodic eval ──
+    def train_iql(obs, actions, rewards, dones, next_obs, next_done, mc1_ret):
+        Tl, El, D = obs.shape
+        rs = args.td_reward_scale
+        tau = args.expectile_tau
+        n = args.iql_td_n
+
+        flat_s = obs.reshape(-1, D)
+        flat_a = actions.reshape(-1, action_dim)
+
+        # Precompute n-step returns and bootstrap info
+        # For each (t, env): nstep_ret = sum_{k=0}^{n-1} gamma^k * r_{t+k}
+        #                     boot_obs = s_{t+n}
+        #                     boot_mask = gamma^n * (alive through n steps)
+        nstep_ret = torch.zeros(Tl, El, device=device)
+        nstep_boot_obs = torch.zeros(Tl, El, D, device=device)
+        nstep_boot_mask = torch.zeros(Tl, El, device=device)
+
+        for t in range(Tl):
+            cumul = torch.zeros(El, device=device)
+            discount = torch.ones(El, device=device)
+            alive = torch.ones(El, device=device)
+
+            for k in range(n):
+                step = t + k
+                if step < Tl:
+                    cumul += discount * alive * rewards[step]
+                    if k < n - 1 and step + 1 < Tl:
+                        alive *= (1.0 - dones[step + 1])
+                    elif k < n - 1 and step + 1 == Tl:
+                        alive *= (1.0 - next_done)
+                    discount *= args.gamma
+                else:
+                    break
+
+            nstep_ret[t] = cumul * rs
+
+            boot_step = min(t + n, Tl)
+            if boot_step < Tl:
+                nstep_boot_obs[t] = obs[boot_step]
+            else:
+                nstep_boot_obs[t] = next_obs
+
+            nstep_boot_mask[t] = discount * alive
+
+        flat_nstep_ret = nstep_ret.reshape(-1)
+        flat_boot_obs = nstep_boot_obs.reshape(-1, D)
+        flat_boot_mask = nstep_boot_mask.reshape(-1)
+
+        N = flat_s.shape[0]
+        mb = min(args.minibatch_size, N)
+
+        q_net = make_q_net()
+        q_target = make_q_net()
+        q_target.load_state_dict(q_net.state_dict())
+        v_net = make_critic()
+
+        q_opt = optim.Adam(q_net.parameters(), lr=args.lr, eps=1e-5)
+        v_opt = optim.Adam(v_net.parameters(), lr=args.lr, eps=1e-5)
+
+        epochs, r_values, grad_steps_log = [], [], []
+        total_steps = 0
+
+        for epoch in range(args.td_epochs):
+            q_net.train(); v_net.train()
+            perm = torch.randperm(N, device=device)
+            for start in range(0, N, mb):
+                idx = perm[start:start + mb]
+                s_b = flat_s[idx]
+                a_b = flat_a[idx]
+                sa_b = torch.cat([s_b, a_b], dim=-1)
+
+                # Q loss: n-step TD target
+                # Q(s,a) → sum gamma^k r_{t+k} * rs + gamma^n * V(s_{t+n}) * alive
+                with torch.no_grad():
+                    v_boot = v_net(flat_boot_obs[idx]).view(-1)
+                    q_tgt = flat_nstep_ret[idx] + flat_boot_mask[idx] * v_boot
+                q_pred = q_net(sa_b).view(-1)
+                q_loss = 0.5 * ((q_pred - q_tgt) ** 2).mean()
+                q_opt.zero_grad(); q_loss.backward()
+                nn.utils.clip_grad_norm_(q_net.parameters(), 0.5); q_opt.step()
+
+                # V loss: expectile regression on Q_target(s,a) - V(s)
+                with torch.no_grad():
+                    q_val = q_target(sa_b).view(-1)
+                v_pred = v_net(s_b).view(-1)
+                v_loss = expectile_loss(q_val - v_pred, tau)
+                v_opt.zero_grad(); v_loss.backward()
+                nn.utils.clip_grad_norm_(v_net.parameters(), 0.5); v_opt.step()
+
+                # Polyak update Q_target
+                with torch.no_grad():
+                    for p, pt in zip(q_net.parameters(), q_target.parameters()):
+                        pt.data.mul_(1 - args.ema_tau).add_(p.data, alpha=args.ema_tau)
+                total_steps += 1
+
+            if (epoch + 1) % args.eval_every == 0 or epoch == 0:
+                v_net.eval()
+                r = compute_r(v_net, rs)
+                epochs.append(epoch + 1)
+                r_values.append(r)
+                grad_steps_log.append(total_steps)
+
+        return epochs, r_values, grad_steps_log
+
     # ── Method dispatch ──
     method_fns = {
         "TD+EMA": train_td_ema,
         "MC1": train_mc1,
         "GAE": train_gae,
+        "IQL": train_iql,
     }
 
     # ── Run for each data size x method ──
     print(f"\n{'=' * 70}")
     print(f"Training Curves: methods={args.methods}")
-    print(f"  TD+EMA: {args.td_epochs} epochs, rs={args.td_reward_scale}, ema_tau={args.ema_tau}")
+    print(f"  TD+EMA: {args.td_epochs} epochs, rs={args.td_reward_scale}, ema_tau={args.ema_tau}, n_step={args.td_n_step}")
     print(f"  MC1: {args.td_epochs} epochs")
     print(f"  GAE: {args.gae_iters} iters x {args.gae_epochs} epochs = {args.gae_iters * args.gae_epochs} total")
+    if "IQL" in args.methods:
+        print(f"  IQL: {args.td_epochs} epochs, rs={args.td_reward_scale}, tau={args.expectile_tau}, td_n={args.iql_td_n}")
     print(f"  eval every {args.eval_every} epochs")
     print(f"{'=' * 70}\n")
 
@@ -396,12 +570,12 @@ if __name__ == "__main__":
         print(f"--- N={N_roll} ({trans:,} trans, {steps_per_ep} steps/ep) ---")
         sys.stdout.flush()
 
-        obs, rewards, dones, next_obs, next_done, mc1_ret = combine(N_roll)
+        obs, actions, rewards, dones, next_obs, next_done, mc1_ret = combine(N_roll)
 
         for method in args.methods:
             t0 = time.time()
             fn = method_fns[method]
-            epochs, r_vals, grad_steps = fn(obs, rewards, dones, next_obs, next_done, mc1_ret)
+            epochs, r_vals, grad_steps = fn(obs, actions, rewards, dones, next_obs, next_done, mc1_ret)
             peak_r = max(r_vals)
             peak_idx = r_vals.index(peak_r)
             peak_ep = epochs[peak_idx]
@@ -414,7 +588,7 @@ if __name__ == "__main__":
                 epochs=epochs, r_values=r_vals, grad_steps=grad_steps,
                 peak_r=peak_r, peak_epoch=peak_ep, peak_steps=peak_steps, final_r=final_r)
 
-        del obs, rewards, dones, next_obs, next_done, mc1_ret
+        del obs, actions, rewards, dones, next_obs, next_done, mc1_ret
         torch.cuda.empty_cache()
 
     # ── Summary table ──

@@ -85,6 +85,10 @@ class Args:
     seed: int = 1
     cuda: bool = True
 
+    # Eval env overrides (needed for StackCube etc.)
+    eval_reconfiguration_freq: int = 0
+    """reconfiguration_freq for eval envs (1 for StackCube)"""
+
     # Logging
     exp_name: Optional[str] = None
     capture_video: bool = True
@@ -150,8 +154,11 @@ if __name__ == "__main__":
     )
 
     envs = gym.make(args.env_id, num_envs=args.num_envs, **env_kwargs)
+    eval_env_kwargs = dict(env_kwargs)
+    if args.eval_reconfiguration_freq > 0:
+        eval_env_kwargs["reconfiguration_freq"] = args.eval_reconfiguration_freq
     eval_envs = gym.make(
-        args.env_id, num_envs=args.num_eval_envs, **env_kwargs,
+        args.env_id, num_envs=args.num_eval_envs, **eval_env_kwargs,
     )
     # MC re-rollout dedicated envs (no video recording needed)
     mc_envs_raw = gym.make(args.env_id, num_envs=args.num_mc_envs, **env_kwargs)

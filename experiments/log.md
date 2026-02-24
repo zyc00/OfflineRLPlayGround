@@ -3008,5 +3008,1273 @@ python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy
 
 6. **TD epoch budget matters.** N=1 (5K data) needs ~1400 epochs to reach peak V quality (from V scaling analysis Exp 16). Using 200 epochs severely under-trains.
 
+### Round 5: PPO + Replay Buffer (no reset, fixed 1400 epochs)
+
+Test whether accumulating replay buffer helps TD+EMA V learning when combined with PPO policy update. No critic reset — critic warm-starts across iterations. Onestep advantage only (best from Round 4).
+
+**Commands**:
+```bash
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --td_epochs_per_iter 1400 --update_epochs 100 --exp_name td_ema_onestep_ppo_replay
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --td_epochs_per_iter 1400 --update_epochs 100 --offline_rollouts 20 --exp_name td_ema_onestep_ppo_replay_off20
+```
+
+| Experiment | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak | Final |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GAE PPO baseline | 43.8% | 58.0% | 66.4% | 73.3% | 72.3% | 83.7% | 85.8% | 87.6% | 92.1% | 91.2% | 92.1% (i9) | 91.2% |
+| TD+EMA Onestep PPO reset (R4) | 43.8% | 55.6% | 62.4% | 67.7% | 75.4% | 91.0% | 89.0% | 90.2% | 93.7% | 95.1% | 95.1% (i10) | 95.1% |
+| **TD+EMA Onestep PPO replay** | 43.8% | 55.6% | 65.2% | 78.7% | 86.3% | 93.9% | 91.6% | 81.1% | 94.6% | **97.1%** | **97.1% (i10)** | **97.1%** |
+| TD+EMA Onestep PPO Off20+replay | 38.6% | 63.9% | 72.7% | 83.9% | 80.6% | 84.1% | 73.9% | 75.2% | 64.2% | 70.9% | 84.1% (i6) | 70.9% |
+
+**Run Dirs**: `runs/td_ema_onestep_ppo_replay__seed1__1771804757`, `runs/td_ema_onestep_ppo_replay_off20__seed1__1771805182`
+
+**Findings**:
+- **Replay + PPO = 97.1%** — best result so far! +5% over GAE PPO baseline, +2% over reset-only (95.1%). Replay accumulation helps V learning when critic warm-starts with PPO.
+- **Off20 + replay = 84.1%→70.9% (collapse)** — pre-collected off-policy data is harmful. 100K off-policy transitions dominate the replay buffer (70-95% across iterations), biasing V toward V^{π_0}. Additionally, 1400 epochs on 105K+ data = 147K+ gradient steps causes severe overfitting.
+
+### Round 6: Dynamic Epoch Scaling (td_target_steps=7000)
+
+Test whether dynamically adjusting TD epochs to keep gradient steps constant (~7000) regardless of data size can fix the off20 overfitting issue. `td_epochs = td_target_steps / num_batches_per_epoch`.
+
+**Commands**:
+```bash
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --td_target_steps 7000 --update_epochs 100 --exp_name td_ema_onestep_ppo_replay_dyn
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --td_target_steps 7000 --update_epochs 100 --offline_rollouts 20 --exp_name td_ema_onestep_ppo_off20_dyn
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --td_target_steps 7000 --update_epochs 100 --current_data_only --exp_name td_ema_onestep_ppo_onpol_dyn
+```
+
+| Experiment | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak | Final |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| GAE PPO baseline | 43.8% | 58.0% | 66.4% | 73.3% | 72.3% | 83.7% | 85.8% | 87.6% | 92.1% | 91.2% | 92.1% (i9) | 91.2% |
+| **Replay+PPO 1400ep (R5)** | 43.8% | 55.6% | 65.2% | 78.7% | 86.3% | 93.9% | 91.6% | 81.1% | 94.6% | **97.1%** | **97.1% (i10)** | **97.1%** |
+| Replay+PPO dyn7000 | 43.8% | 55.6% | 73.8% | 87.3% | 84.5% | 72.5% | 80.1% | 92.3% | 90.3% | 85.3% | 92.3% (i8) | 85.3% |
+| Off20+PPO dyn7000 | 38.6% | 79.7% | 73.7% | 52.1% | 54.1% | 72.2% | 76.9% | 74.0% | 75.4% | 78.7% | 79.7% (i2) | 78.7% |
+| On-policy+PPO dyn7000 | 43.8% | 55.6% | 62.4% | 67.7% | 75.4% | 91.0% | 89.0% | 90.2% | 93.7% | 95.1% | 95.1% (i10) | 95.1% |
+
+Dynamic epoch details:
+- Replay+dyn7000: td_epochs = [1400, 700, 466, 350, 280, 233, 200, 175, 155, 140]
+- Off20+dyn7000: td_epochs = [66, 63, 60, 58, 56, 53, 51, 50, 48, 46]
+- On-policy+dyn7000: td_epochs = [1400, 1400, ...] (5K data/iter → always 1400, equivalent to R4 reset)
+
+**Run Dirs**: `runs/td_ema_onestep_ppo_replay_dyn__seed1__1771807785`, `runs/td_ema_onestep_ppo_off20_dyn__seed1__1771807972`, `runs/td_ema_onestep_ppo_onpol_dyn__seed1__1771808180`
+
+**Findings**:
+- **Dynamic scaling hurts replay**: Replay+dyn7000 (92.3%) << Replay+fixed 1400 (97.1%). As replay grows, dynamic scaling reduces epochs (1400→140), under-training V on later iterations. Fixed 1400 epochs keeps V well-trained even with 50K data (still 70K gradient steps at iter 10, reasonable).
+- **Off20 still collapses even with dynamic scaling**: Off20+dyn7000 peaks at i2=79.7% then collapses to 52.1%. The initial V is good (lots of data), but off-policy data dominates the buffer permanently, biasing V toward V^{π_0} regardless of epoch count.
+- **On-policy+dyn7000 = R4 reset** (95.1%): With on-policy only and 5K data, dyn7000 → 1400 epochs every iteration. Confirms on-policy + reset is a solid baseline.
+
+### Overall Summary (Rounds 1-6)
+
+| Configuration | Policy | Critic | Data | Peak SR | vs Baseline |
+|---|---|---|---|---|---|
+| GAE PPO baseline | PPO | iterative GAE V | on-policy | 92.1% | — |
+| TD+EMA Onestep + PPO + reset | PPO | reset each iter | on-policy | 95.1% | +3.0% |
+| **TD+EMA Onestep + PPO + replay 1400ep** | PPO | warm-start | **replay** | **97.1%** | **+5.0%** |
+| TD+EMA Onestep + PPO + replay dyn7000 | PPO | warm-start | replay | 92.3% | +0.2% |
+| TD+EMA GAE + PPO + reset | PPO | reset each iter | on-policy | 91.7% | -0.4% |
+| TD+EMA Onestep + AWR + reset | AWR | reset each iter | on-policy | 88.2% | -3.9% |
+| TD+EMA Onestep + PPO + Off20 | PPO | warm-start | off20+replay | 84.1% | -8.0% |
+
+**Key takeaways**:
+1. **Best: TD+EMA Onestep + PPO + replay + fixed 1400ep = 97.1%** (+5% over GAE PPO). Replay accumulation with warm-started critic is the winning combination.
+2. **PPO >> AWR**: Same V learning, PPO gives +7-12% over AWR. AWR oscillates with 200 update epochs.
+3. **Onestep >> GAE with TD+EMA V**: One-step advantages better exploit TD+EMA's V quality.
+4. **Replay helps, but off-policy pre-collection hurts**: Gradual on-policy accumulation is beneficial; front-loading 100K off-policy data overwhelms the buffer and biases V toward the initial policy.
+5. **Fixed epochs > dynamic scaling for replay**: The V scaling law's "more data → fewer epochs" principle doesn't apply well when data grows gradually and we want V to track the evolving policy.
+
+---
+
+## Exp 20: IQL+PPO Online — Q-V Advantages vs TD+EMA Onestep - 2026-02-22 18:00
+
+**Git**: 58d478e (main)
+**Script**: `RL/iql_ppo_online.py` (new)
+
+### Motivation
+
+Test whether IQL-style Q(s,a)−V(s) advantages can match TD+EMA onestep `r+γV(s')−V(s)` in online iterative RL. Theory: at tau=0.5, IQL Q−V ≈ TD+EMA onestep (both estimate one-step advantage). But IQL requires learning Q(s,a) which suffers from the SNR/ranking problem (Issue #8).
+
+### Design
+
+- **IQL critic**: Q(s,a) network (obs+action→scalar) + V(s) network (obs→scalar)
+- **Q target**: 1-step TD: `r*rs + γ * V_target(s')`
+- **V loss**: expectile regression on `Q_target(s,a) − V(s)`
+- **Advantage**: `Q(s,a)/rs − V(s)/rs`
+- **Policy update**: PPO (same as td_ema_awr_online.py PPO mode)
+- **Replay buffer**: stores (obs, actions, rewards, dones, next_obs)
+
+### Common Settings
+
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt |
+| num_envs | 100 |
+| num_steps | 50 |
+| total_timesteps | 50,000 (10 iterations) |
+| gamma | 0.99 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| iql_epochs_per_iter | 1400 |
+| critic | 3×256 |
+| update_epochs | 100 |
+| num_minibatches | 5 |
+
+### Results
+
+| Experiment | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| IQL tau=0.5 reset | 43.8% | 78.9% | 86.9% | 84.1% | 83.4% | 85.5% | 82.3% | 84.4% | 83.6% | 82.3% | 86.9% (i3) |
+| IQL tau=0.7 reset | 43.8% | 78.9% | 83.4% | 81.3% | 86.4% | 82.8% | 82.7% | 83.4% | 84.8% | 85.5% | 86.4% (i5) |
+| IQL tau=0.5 replay | 43.8% | 72.8% | 76.5% | 74.6% | 72.0% | 71.7% | 67.5% | 65.8% | 63.3% | 61.1% | 76.5% (i3) |
+
+### Comparison with TD+EMA Baselines
+
+| Method | Peak SR | vs GAE PPO baseline |
+|---|---|---|
+| TD+EMA Onestep + PPO + replay 1400ep | **97.1%** | +5.0% |
+| TD+EMA Onestep + PPO + reset | 95.1% | +3.0% |
+| GAE PPO baseline | 92.1% | — |
+| IQL tau=0.5 reset | 86.9% | −5.2% |
+| IQL tau=0.7 reset | 86.4% | −5.7% |
+| IQL tau=0.5 replay | 76.5% | −15.6% |
+
+### Notes
+
+1. **IQL (86.9%) << TD+EMA onestep (95.1%)**: Despite similar V quality (Exp 21), IQL's Q−V advantages are much worse for policy optimization. Confirms Issue #8: Q(s,a) cannot rank actions.
+2. **Reset >> Replay for IQL**: Replay causes collapse (76.5%→61.1%), likely because Q(s,a) trained on off-policy actions becomes even more unreliable.
+3. **tau=0.5 ≈ tau=0.7**: No significant difference, suggesting the expectile doesn't help when Q itself is unreliable.
+4. **Key insight**: `r+γV(s')−V(s)` bypasses Q learning entirely, only needs V(s). This is fundamentally more robust than Q(s,a)−V(s) because V is much easier to learn accurately.
+
+---
+
+## Exp 21: IQL V Scaling Analysis — IQL vs TD+EMA Across Data Sizes - 2026-02-22 19:30
+
+**Command**: `python -u -m RL.td_ema_curve --gamma 0.99 --td-epochs 2000 --eval-every 5 --rollout-counts 1 5 10 20 50 100 --methods "TD+EMA" "IQL" --output runs/iql_vs_tdema_curve_2k.png`
+**Git**: 58d478e (main)
+**Script**: `RL/td_ema_curve.py` (modified to add IQL with n-step Q target)
+**Run Dir**: runs/iql_vs_tdema_curve_2k.pt, runs/iql_vs_tdema_curve_2k.png
+
+### Motivation
+
+The V scaling analysis (Exp 16b) tested TD+EMA, MC1, GAE but not IQL across data sizes. Previous IQL experiment (Exp 11b) only tested N=100. This fills the gap: does IQL V scale similarly to TD+EMA?
+
+### Design
+
+- **IQL implementation**: Added to `td_ema_curve.py` with n-step Q target precomputation
+- **n-step Q target**: `Q_target = Σ_{k=0}^{n-1} γ^k r_{t+k} + γ^n V(s_{t+n})` (n=10)
+- **V learned via expectile regression** on `Q_target(s,a) − V(s)` at tau=0.5
+- Actions stored in data collection for Q(s,a) input
+
+### Settings
+
+| Parameter | Value |
+|-----------|-------|
+| gamma | 0.99 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| td_epochs | 2000 |
+| eval_every | 5 |
+| iql_td_n | 10 |
+| expectile_tau | 0.5 |
+| critic | 3×256 |
+| lr | 3e-4 |
+| batch_size | 1000 |
+| N values | 1, 5, 10, 20, 50, 100 |
+| MC16 ground truth | Same as Exp 14/16 |
+
+### Results — Peak Pearson r (V quality vs MC16 ground truth)
+
+| N | TD+EMA peak r | TD+EMA peak epoch | IQL peak r | IQL peak epoch |
+|---|---|---|---|---|
+| 1 | 0.450 | 1380 | **0.522** | 230 |
+| 5 | 0.653 | 505 | **0.679** | 165 |
+| 10 | 0.719 | 340 | **0.742** | 115 |
+| 20 | 0.764 | 200 | **0.771** | 80 |
+| 50 | **0.827** | 105 | 0.827 | 50 |
+| 100 | **0.854** | 70 | 0.852 | 30 |
+
+### Notes
+
+1. **IQL V quality matches or beats TD+EMA at all data sizes**: +16% at N=1 (0.522 vs 0.450), converging to parity at N≥50.
+
+2. **IQL converges ~6x faster**: N=1 peaks at epoch 230 vs 1380 for TD+EMA. N-step=10 provides much better Q targets than 1-step bootstrap, reducing the number of training iterations needed.
+
+3. **N-step is critical for IQL**: Previous run with n=1 gave r=0.023 at N=1 (completely broken). N-step=10 gives 0.522 — a 22x improvement. The n-step return reduces bootstrap error from the initially random V.
+
+4. **Both methods severely overfit**: Final r is much lower than peak r at all data sizes. Early stopping is essential for both TD+EMA and IQL.
+
+5. **Paradox: IQL V is better, but IQL advantages are worse (Exp 20)**: IQL learns V(s) as well as TD+EMA, but Q(s,a)−V(s) advantages (peak SR 86.9%) are far worse than r+γV(s')−V(s) advantages (peak SR 95.1%). The bottleneck is Q action ranking (Issue #8), not V quality.
+
+6. **Implication**: For online iterative RL, use TD+EMA V with onestep advantages (`r+γV(s')−V(s)`), not IQL Q−V. Both learn V equally well, but onestep bypasses the Q ranking problem entirely.
+
+**Plot**: `runs/iql_vs_tdema_curve_2k.png`
+
+---
+
+## Exp 22: TD+EMA N-step=10 vs IQL — Fair Comparison V Scaling - 2026-02-22 21:25
+
+**Command**: `python -u -m RL.td_ema_curve --gamma 0.99 --td-epochs 2000 --eval-every 5 --rollout-counts 1 5 10 20 50 100 --methods "TD+EMA" "IQL" --td-n-step 10 --output runs/td_nstep10_vs_iql_curve.png`
+**Git**: 58d478e (main)
+**Script**: `RL/td_ema_curve.py` (modified: added `td_n_step` arg to TD+EMA)
+**Run Dir**: runs/td_nstep10_vs_iql_curve.pt, runs/td_nstep10_vs_iql_curve.png
+
+### Motivation
+
+Exp 21 showed IQL (n-step=10) beats TD+EMA (1-step) at small data sizes. But the comparison was unfair — IQL used 10-step Q targets while TD+EMA used 1-step bootstrap. This experiment gives TD+EMA the same n-step=10 treatment to isolate whether the advantage comes from IQL's Q→V framework or simply from n-step returns.
+
+### Settings
+
+| Parameter | Value |
+|-----------|-------|
+| gamma | 0.99 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| td_epochs | 2000 |
+| eval_every | 5 |
+| td_n_step | 10 (NEW — TD+EMA now uses 10-step targets) |
+| iql_td_n | 10 |
+| expectile_tau | 0.5 |
+| critic | 3×256 |
+| lr | 3e-4 |
+| batch_size | 1000 |
+| N values | 1, 5, 10, 20, 50, 100 |
+
+### Results — Peak Pearson r
+
+| N | TD+EMA 1-step (Exp 21) | TD+EMA 10-step (new) | IQL n=10 | TD 10-step vs IQL |
+|---|---|---|---|---|
+| 1 | 0.450 | 0.482 | **0.524** | −8% |
+| 5 | 0.653 | **0.689** | 0.681 | +1% |
+| 10 | 0.719 | **0.742** | 0.742 | ≈0 |
+| 20 | 0.764 | 0.764 | **0.771** | −1% |
+| 50 | 0.827 | 0.821 | **0.827** | −1% |
+| 100 | 0.854 | 0.851 | **0.855** | ≈0 |
+
+### Peak Epochs
+
+| N | TD+EMA 10-step | IQL n=10 |
+|---|---|---|
+| 1 | ep195 | ep235 |
+| 5 | ep60 | ep75 |
+| 10 | ep135 | ep140 |
+| 20 | ep75 | ep90 |
+| 50 | ep55 | ep60 |
+| 100 | ep35 | ep55 |
+
+### Notes
+
+1. **N-step closes the gap**: TD+EMA 10-step matches IQL at N=5-10 (0.689 vs 0.681, 0.742 vs 0.742). The Exp 21 advantage of IQL over TD+EMA was primarily from n-step, NOT from the IQL Q→V framework.
+
+2. **N=1 still favors IQL (+8%)**: 0.482 vs 0.524. At extreme small data, IQL's two-stage Q→V learning may provide implicit regularization. But this gap is much smaller than the 1-step comparison (+16% in Exp 21).
+
+3. **N-step helps TD+EMA mainly at small N**: N=1 +7%, N=5 +5.5%, N=10 +3%, N≥20 ≈0%. With enough data, 1-step bootstrap error is small enough that n-step provides no benefit.
+
+4. **Convergence speed similar**: TD+EMA 10-step and IQL peak at comparable epochs, unlike Exp 21 where IQL was 6x faster (because 1-step TD+EMA needed many more epochs).
+
+5. **Conclusion**: IQL ≈ TD+EMA when both use n-step=10. The IQL framework (learning Q then V via expectile) adds no meaningful value over directly learning V with n-step TD. For online RL, TD+EMA with onestep advantages (`r+γV(s')−V(s)`) is preferred because it avoids the Q ranking problem entirely.
+
+**Plot**: `runs/td_nstep10_vs_iql_curve.png`
+
+---
+
+## Exp 23: IQL+PPO Online — N-step, Advantage Mode, Epoch Ablation - 2026-02-22 22:56
+
+**Git**: 58d478e (main)
+**Script**: `RL/iql_ppo_online.py` (modified: added n-step Q target, GAE advantage mode)
+
+### Motivation
+
+Exp 20 showed IQL Q-V advantages (86.9%) << TD+EMA onestep (95.1%). Exp 22 showed this gap partly came from IQL using 1-step Q targets. This experiment tests:
+1. Does n-step=10 improve IQL online RL? (Yes: 93.2%)
+2. Can IQL's V be used for onestep advantages? (No: collapses)
+3. Can GAE smooth IQL V's noise? (Yes: **97.3%** new best)
+
+### Common Settings
+
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt |
+| num_envs | 100 |
+| num_steps | 50 |
+| total_timesteps | 50,000 (10 iterations) |
+| gamma | 0.99 |
+| iql_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| expectile_tau | 0.5 |
+| PPO: clip_coef | 0.2 |
+| PPO: update_epochs | 100 |
+| PPO: target_kl | 100.0 |
+| num_minibatches | 5 |
+
+### Results — All Runs
+
+| Config | td_n | advantage | epochs | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **IQL n10 GAE reset** | **10** | **GAE** | **200** | 43.8% | 55.8% | 64.3% | 65.6% | 79.1% | 93.6% | 93.6% | 93.8% | 94.2% | **97.3%** | **97.3%** |
+| IQL n10 Q-V reset | 10 | Q-V | 200 | 43.8% | 38.5% | 57.9% | 76.3% | 78.2% | 81.5% | 83.6% | 80.7% | 88.2% | 93.2% | 93.2% |
+| IQL n10 onestep reset | 10 | onestep | 200 | 43.8% | 53.1% | 68.4% | 83.7% | 74.4% | 81.6% | 77.4% | 84.3% | 88.4% | 90.8% | 90.8% |
+| IQL n10 replay Q-V | 10 | Q-V | 200 | 43.8% | 43.1% | 56.2% | 62.1% | 61.5% | 65.2% | 72.7% | 66.9% | 71.4% | 77.6% | 77.6% |
+| IQL td1 Q-V 1400ep (Exp 20) | 1 | Q-V | 1400 | 43.8% | 78.9% | 86.9% | 84.1% | 83.4% | 85.5% | 82.3% | 84.4% | 83.6% | 82.3% | 86.9% |
+| IQL td1 GAE 1400ep | 1 | GAE | 1400 | 43.8% | 53.5% | 65.9% | 54.1% | 51.5% | 46.2% | 39.5% | 29.7% | 24.0% | 10.2% | 65.9% |
+| IQL td1 onestep 1400ep | 1 | onestep | 1400 | 43.8% | 55.8% | 59.1% | 32.6% | 21.7% | 19.4% | 16.3% | 14.8% | 4.7% | 8.6% | 59.1% |
+| IQL td1 onestep 1500ep | 1 | onestep | 1500 | 43.8% | 45.7% | 27.1% | 18.0% | 13.3% | 17.1% | 16.2% | 10.1% | 13.2% | 5.5% | 45.7% |
+
+### Comparison with Baselines
+
+| Method | Peak SR | vs GAE PPO |
+|---|---|---|
+| **IQL n10 + GAE + reset** | **97.3%** | **+5.2%** |
+| TD+EMA onestep + replay (Exp 19) | 97.1% | +5.0% |
+| TD+EMA onestep + reset (Exp 19) | 95.1% | +3.0% |
+| IQL n10 Q-V + reset | 93.2% | +1.1% |
+| GAE PPO baseline | 92.1% | — |
+| IQL n10 onestep + reset | 90.8% | −1.3% |
+| IQL td1 Q-V + reset (Exp 20) | 86.9% | −5.2% |
+
+### V Quality Scaling — IQL td_n=1 vs Others
+
+| N | TD+EMA 1-step | IQL td_n=1 | IQL td_n=10 | TD+EMA 10-step |
+|---|---|---|---|---|
+| 1 | 0.450 | 0.462 | **0.524** | 0.482 |
+| 5 | 0.653 | 0.634 | **0.681** | 0.689 |
+| 10 | 0.719 | 0.673 | **0.742** | 0.742 |
+| 20 | 0.764 | 0.701 | **0.771** | 0.764 |
+| 50 | 0.827 | 0.757 | **0.827** | 0.821 |
+| 100 | 0.854 | 0.785 | **0.855** | 0.851 |
+
+**Plot**: `runs/iql_td1_curve_2k.png`
+
+### Notes
+
+1. **IQL n10 + GAE = 97.3% (new best)**: Matches TD+EMA replay (97.1%) without needing replay buffer. GAE smooths IQL V's pointwise noise into usable advantage signal.
+
+2. **Why IQL's V fails at onestep but works with GAE**:
+   - TD+EMA directly minimizes Bellman residual `(V(s) - r - γV(s'))²` → onestep advantage IS the residual, so it's small and accurate
+   - IQL's V is learned pointwise from Q via expectile regression → no temporal consistency constraint → V(s')-V(s) has high-frequency noise
+   - Onestep advantage `r+γV(s')-V(s)` amplifies this noise → collapse
+   - GAE averages multiple δ_t, smoothing out the noise → works
+
+3. **Q-V advantages are robust to V overfit**: IQL td1 Q-V (86.9%) works fine with 1400ep even though V is overfitted. Q and V share the same Q network bias, so Q(s,a)-V(s) cancels systematic errors. But r+γV(s')-V(s) uses V at different states, errors compound.
+
+4. **N-step is critical for IQL**: td_n=1 → td_n=10 improves every advantage mode. Q-V: 86.9%→93.2%, onestep: collapse→90.8%, GAE: collapse→97.3%.
+
+5. **IQL td_n=1 V is worse than TD+EMA 1-step at N≥5**: The Q→V indirect learning path adds noise compared to direct TD. At N=100: 0.785 vs 0.854. This contradicts the N=1 finding where they're similar (0.462 vs 0.450).
+
+6. **Epoch sensitivity**: IQL td1 at 1400ep is past peak (scaling shows N=1 peak at ep1560) and already overfitting. All td1 experiments with onestep/GAE collapse because V quality degrades. With n10, peak is at ep~200, so 200ep is near-optimal.
+
+---
+
+## Exp 24: TD+EMA N-step=10 Online Policy Learning — Does N-step Help TD+EMA? - 2026-02-22 23:53
+
+**Git**: 58d478e (main)
+**Script**: `RL/td_ema_awr_online.py` (modified: added `td_n_step` arg with n-step V target support)
+
+### Motivation
+
+IQL n10 + GAE reached 97.3% (Exp 23). Is this due to n-step, IQL's Q→V framework, or GAE? Test TD+EMA with the same n-step=10 to isolate. TD+EMA 1-step + 1400ep baseline = 95.1%.
+
+### Commands
+```bash
+# TD+EMA n10, onestep, reset, 200ep, current_data_only
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode onestep --policy_update ppo --current_data_only --reset_critic_each_iter --td_epochs_per_iter 200 --td_n_step 10 --update_epochs 100 --exp_name td_n10_onestep_ppo_reset_ep200
+
+# TD+EMA n10, GAE, reset, 200ep, current_data_only
+python -u -m RL.td_ema_awr_online --gamma 0.99 --advantage_mode gae --policy_update ppo --current_data_only --reset_critic_each_iter --td_epochs_per_iter 200 --td_n_step 10 --update_epochs 100 --exp_name td_n10_gae_ppo_reset_ep200
+```
+
+### Settings (aligned with Exp 19 R4 baseline, only td_n_step and epochs differ)
+
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | ckpt_76_logstd-1.5.pt |
+| num_envs | 100 |
+| num_steps | 50 |
+| total_timesteps | 50,000 (10 iter) |
+| gamma | 0.99 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| td_n_step | **10** |
+| td_epochs_per_iter | **200** |
+| current_data_only | True |
+| reset_critic_each_iter | True |
+| PPO: update_epochs | 100 |
+| PPO: clip_coef | 0.2 |
+| PPO: target_kl | 100.0 |
+
+### Results
+
+| Config | i1 | i2 | i3 | i4 | i5 | i6 | i7 | i8 | i9 | i10 | Peak |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| TD n10 onestep reset 200ep | 43.8% | 61.4% | 49.6% | 48.1% | 34.6% | 59.6% | 45.8% | 58.3% | 50.8% | 45.8% | 61.4% (i2) |
+| TD n10 GAE reset 200ep | 43.8% | 50.8% | 51.9% | 60.0% | 60.6% | 68.5% | 69.2% | 77.7% | 77.6% | 78.1% | 78.1% (i10) |
+
+### Comparison — All Methods at 200ep, reset, current_data_only
+
+| Method | n_step | advantage | epochs | Peak |
+|---|---|---|---|---|
+| **IQL n10 GAE** | 10 | GAE | 200 | **97.3%** |
+| IQL n10 Q-V | 10 | Q-V | 200 | 93.2% |
+| IQL n10 onestep | 10 | onestep | 200 | 90.8% |
+| TD+EMA n10 GAE | 10 | GAE | 200 | 78.1% |
+| TD+EMA n10 onestep | 10 | onestep | 200 | 61.4% |
+| **TD+EMA 1-step onestep 1400ep** (baseline) | **1** | **onestep** | **1400** | **95.1%** |
+
+### Notes
+
+1. **TD+EMA n10 + 200ep is terrible**: Both onestep (61.4%) and GAE (78.1%) far worse than 1-step baseline (95.1%). The 200 epochs is insufficient for TD+EMA — scaling experiments show TD+EMA N=1 peak at ep195 for n10, but this was on static data. In the online iterative setting with reset, 200ep may not be enough for stable V learning.
+
+2. **IQL n10 >> TD+EMA n10 at same epochs**: At 200ep, IQL dramatically outperforms TD+EMA on all advantage modes. IQL's Q→V indirect learning converges faster in practice — the Q network provides a smoother learning signal for V than raw TD targets.
+
+3. **TD+EMA needs more epochs**: The 1-step baseline uses 1400ep and works great. N-step=10 might also work with more epochs, but we didn't test this. The key insight is that TD+EMA is more epoch-hungry than IQL.
+
+4. **IQL's advantage at equal compute**: When both methods get the same epoch budget (200), IQL is far superior. IQL's two-stage Q→V learning provides implicit regularization that lets V converge faster and stay stable.
+
+5. **GAE >> onestep for TD+EMA n10**: GAE (78.1%) much better than onestep (61.4%), consistent with the pattern that GAE smooths noisy V. But even GAE can't fully compensate for under-trained V.
+
+---
+
+## [P(success) Analysis & Guided Branching Methods] - 2026-02-23
+
+**Git**: 58d478e (main)
+
+### P(success|s) from MC16 — Key Results
+
+Computed P(success|s) = fraction of 16 MC rollouts that succeed from each state. First episodes only (no truncated post-reset fragments).
+
+**PickCube** (ckpt_76_logstd-1.5, SR=44%, gamma=0.99):
+- P ≈ 0.5 across 0-50% of episode (broad decision region)
+- Var[P] peaks at 75-80%
+- Fail trajectories P drops from 0.46 → 0.05
+- Success trajectories P stays ~0.55-0.59
+
+**PegInsertion** (ckpt_231_ema99, SR=81%, gamma=0.97):
+- Var[P] sharp peak at 25-30% (critical approach/alignment phase)
+- Fail trajectories P dips to 0.29 at 25-30% then rises to ~0.48
+- Success trajectories P gradually decreases from 0.80 → 0.67
+
+### Cross-analysis with Branch Ablation
+
+EP-% ablation + V-bin ablation + P(success) 联立分析:
+- PickCube: late/mid branching best, v60_100 (high V) best → proximity to reward matters most
+- PegInsertion: uniform best, v0_20 (low V) competitive → success termination times spread widely, only uniform covers all
+- **V-learning needs signal (near-reward transitions) + propagation (TD bootstrap chain). No focused strategy beats uniform because both are needed.**
+- **P(success) ≈ 0.5 is best for policy improvement, not V-learning. TD error is better for V-learning.**
+
+### Two Practical Guided Branching Methods (to test)
+
+Both methods use ONLY existing data (no MC16 oracle):
+
+**Method 1: TD Error Guided** (`v_tree_td_guided.py`)
+- Train V₀ on seed data (1 rollout) with target gamma
+- Compute |TD error| = |r + γV₀(s') - V₀(s)| per state
+- Branch from high TD-error states (weighted sampling or top-K)
+- Directly optimizes "where V is most wrong"
+- Script: `RL/v_tree_td_guided.py`, running now
+
+**Method 2: P(success) Predictor Guided** (to write)
+- Train V₀ with gamma=1.0 on seed data → V₀(s) ≈ P(success|s)
+- Branch from states where |P - 0.5| is smallest (maximum uncertainty)
+- Or equivalently: branch where P*(1-P) is largest (Bernoulli variance)
+- Identifies the decision boundary without knowing the task structure
+- Key: gamma=1 avoids discount confound; with sparse reward, V(gamma=1) = P(success)
+
+### Notes
+- MC16 P(success) is oracle for validation only, not for practical use
+- TD error may correlate with P ≈ 0.5 but isn't identical: TD error also captures V approximation error, not just outcome uncertainty
+- For sparse reward + gamma=1: TD target = r + V(s'), TD error = |V(s) - r - V(s')| ≈ how wrong V is about success propagation
+
+---
+
+## Guided Branching Ablation — TD Error vs P(success) (PickCube) - 2026-02-23 15:00
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.99 --strategies uniform td_weighted td_topk p_bernoulli p_topk`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_guided_ablation.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PickCube-v1 |
+| checkpoint | runs/pickcube_ppo/ckpt_76_logstd-1.5.pt |
+| gamma | 0.99 |
+| num_envs | 100 |
+| num_steps / max_episode_steps | 50 |
+| mc_samples | 16 |
+| N_values | (1, 2, 3, 5) |
+| strategies | uniform, td_weighted, td_topk, p_bernoulli, p_topk |
+| topk_frac | 0.2 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| epochs | 2000 |
+| v0_epochs | 500 |
+| p0_epochs | 2000 |
+| lr | 3e-4 |
+| batch_size | 1000 |
+| hidden_dim | 256 |
+| critic_layers | 3 |
+
+### Results
+
+**Diagnostics**: V₀ r=0.2031, P₀ r=0.4567, Corr(TD_error, Bernoulli_var)=-0.217
+
+**Peak Pearson r (vs MC16):**
+
+| N | Rollout | uniform | td_weighted | td_topk | p_bernoulli | p_topk |
+|---|---------|---------|-------------|---------|-------------|--------|
+| 1 | 0.4540 | 0.5272 | 0.4989 | **0.5662** | 0.4127 | 0.3888 |
+| 2 | 0.5510 | 0.5696 | 0.6569 | **0.6416** | 0.5391 | 0.5286 |
+| 3 | 0.5734 | 0.6201 | 0.6786 | **0.6843** | 0.6281 | 0.6067 |
+| 5 | 0.6567 | 0.7210 | 0.7270 | **0.7296** | 0.7114 | 0.6344 |
+
+**Delta vs uniform:**
+
+| N | td_weighted | td_topk | p_bernoulli | p_topk |
+|---|-------------|---------|-------------|--------|
+| 1 | -0.028 | **+0.039** | -0.115 | -0.138 |
+| 2 | +0.087 | **+0.072** | -0.031 | -0.041 |
+| 3 | +0.058 | **+0.064** | +0.008 | -0.014 |
+| 5 | +0.006 | **+0.009** | -0.010 | -0.087 |
+
+### Notes
+- **TD error methods dominate across ALL N**: td_topk is best or near-best everywhere
+- **P-guided methods HURT**: p_bernoulli and p_topk are negative vs uniform at most N values
+- Corr(TD_error, Bernoulli_var) = -0.22 (negative!) — P≈0.5 states are where V is already accurate; high TD error states have P far from 0.5 (near reward)
+- **V-learning needs reward signal (high TD error) + propagation (TD chain), not decision boundary data (P≈0.5)**
+- TD error top-20% concentrated in late timesteps (Q3+Q4 = 79.5%), P(success) uncertainty concentrated in early timesteps
+
+---
+
+## Guided Branching Ablation — TD Error (PegInsertion) - 2026-02-23 16:00
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.97 --env_id PegInsertionSide-v1 --checkpoint runs/peginsertion_ppo_ema99/ckpt_231.pt --max_episode_steps 100 --num_steps 100 --strategies uniform td_weighted td_topk --output runs/v_tree_guided_ablation_peg.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_guided_ablation_peg.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| checkpoint | runs/peginsertion_ppo_ema99/ckpt_231.pt |
+| gamma | 0.97 |
+| num_envs | 100 |
+| num_steps / max_episode_steps | 100 |
+| mc_samples | 16 |
+| N_values | (1, 2, 3, 5) |
+| strategies | uniform, td_weighted, td_topk |
+| Other settings | Same as PickCube experiment above |
+
+### Results
+
+**Diagnostics**: V₀ r=0.3171, P₀ r=0.4067, Corr(TD_error, Bernoulli_var)=-0.064
+
+**Peak Pearson r (vs MC16):**
+
+| N | Rollout | uniform | td_weighted | td_topk |
+|---|---------|---------|-------------|---------|
+| 1 | 0.5220 | 0.5182 | 0.4928 | **0.6050** |
+| 2 | 0.5956 | **0.6094** | 0.5817 | 0.5876 |
+| 3 | 0.6117 | 0.6302 | 0.6156 | **0.6310** |
+| 5 | 0.6262 | **0.6419** | 0.6322 | 0.6242 |
+
+**Delta vs uniform:**
+
+| N | td_weighted | td_topk |
+|---|-------------|---------|
+| 1 | -0.025 | **+0.087** |
+| 2 | -0.028 | -0.022 |
+| 3 | -0.015 | +0.001 |
+| 5 | -0.010 | -0.018 |
+
+### Notes
+- **td_topk helps only at N=1** (+0.087), neutral-to-negative at N≥2 — different from PickCube where td_topk is consistently positive
+- **Root cause: TD error distribution is much more uniform on PegInsertion**
+  - PickCube TD error concentration: 0.073, KL(topk||uniform) = 0.284
+  - PegInsertion TD error concentration: 0.022, KL(topk||uniform) = 0.101
+  - PegInsertion topk effective timesteps: 90.4/100 (90%) vs PickCube 37.7/50 (75%)
+- PegInsertion's V₀ is already better (r=0.317 vs 0.203), TD errors distributed uniformly across episode → topk doesn't change data distribution meaningfully
+- td_weighted consistently negative on both tasks — soft weighting is worse than hard topk selection
+
+---
+
+## Ensemble Disagreement Ablation (PickCube) - 2026-02-23 17:00
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.99 --strategies uniform td_topk ens_weighted ens_topk --output runs/v_tree_ensemble_ablation.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_ensemble_ablation.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PickCube-v1 |
+| gamma | 0.99 |
+| ensemble_K | 5 |
+| strategies | uniform, td_topk, ens_weighted, ens_topk |
+| Other settings | Same as base guided ablation |
+
+### Results
+
+**Diagnostics**: V₀ r=0.2031, Ens mean_member_r=0.1870, Corr(TD_error, Ens_var)=-0.012
+
+**Peak Pearson r:**
+
+| N | Rollout | uniform | td_topk | ens_weighted | ens_topk |
+|---|---------|---------|---------|--------------|----------|
+| 1 | 0.4500 | 0.4061 | **0.5572** | 0.5456 | 0.4142 |
+| 2 | 0.5405 | 0.5781 | **0.6678** | 0.5892 | 0.5763 |
+| 3 | 0.5825 | 0.6297 | **0.7167** | 0.6378 | 0.6549 |
+| 5 | 0.6573 | 0.7241 | **0.7421** | 0.7398 | 0.6974 |
+
+**Delta vs uniform:**
+
+| N | td_topk | ens_weighted | ens_topk |
+|---|---------|--------------|----------|
+| 1 | **+0.151** | +0.140 | +0.008 |
+| 2 | **+0.090** | +0.011 | -0.002 |
+| 3 | **+0.087** | +0.008 | +0.025 |
+| 5 | +0.018 | +0.016 | -0.027 |
+
+### Notes
+- **Ensemble disagreement (Var[V_k]) does NOT beat single-V₀ TD error**
+- **Corr(TD_error, Ens_var) = -0.012** — the two signals measure completely different things
+- Ens_var top-20% by quartile: Q1=33%, Q2=27%, Q3=21%, Q4=19% — biased toward EARLY states (where V≈0, disagreement is about small irrelevant differences)
+- TD_error top-20% by quartile: Q1=3%, Q2=17%, Q3=37%, Q4=43% — concentrated near reward (where V changes rapidly)
+- **Epistemic uncertainty alone is insufficient** — it doesn't distinguish "uncertain but unimportant" from "uncertain and important"
+- ens_topk is worse than ens_weighted because it concentrates on early timesteps even more
+
+---
+
+## Ensemble TD Error Ablation — Mean TD & Bellman Residual Variance (PickCube) - 2026-02-23 17:30
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.99 --strategies uniform td_topk ens_td_mean_topk ens_td_var_topk --output runs/v_tree_ens_td_ablation.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_ens_td_ablation.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PickCube-v1 |
+| gamma | 0.99 |
+| ensemble_K | 5 |
+| strategies | uniform, td_topk, ens_td_mean_topk, ens_td_var_topk |
+| ens_td_mean_topk | top 20% by mean |TD error| across K networks |
+| ens_td_var_topk | top 20% by Var[|TD error|] across K networks (Bellman residual variance) |
+
+### Results
+
+**Diagnostics**: Corr(single_TD, mean_TD) = 0.9837, Mean_TD top-20% quartile: [2.5%, 14.2%, 38.1%, 45.2%]
+
+**Peak Pearson r:**
+
+| N | Rollout | uniform | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|---------|---------|------------------|-----------------|
+| 1 | 0.4500 | 0.4061 | 0.5572 | 0.5092 | **0.5805** |
+| 2 | 0.5417 | 0.6197 | 0.6325 | 0.6554 | **0.6791** |
+| 3 | 0.5812 | 0.6599 | **0.6918** | 0.6714 | 0.6582 |
+| 5 | 0.6586 | 0.7060 | 0.7174 | 0.6863 | **0.7239** |
+
+**Delta vs uniform:**
+
+| N | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|------------------|-----------------|
+| 1 | +0.151 | +0.103 | **+0.174** |
+| 2 | +0.013 | +0.036 | **+0.059** |
+| 3 | **+0.032** | +0.012 | -0.002 |
+| 5 | +0.011 | -0.020 | **+0.018** |
+
+### Notes
+- **ens_td_var_topk (Bellman residual variance) is best at N=1,2,5** on PickCube
+- **ens_td_mean_topk ≈ single td_topk** — Corr(single_TD, mean_TD) = 0.984, averaging K networks doesn't add information because single V₀ TD error is already stable
+- **Bellman residual variance captures "importance-weighted epistemic uncertainty"** — Var[TD_error] is high only when (a) the TD error itself is non-trivial (importance) AND (b) different networks disagree on how wrong they are (epistemic)
+- TD error inherently encodes importance weighting: |V(s) - target| is naturally small when V≈0 (early states), even if V is inaccurate there
+
+---
+
+## Ensemble TD Error Ablation — Mean TD & Bellman Residual Variance (PegInsertion) - 2026-02-23 18:00
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.97 --env_id PegInsertionSide-v1 --checkpoint runs/peginsertion_ppo_ema99/ckpt_231.pt --max_episode_steps 100 --num_steps 100 --strategies uniform td_topk ens_td_mean_topk ens_td_var_topk --output runs/v_tree_ens_td_ablation_peg.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_ens_td_ablation_peg.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| checkpoint | runs/peginsertion_ppo_ema99/ckpt_231.pt |
+| gamma | 0.97 |
+| num_envs | 100 |
+| num_steps / max_episode_steps | 100 |
+| ensemble_K | 5 |
+| strategies | uniform, td_topk, ens_td_mean_topk, ens_td_var_topk |
+
+### Results
+
+**Diagnostics**: V₀ r=0.3171, Corr(single_TD, mean_TD)=0.9674, Corr(TD_error, Ens_var)=-0.115
+
+**Peak Pearson r:**
+
+| N | Rollout | uniform | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|---------|---------|------------------|-----------------|
+| 1 | 0.5196 | 0.5036 | 0.5262 | **0.5599** | 0.5454 |
+| 2 | 0.5940 | **0.6306** | 0.5898 | 0.6277 | 0.5810 |
+| 3 | 0.6166 | **0.6450** | 0.6088 | 0.6321 | 0.5981 |
+| 5 | 0.6242 | 0.6362 | 0.6011 | 0.6347 | **0.6363** |
+
+**Delta vs uniform:**
+
+| N | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|------------------|-----------------|
+| 1 | +0.023 | **+0.056** | +0.042 |
+| 2 | -0.041 | **-0.003** | -0.050 |
+| 3 | -0.036 | **-0.013** | -0.047 |
+| 5 | -0.035 | **-0.002** | +0.000 |
+
+### Notes
+- **ens_td_mean_topk is the most robust strategy across both tasks** — never catastrophically bad, positive at small N
+- **td_topk collapses on PegInsertion at N≥2** (consistently -0.035 to -0.041 vs uniform) — because PegInsertion's TD error is uniformly distributed, topk over-concentrates on noise
+- **ens_td_mean_topk smooths away noise**: averaging K=5 networks prevents over-concentration on spurious TD error peaks, making it more robust when the underlying signal is diffuse
+- ens_td_var_topk (Bellman residual variance) is unstable on PegInsertion — good at N=1, bad at N=2,3
+- **Cross-task conclusion**: ens_td_mean_topk is the safest choice as a general-purpose guided branching strategy. td_topk is stronger when TD error is naturally concentrated (PickCube), but risky when TD error is diffuse (PegInsertion)
+
+---
+
+## Guided Branching — Summary Across All Experiments - 2026-02-23 18:17
+
+### Strategy Taxonomy
+
+| Strategy | Signal | Description |
+|----------|--------|-------------|
+| uniform | None | Random branch points (tree baseline) |
+| td_weighted | |TD error| from single V₀ | Soft weighting proportional to TD error |
+| td_topk | |TD error| from single V₀ | Branch only from top 20% TD error states |
+| p_bernoulli | P₀*(1-P₀) from gamma=1 V | Weight by Bernoulli variance |
+| p_topk | P₀*(1-P₀) from gamma=1 V | Branch from top 20% Bernoulli variance states |
+| ens_weighted | Var_k[V_k(s)] | Weight by ensemble V disagreement |
+| ens_topk | Var_k[V_k(s)] | Branch from top 20% ensemble disagreement |
+| ens_td_mean_topk | Mean_k[|TD_err_k|] | Top 20% by averaged TD error across K networks |
+| ens_td_var_topk | Var_k[|TD_err_k|] | Top 20% by Bellman residual variance |
+
+### Cross-Task Ranking (delta vs uniform, averaged across N=1,2,3,5)
+
+| Strategy | PickCube avg Δ | PegInsertion avg Δ | Overall |
+|----------|---------------|-------------------|---------|
+| td_topk | **+0.068** | -0.018 | +0.025 |
+| ens_td_var_topk | +0.062 | -0.014 | +0.024 |
+| ens_td_mean_topk | +0.033 | **+0.010** | +0.021 |
+| td_weighted | +0.031 | -0.020 | +0.006 |
+| ens_weighted | +0.041 | — | — |
+| ens_topk | +0.001 | — | — |
+| p_bernoulli | -0.037 | — | — |
+| p_topk | -0.070 | — | — |
+
+### Key Insights
+
+1. **For V-learning, TD error is the correct guiding signal**, not P(success) uncertainty or ensemble V disagreement
+2. **TD error = "importance-weighted uncertainty"** — it naturally encodes both "V is wrong here" and "this region matters (V≠0)"
+3. **Ensemble V disagreement (Var[V_k]) fails** because it measures epistemic uncertainty without importance weighting — high disagreement at early states where V≈0 is irrelevant
+4. **ens_td_mean_topk is the most robust across tasks** — smoothing K TD errors prevents noise-driven over-concentration
+5. **ens_td_var_topk (Bellman residual variance) is strongest on PickCube** but unstable on PegInsertion
+6. **Task structure matters**: when TD error is concentrated (PickCube, late-episode reward), guided branching helps significantly; when TD error is diffuse (PegInsertion), uniform is hard to beat
+
+---
+
+## StackCube PPO Training - 2026-02-23 18:30
+
+**Command**: `python -u -m data.data_collection.ppo --env_id StackCube-v1 --num_envs 1024 --update_epochs 8 --num_minibatches 32 --total_timesteps 25000000 --eval_freq 10 --exp_name stackcube_ppo --no-capture_video`
+**Git**: 58d478e (main)
+**Run Dir**: runs/stackcube_ppo/
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | StackCube-v1 |
+| num_envs | 1024 |
+| update_epochs | 8 |
+| num_minibatches | 32 |
+| total_timesteps | 25,000,000 |
+| gamma | 0.8 (default) |
+| gae_lambda | 0.9 (default) |
+| learning_rate | 3e-4 (default) |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 50 |
+| reward_mode | normalized_dense (default) |
+
+### Results
+
+Training progression (eval with 8 envs only — noisy):
+- 0-13M steps: 0% eval success, dense return rising 2.4 → 29
+- 8M steps: first train successes appear
+- 14M steps: train success ~20%
+- 18-25M: eval success 25-75% (noisy, only 8 episodes)
+
+**Proper evaluation (200 envs):**
+
+| Checkpoint | Steps | Stochastic SR | Deterministic SR |
+|-----------|-------|---------------|------------------|
+| ckpt_271 | 14M | 17.5% | 10.5% |
+| ckpt_331 | 17M | 33.5% | 31.5% |
+| ckpt_371 | 19M | 44.0% | 43.0% |
+| ckpt_411 | 21M | 46.0% | 47.5% |
+| ckpt_451 | 23M | 49.0% | 48.5% |
+| **ckpt_481** | **25M** | **55.0%** | **54.5%** |
+| final | 25M | 54.0% | 52.5% |
+
+### Notes
+- Command matches ManiSkill official `examples.sh` for StackCube-v1
+- **Stochastic ≈ Deterministic** — unlike PickCube where stochastic inflates SR. StackCube requires precision (place + release), noise doesn't help.
+- Agent still improving at 25M — could benefit from longer training
+- Selected **ckpt_481** (55% SR) as finetuning start checkpoint
+- Breakthrough around 8-14M steps (0% → 20% train success)
+
+---
+
+## Guided Branching Ablation — StackCube - 2026-02-23 19:15
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --gamma 0.99 --env_id StackCube-v1 --checkpoint runs/stackcube_ppo/ckpt_481.pt --max_episode_steps 50 --num_steps 50 --strategies uniform td_topk ens_td_mean_topk ens_td_var_topk --output runs/v_tree_guided_ablation_stackcube.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_guided_ablation_stackcube.pt / .png
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | StackCube-v1 |
+| checkpoint | runs/stackcube_ppo/ckpt_481.pt |
+| gamma | 0.99 |
+| num_envs | 100 |
+| num_steps / max_episode_steps | 50 |
+| mc_samples | 16 |
+| N_values | (1, 2, 3, 5) |
+| strategies | uniform, td_topk, ens_td_mean_topk, ens_td_var_topk |
+| ensemble_K | 5 |
+| Other settings | Same as PickCube/PegInsertion experiments |
+
+### Results
+
+**Diagnostics**: V₀ r=0.7140, P₀ r=0.9099, Corr(TD_error, Ens_var)=0.0001, Corr(TD_error, Bernoulli_var)=0.024
+
+**Peak Pearson r (vs MC16):**
+
+| N | Rollout | uniform | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|---------|---------|------------------|-----------------|
+| 1 | **0.9237** | 0.8754 | 0.8513 | 0.8473 | 0.8738 |
+| 2 | **0.9238** | 0.9150 | 0.9010 | 0.9038 | 0.9124 |
+| 3 | **0.9165** | 0.9022 | 0.8976 | 0.8990 | 0.9034 |
+| 5 | **0.9213** | 0.9099 | 0.8895 | 0.8830 | 0.9048 |
+
+**Delta vs uniform:**
+
+| N | td_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|------------------|-----------------|
+| 1 | -0.024 | -0.028 | -0.002 |
+| 2 | -0.014 | -0.011 | -0.003 |
+| 3 | -0.005 | -0.003 | +0.001 |
+| 5 | -0.020 | -0.027 | -0.005 |
+
+### Notes
+- **Rollout >> Tree on ALL N values** — completely opposite to PickCube. Tree sampling hurts on StackCube.
+- **All guided strategies worse than uniform**, td_topk especially bad (-0.005 to -0.024)
+- **V₀ already very high (r=0.714)** vs PickCube (0.203) and PegInsertion (0.317). StackCube V is "easy" to learn with just rollout data.
+- P₀ r=0.910 also extremely high — success/failure is very predictable from state
+- TD error uniformly distributed: Mean_TD top-20% quartile = [30%, 28%, 25%, 16%]
+- **Why tree hurts**: V is already easy to learn (r=0.924 from just 1 rollout!). Rollout provides complete trajectory structure (temporal consistency). Tree branches from mid-episode break this structure and provide less useful transitions for an already-easy V-learning problem.
+
+---
+
+## Cross-Task Guided Branching Summary (3 Tasks) - 2026-02-23 19:20
+
+### Task Characteristics
+
+| Task | V₀ r (500ep) | P₀ r | TD error concentration | Rollout N=1 r |
+|------|-------------|------|----------------------|---------------|
+| PickCube | 0.203 | 0.457 | High (Q4=45%) | 0.450 |
+| PegInsertion | 0.317 | 0.407 | Low (Q4=28%) | 0.520 |
+| StackCube | 0.714 | 0.910 | Very low (Q4=16%) | 0.924 |
+
+### Best Strategy Delta vs Uniform (across N=1,2,3,5)
+
+| Task | td_topk | ens_td_mean_topk | ens_td_var_topk | Tree vs Rollout |
+|------|---------|------------------|-----------------|-----------------|
+| PickCube | **+0.068** | +0.033 | +0.062 | Tree wins |
+| PegInsertion | -0.018 | **+0.010** | -0.014 | Mixed |
+| StackCube | -0.016 | -0.017 | **-0.002** | Rollout wins |
+
+### Key Insights
+
+1. **Tree sampling benefit is inversely related to V₀ quality**:
+   - V₀ r=0.20 (PickCube): tree helps a lot, guided branching helps more
+   - V₀ r=0.32 (PegInsertion): tree marginally helps, guided branching ~neutral
+   - V₀ r=0.71 (StackCube): tree HURTS, guided branching hurts more
+
+2. **When V is already easy to learn, more data (rollout) > smarter data (tree)**. Tree branching sacrifices temporal coherence for state diversity, which only helps when the V landscape is hard (low V₀ quality, concentrated TD error).
+
+3. **TD error concentration predicts tree sampling benefit**: PickCube Q4=45% (concentrated near reward → topk helps), PegInsertion Q4=28% (moderate), StackCube Q4=16% (almost uniform → topk can't help).
+
+4. **ens_td_var_topk is the most robust guided strategy** — least negative on StackCube (-0.002 avg), still strong on PickCube (+0.062 avg). It's the safest "do no harm" choice across tasks.
+
+5. **Practical rule**: If V₀ quality from seed data is already high (r > 0.5), skip tree sampling entirely and just use rollout data. Tree sampling is only useful when V is hard to learn from rollouts alone.
+
+---
+
+## [StackCube Tree Guided Branching with logstd=-1.5] - 2026-02-23 21:20
+
+**Command**: `python -u -m RL.v_tree_guided_ablation --env_id StackCube-v1 --checkpoint runs/stackcube_ppo/ckpt_481_logstd-1.5.pt --gamma 0.99 --output runs/v_tree_guided_ablation_stackcube_logstd15.png`
+**Git**: 58d478e (main)
+**Run Dir**: runs/v_tree_guided_ablation_stackcube_logstd15.pt
+
+### Motivation
+
+Original StackCube policy is near-deterministic (within-state MC std=0.10, Corr(MC1,MC16)=0.912), making tree sampling useless because all branches produce homogeneous trajectories. This experiment tests whether manually increasing stochasticity (logstd=-1.5, std=0.223) enables tree sampling to work — confirming that action diversity is the prerequisite for tree benefit.
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | StackCube-v1 |
+| checkpoint | runs/stackcube_ppo/ckpt_481_logstd-1.5.pt (SR=31.9%) |
+| gamma | 0.99 |
+| td_reward_scale | 10.0 |
+| ema_tau | 0.005 |
+| epochs | 2000 |
+| eval_every | 5 |
+| N_values | (1, 2, 3, 5) |
+| n_seed | 1 (fixed) |
+| rollouts | 5 |
+| MC16 envs | 1600 |
+| strategies | uniform, td_weighted, td_topk, p_bernoulli, p_topk, ens_weighted, ens_topk, ens_td_mean_topk, ens_td_var_topk |
+
+### Diagnostics
+| Metric | Value |
+|--------|-------|
+| MC16 mean | 0.1954 |
+| MC16 std | 0.2653 |
+| V₀ peak r | 0.6460 |
+| P₀ peak r | 0.7120 |
+| Ensemble mean r | 0.6513 |
+| Corr(TD_error, Ens_var) | 0.1287 |
+| Corr(TD_error, Bernoulli_var) | -0.0158 |
+
+### Results — Peak Pearson r (vs MC16 ground truth)
+
+| N | Rollout | uniform | td_weighted | td_topk | p_bernoulli | p_topk | ens_weighted | ens_topk | ens_td_mean_topk | ens_td_var_topk |
+|---|---------|---------|-------------|---------|-------------|--------|--------------|----------|------------------|-----------------|
+| 1 | **0.757** | 0.637 | 0.692 | 0.732 | 0.602 | 0.651 | 0.689 | 0.654 | 0.728 | 0.693 |
+| 2 | 0.799 | 0.781 | **0.810** | 0.802 | 0.783 | 0.808 | 0.788 | 0.760 | 0.798 | 0.803 |
+| 3 | 0.803 | 0.828 | 0.813 | 0.850 | 0.804 | 0.805 | 0.841 | 0.787 | **0.851** | 0.807 |
+| 5 | 0.827 | 0.841 | 0.861 | 0.832 | 0.829 | 0.819 | 0.836 | 0.820 | **0.869** | 0.849 |
+
+### Delta vs Rollout (best tree strategy)
+
+| N | Best Strategy | Delta |
+|---|---------------|-------|
+| 1 | td_topk | **-0.025** |
+| 2 | td_weighted | **+0.011** |
+| 3 | ens_td_mean_topk | **+0.048** |
+| 5 | ens_td_mean_topk | **+0.042** |
+
+### Comparison: Original StackCube vs logstd=-1.5
+
+| Metric | Original (det) | logstd=-1.5 |
+|--------|---------------|-------------|
+| Checkpoint SR | 62.1% | 31.9% |
+| MC within-state std | 0.104 | 0.179 |
+| Corr(MC1, MC16) | 0.912 | ~0.7 (est.) |
+| SNR (between/within) | 3.87 | 1.59 |
+| V₀ r | 0.714 | 0.646 |
+| Tree vs Rollout (N=3) | Tree hurts | **Tree +4.8%** |
+| Tree vs Rollout (N=5) | Tree hurts | **Tree +4.2%** |
+
+### Notes
+
+1. **logstd=-1.5 enables tree sampling on StackCube**: With increased stochasticity, tree beats rollout at N≥2. Original StackCube saw tree consistently hurt because MC trajectories were too homogeneous.
+
+2. **ens_td_mean_topk is the best strategy at N≥3**: Combines ensemble uncertainty with TD error — branches at high-uncertainty, high-error states.
+
+3. **But practical significance is limited**: In real training, the policy naturally converges toward deterministic (low logstd). The experiment confirms the mechanism (stochasticity → diversity → tree helps), but StackCube's inherent low action sensitivity means:
+   - Advantage signal remains weak (within-state std=0.18 vs PickCube's 0.33)
+   - Even with better V from tree sampling, iterative RL struggles because A(s,a) ≈ noise
+   - The bottleneck isn't V quality — it's the task's low sensitivity to action choice
+
+4. **Conclusion**: Tree sampling on StackCube is of limited practical value. The task's near-deterministic dynamics mean that (a) naturally trained policies don't benefit from tree branching, and (b) even if forced to benefit via noise injection, the downstream advantage signal is still too weak for effective policy improvement.
+
+---
+
+## [Cross-Task Within-State MC Variance Comparison] - 2026-02-23 21:30
+
+**Git**: 58d478e (main)
+
+### Motivation
+
+Within-state MC variance (variance of MC returns across different rollouts from the same state) is the upper bound on advantage signal — if MC returns are the same regardless of action, then A(s,a) ≈ 0. This comparison explains why tree sampling and iterative RL work on PickCube but fail on StackCube.
+
+### Results — MC1 vs MC16 Analysis (16 MC samples per state, gamma=0.99)
+
+| Metric | PickCube (logstd=-1.5) | StackCube (original) | StackCube (logstd=-1.5) |
+|--------|----------------------|---------------------|------------------------|
+| Checkpoint SR | 43.8% | 62.1% | 31.9% |
+| Action std | 0.223 | ~0.05 (learned) | 0.223 |
+| **Within-state MC std** | **0.330** | **0.104** | **0.179** |
+| Between-state MC std | 0.218 | 0.403 | 0.284 |
+| **SNR (between/within)** | **0.66** | **3.87** | **1.59** |
+| Corr(MC1, MC16) | 0.504 | 0.912 | ~0.7 |
+| States with MC std < 0.01 | ~5% | 51% | ~20% |
+
+### Interpretation
+
+- **Within-state std = advantage signal upper bound**: If all MC rollouts from the same state give the same return, no action is better than any other → advantage ≈ 0.
+- **PickCube (0.33)**: Actions meaningfully affect outcomes → tree sampling creates useful diversity → iterative RL works.
+- **StackCube original (0.10)**: Near-deterministic policy → all branches homogeneous → tree sampling useless → iterative RL fails (advantage ≈ noise).
+- **StackCube logstd=-1.5 (0.18)**: Forced noise partially helps, but still half of PickCube's signal → tree sampling marginally works at N≥2.
+- **SNR interpretation**: Low SNR (PickCube=0.66) means within-state variation dominates → actions matter. High SNR (StackCube=3.87) means between-state variation dominates → state identity determines outcome, not action choice.
+
+---
+
+## [MC16 AWR Iterative Finetuning on StackCube] - 2026-02-23 22:37
+
+**Commands**:
+```bash
+# Run 1: Original checkpoint
+python -u -m RL.mc_finetune_awr_parallel --env_id StackCube-v1 \
+  --checkpoint runs/stackcube_ppo/ckpt_481.pt \
+  --optimal_checkpoint runs/stackcube_ppo/ckpt_481.pt \
+  --mc_samples 16 --awr_beta 0.5 --gamma 0.8 \
+  --num_envs 100 --num_steps 50 --total_timesteps 50000 \
+  --update_epochs 200 --num_minibatches 5 --eval_freq 1 \
+  --exp_name mc16_awr_stackcube_orig --seed 1
+
+# Run 2: logstd=-1.5 checkpoint (more stochastic)
+python -u -m RL.mc_finetune_awr_parallel --env_id StackCube-v1 \
+  --checkpoint runs/stackcube_ppo/ckpt_481_logstd-1.5.pt \
+  --optimal_checkpoint runs/stackcube_ppo/ckpt_481.pt \
+  --mc_samples 16 --awr_beta 0.5 --gamma 0.8 \
+  --num_envs 100 --num_steps 50 --total_timesteps 50000 \
+  --update_epochs 200 --num_minibatches 5 --eval_freq 1 \
+  --exp_name mc16_awr_stackcube_logstd15 --seed 1
+```
+**Git**: 58d478e (main)
+**Run Dirs**: `runs/mc16_awr_stackcube_orig__seed1__1771911818/`, `runs/mc16_awr_stackcube_logstd15__seed1__1771911820/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | StackCube-v1 |
+| method | MC16 AWR (parallel re-rollout) |
+| mc_samples | 16 |
+| awr_beta | 0.5 |
+| gamma | 0.8 |
+| num_envs | 100 |
+| mc_envs | 3200 |
+| num_steps | 50 |
+| total_timesteps | 50000 (10 iterations) |
+| update_epochs | 200 |
+| num_minibatches | 5 |
+| batch_size | 5000 |
+| eval_freq | 1 |
+| reward_mode | sparse |
+| control_mode | pd_joint_delta_pos |
+
+### Results
+
+| Iter | Original ckpt_481 (SR%) | logstd=-1.5 (SR%) |
+|------|------------------------|--------------------|
+| 1 (init) | 65.7 | 65.7 |
+| 2 | 69.7 | 68.2 |
+| 3 | 66.3 | 72.4 |
+| 4 | 68.3 | 60.7 |
+| 5 | 68.0 | 56.3 |
+| 6 | 61.2 | 67.4 |
+| 7 | 64.0 | 64.7 |
+| 8 | 65.1 | 61.7 |
+| 9 | 64.2 | 59.5 |
+| 10 | 68.8 | 62.2 |
+| **Peak** | **69.7 (iter 2)** | **72.4 (iter 3)** |
+
+### Notes
+- **MC16 AWR completely fails on StackCube** — neither checkpoint reaches 90%, both oscillate around 60-70% with zero upward trend over 10 iterations.
+- Initial SR is 65.7% for both (deterministic eval uses same mean weights).
+- Original checkpoint oscillates ±5% around 66%; logstd=-1.5 actually degrades over time (72.4% → 62.2%).
+- Compare to PickCube where MC16 AWR reaches 99.1% in 10 iterations — the difference is entirely due to task dynamics.
+- Root cause: StackCube's within-state MC std is only 0.16 (vs PickCube's 0.33), so MC advantages are uninformative. AWR can't learn meaningful policy updates from noisy advantages.
+- This confirms that **iterative MC16 AWR requires a task/policy combination where actions meaningfully affect outcomes** (i.e., sufficient within-state MC variance).
+- Open question: what metrics can predict whether a base policy is suitable for iterative RL? Candidates: within-state MC std, SR sweet spot (~50%), fraction of decisive states, action entropy.
+
+---
+
+## [Initial State P(success) Distribution: PickCube vs StackCube] - 2026-02-23 23:03
+
+**Command**: `python -u -m RL.p_initial_state_analysis`
+**Git**: 58d478e (main)
+**Script**: `RL/p_initial_state_analysis.py` (new)
+**Output**: `runs/p_initial_state_analysis.png`, `runs/p_initial_state_analysis.pt`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| pick_checkpoint | runs/pickcube_ppo/ckpt_76_logstd-1.5.pt |
+| stack_checkpoint | runs/stackcube_ppo/ckpt_481.pt |
+| gamma | 0.8 |
+| num_envs | 500 (diverse initial states) |
+| max_episode_steps | 50 |
+| mc_samples | 16 |
+| seed | 1 |
+
+### Method
+For each task: reset 500 envs → 500 diverse initial states → MC16 from each initial state → P(success|s₀) = n_success/16. Compare distributions.
+
+### Results
+
+| Metric | PickCube | StackCube |
+|--------|----------|-----------|
+| Overall SR | 46.3% | 53.6% |
+| frac_zero (P=0) | 1.2% | **25.2%** |
+| frac_one (P=1) | 0.2% | **21.2%** |
+| frac_decisive (0.1<P<0.9) | **96.2%** | 40.8% |
+| P(success) std | 0.212 | **0.408** |
+| P(success) median | 0.438 | 0.625 |
+| mean MC return std | 0.0028 | 0.0045 |
+
+### Notes
+- **Hypothesis confirmed**: StackCube's P(success|s₀) distribution is strikingly bimodal — 25% of initial states always fail (P=0), 21% always succeed (P=1). Only 41% of states are "decisive" (0.1<P<0.9).
+- **PickCube** has a smooth, unimodal distribution centered around ~0.45. Nearly all initial states (96.2%) have uncertain outcomes where the policy's actions matter.
+- This explains why MC16 AWR oscillates at 60-70% on StackCube instead of converging: ~59% of initial states produce uninformative advantages (either always +1 or always 0 regardless of actions taken).
+- The ~70% ceiling across all StackCube methods (MC16 AWR peak=72.4%, GAE baseline peak=70.3%) aligns with ~75% of initial states being potentially solvable (100% - 25% hopeless = 75%).
+- **Root cause**: StackCube's difficulty is driven by initial state diversity (cube placement/orientation), not by advantage estimation quality. Some reset configurations are physically unsolvable by the policy.
+- This complements the earlier within-state MC std finding (StackCube 0.16 vs PickCube 0.33): low within-state variance is partly because many states are deterministically success/fail.
+
+---
+
+## [P(success|s₀) Distribution: PegInsertionSide] - 2026-02-24 03:30
+
+### Overview
+Compute initial state P(success|s₀) distribution for PegInsertionSide-v1 (ckpt_231, ema99) via MC16, and compare with PickCube/StackCube.
+
+### Command
+```bash
+# Inline script using p_initial_state_analysis.py logic
+# E=500, M=16, max_episode_steps=100, gamma=0.97, seed=1
+# checkpoint: runs/peginsertion_ppo_ema99/ckpt_231.pt
+```
+
+### Results
+
+| Metric | PickCube (ckpt_76) | PegInsertion (ckpt_231) | StackCube (ckpt_481) |
+|--------|-------------------|------------------------|---------------------|
+| Overall SR | 43.8% | **76.7%** | ~70% |
+| frac_zero (P=0) | 1.2% | **0.0%** | 25.2% |
+| frac_one (P=1) | 0.2% | 17.2% | 21.2% |
+| frac_decisive (0.1<P<0.9) | 96.2% | 65.8% | 40.8% |
+| P(success) std | 0.212 | 0.218 | 0.408 |
+| P(success) median | ~0.44 | 0.81 | — |
+
+**Output**: `runs/p_initial_state_peg.png`, `runs/p_initial_state_peg.pt`
+
+### Notes
+- PegInsertion has **zero dead zones** (frac_zero=0%), unlike StackCube (25%). Every initial state has some chance of success.
+- Distribution is **right-skewed single-peak** (median=0.81), not bimodal like StackCube.
+- 65.8% of states are in the decisive range (0.1<P<0.9) — less than PickCube (96.2%) but far better than StackCube (40.8%).
+- This suggests PegInsertion finetuning has significant room for improvement (76.7% → 90%+) with MC16 AWR.
+
+---
+
+## [BC on PickCube-v1: Network Architecture Ablation] - 2026-02-24 02:30–04:30
+
+### Overview
+Train MLP BC on PickCube-v1 using MP demos (pd_ee_delta_pos, physx_cpu) to get a base policy for RL finetuning. Ablate demo source, network architecture, activation function, and loss function.
+
+### Demo Data
+- **MP demos**: `~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5` (1000 trajs, 49-105 steps avg 78, obs=42D, action=7D)
+- **RL demos**: `~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5` (594 trajs, 50 steps, obs=42D, action=8D)
+
+### Commands
+```bash
+# 1. RL demo, 2x256 ReLU, MSE, 10k
+python -u bc_official.py --env-id "PickCube-v1" \
+  --demo-path ~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --control-mode "pd_joint_delta_pos" --sim-backend "cpu" --max-episode-steps 100 \
+  --total-iters 10000 --exp-name "bc_pickcube_rl_demo"
+
+# 2. MP demo, 2x256 ReLU (official), MSE, 100k
+python -u bc_official.py --env-id "PickCube-v1" \
+  --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 \
+  --control-mode "pd_ee_delta_pos" --sim-backend "cpu" --max-episode-steps 100 \
+  --total-iters 100000 --exp-name "bc_pickcube_mp_100k"
+
+# 3. MP demo, 3x256 Tanh+ortho, Gaussian NLL, 100k
+python -u bc_official.py --env-id "PickCube-v1" \
+  --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 \
+  --control-mode "pd_ee_delta_pos" --sim-backend "cpu" --max-episode-steps 100 \
+  --total-iters 100000 --exp-name "bc_pickcube_mp_gaussian"
+
+# 4. MP demo, 3x256 ReLU+ortho, MSE, 100k
+python -u bc_official.py --env-id "PickCube-v1" \
+  --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 \
+  --control-mode "pd_ee_delta_pos" --sim-backend "cpu" --max-episode-steps 100 \
+  --total-iters 100000 --exp-name "bc_pickcube_mp_mse_3x256relu"
+```
+
+### Results
+
+| # | Setting | Network | Loss | Iters | Peak SR |
+|---|---------|---------|------|-------|---------|
+| 1 | RL demo | 2×256 ReLU | MSE | 10k | **88%** |
+| 2 | MP demo (official) | 2×256 ReLU | MSE | 100k | **57%** |
+| 3 | MP demo | 3×256 ReLU+ortho | MSE | 100k | 40% |
+| 4 | MP demo | 3×256 Tanh+ortho | NLL | 100k | 15% |
+| 5 | MP demo | 3×256 Tanh+ortho | MSE | ~50k | ~3% |
+
+**Training curves (MP demo, every 10k iters):**
+
+| Iter | 2×256 ReLU | 3×256 ReLU+ortho | 3×256 Tanh+NLL |
+|------|-----------|-----------------|---------------|
+| 10k | 4% | 4% | 0% |
+| 20k | 6% | 7% | 1% |
+| 30k | 23% | 22% | 1% |
+| 40k | 16% | 11% | 7% |
+| 50k | 36% | 10% | 1% |
+| 60k | 28% | 14% | 6% |
+| 70k | 42% | 15% | 0% |
+| 80k | 38% | 22% | 2% |
+| 90k | 40% | 36% | 0% |
+| 100k | — | ~13% | ~8% |
+
+**Run dirs**: `runs/bc_pickcube_rl_demo/`, `runs/bc_pickcube_mp_100k/`, `runs/bc_pickcube_mp_gaussian/`, `runs/bc_pickcube_mp_mse_3x256relu/`
+
+### Notes
+1. **RL demo >> MP demo** (88% vs 57%): Deterministic NN-generated demos are far easier to clone. MP demos are multimodal (different motion plans per reset), causing MLP to average across modes.
+2. **Tanh is the dominant failure mode**: 3×256 Tanh+MSE = 3% (worst), Tanh+NLL = 15%. ReLU variants are 10-20x better. Tanh saturates and compresses gradients, making precise continuous action regression very difficult.
+3. **NLL loss is NOT the main problem**: Previously attributed 15% SR to NLL degrading mean learning. Control experiment showed Tanh+MSE is even worse (3%). NLL's gradient scaling (1/var) actually partially compensates for Tanh saturation.
+4. **Orthogonal init + deeper network slightly hurts**: 3×256 ReLU+ortho (40%) vs 2×256 ReLU+default (57%). Possibly over-parameterization or last-layer small std init (`std=0.01*sqrt(2)`) limiting output range.
+5. **Gaussian policy exploration must be manually added**: BC pushes logstd → -5 (clamp limit) regardless of loss. For finetuning, manually set logstd (e.g., -1.5). The logstd from BC is meaningless.
+6. **Implication for finetuning Agent**: The standard Agent class uses Tanh activation — fine for RL (policy gradient), but bad for BC regression. Need to add ReLU activation option to Agent for BC→RL pipeline.
+
+---
+
+## [BC Policy P(success|s₀) Distribution: Extreme Bimodality] - 2026-02-24 05:00
+
+### Overview
+Analyze P(success|s₀) distribution of the two best BC policies on PickCube-v1 via MC16, and compare with PPO base policy.
+
+### Command
+```bash
+# Inline script: 500 initial states, MC16 deterministic rollout, physx_cuda
+# RL demo BC: runs/bc_pickcube_rl_demo/checkpoints/best_eval_success_once.pt (pd_joint_delta_pos)
+# MP demo BC: runs/bc_pickcube_mp_100k/checkpoints/best_eval_success_once.pt (pd_ee_delta_pos)
+```
+
+### Results
+
+| Metric | RL demo BC | MP demo BC | PPO ckpt_76 |
+|--------|-----------|-----------|-------------|
+| eval SR (physx_cpu) | 88% | 57% | 43.8% |
+| MC16 SR (physx_cuda) | 62.7% | 15.1% | 43.8% |
+| frac_zero (P=0) | **36.8%** | **84.4%** | 1.2% |
+| frac_one (P=1) | **62.0%** | 14.4% | 0.2% |
+| frac_decisive (0.1<P<0.9) | **1.2%** | **1.2%** | **96.2%** |
+| P std | 0.481 | 0.354 | 0.212 |
+
+**Output**: `runs/p_initial_state_bc_pickcube.png`
+
+### Notes
+1. **BC policies are extremely bimodal**: Both have frac_decisive=1.2% — virtually no states where the policy's actions matter stochastically. Each initial state deterministically succeeds or fails. PPO has 96.2% decisive states.
+2. **Root cause**: BC is a deterministic policy (MSE-trained, no exploration noise). Given a fixed initial state, it always produces the same trajectory → same outcome. PPO has learnable logstd providing action noise, so the same initial state can have different outcomes.
+3. **Finetuning implication**: With frac_decisive=1.2%, MC re-rollout from any given state always returns the same outcome → advantage ≈ 0 everywhere → no learning signal. Must add exploration noise (set logstd to e.g. -1.5) before finetuning.
+4. **Backend mismatch**: RL demo BC shows 88% on physx_cpu but 62.7% on physx_cuda. The deterministic BC policy amplifies even small obs differences between backends via compounding error. This is Issue #18 affecting PickCube too, not just StackCube.
+5. **MP demo BC especially bad**: 84.4% of initial states are dead zones (P=0). Even with logstd=-1.5, many of these will remain near-zero, limiting finetuning ceiling.
+
 ---
 

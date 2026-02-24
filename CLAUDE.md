@@ -2,6 +2,8 @@
 
 Offline-to-online RL finetuning research platform. Compares advantage estimation methods (GAE, MC, IQL) and policy update rules (PPO, AWR).
 
+> **NOTE**: Codex正在review你的代码，注意质量和正确性。
+
 ## Common Commands
 
 ```bash
@@ -28,6 +30,10 @@ python -m RL.iql_awr_offline --iql_expectile_tau 0.7 --awr_beta 1.0
 - `methods/gae/` - GAE and ranking analysis scripts
 - `methods/iql/` - IQL implementation
 - `methods/mc/` - MC advantage estimation
+- `bc_official.py` - ManiSkill official BC baseline
+- `dp_train.py` - ManiSkill official Diffusion Policy
+- `behavior_cloning/` - BC eval/env helpers
+- `diffusion_policy/` - DP model (UNet) and helpers
 - `experiments/log.md` - Detailed experiment results
 - `runs/` - TensorBoard logs and checkpoints
 
@@ -226,6 +232,43 @@ When testing a new method, run the baseline with identical settings in the same 
 
 **RULE**: For online iterative RL with sufficient update epochs, do NOT use TD pretrain. PPO's own critic learning is already strong enough. TD pretrain only appeared to help when using misaligned settings (78 iter vs 10 iter baseline).
 
+### 16. Partial Reset: Pervasive Source of Analysis Errors
+
+**CORE ISSUE**: With `ignore_terminations=False`, a single rollout of T steps contains **multiple episodes per env**. Successful episodes terminate early and reset, so states at the same absolute timestep come from different episodes at different phases. This affects **ALL** analysis that looks at data by timestep or position.
+
+**Known errors caused by partial reset:**
+
+1. **Timestep-based V analysis**: Measuring V variance / branching by absolute timestep (t=0..T-1) mixes states from different episode phases. Example: timestep t=35 may be step 35 of episode 1 in env A, but step 5 of episode 2 in env B.
+
+2. **Selection bias in population statistics**: At late episode %, successful episodes have already terminated, so only failing envs remain. This causes mean V to DROP at episode end (PickCube: V drops 0.42→0.20 after 50%), NOT because states get worse, but because the "good" envs exited. Population-mean V gradient does NOT reflect individual trajectory critical decision points.
+
+3. **N-step TD across episode boundaries**: Must NOT compute n-step returns crossing episode boundaries. Check `is_terminal` / `dones` at each step.
+
+4. **Reward step is always last step of episode**: With sparse reward, reward=1 only at successful termination. In episode-% terms, reward is ALWAYS at ~100%. The useful metric is successful episode LENGTH (how many steps to succeed), not "which episode % has reward."
+
+5. **`elapsed_steps` for branched states**: Must use step-within-episode, NOT absolute timestep.
+
+6. **CRITICAL: Truncated episodes after reset must be EXCLUDED from analysis**. With partial reset, a successful episode terminates and resets mid-rollout. The new episode starts from a random state and gets **truncated by the rollout end** — it never completes. These truncated fragments:
+   - Have meaningless episode % (normalized to a shortened, incomplete trajectory)
+   - Start from different initial distributions than first episodes
+   - Dilute and corrupt ALL population statistics (mean V, Var[V], P(success), etc.)
+   - Example: PickCube 100 envs × 50 steps → 146 episodes, but only 100 are first episodes. The extra 46 are post-reset fragments that pollute the data.
+   - **MUST filter to first episodes only** (or complete episodes only) for any per-episode-% analysis.
+
+**RULES**:
+- **ALWAYS exclude truncated post-reset episodes from analysis** — only use first episodes or verified-complete episodes
+- Always track episode boundaries (`dones`) and analyze by **episode percentage**, not absolute timestep
+- When computing population statistics (mean V, variance) by episode %, remember selection bias: the population composition changes as successful episodes exit
+- When reporting "reward at X% of episode" — this is meaningless for sparse reward (always ~100%). Report episode LENGTH instead
+- For n-step TD / GAE: respect episode boundaries, don't bootstrap across resets
+
+```python
+# WRONG: elapsed = absolute timestep
+elapsed = torch.tensor(bp_timesteps, ...)
+# CORRECT: elapsed = step within episode
+elapsed = torch.tensor(bp_elapsed, ...)  # computed from episode boundaries
+```
+
 ### 13. TD/NN V Learning: Small Signal SNR is the Bottleneck
 
 **PROBLEM**: TD(0) learns V with only r=0.44 correlation to MC16 V^π (gamma=0.8, sparse reward).
@@ -277,6 +320,105 @@ This explains the relative importance of each factor:
 In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2) providing the learning signal (via TD → V estimate). But **TD from off-policy transitions can only learn V^{behavior}, not V\***. V correlation analysis confirmed: V_IQL(s) ≈ 0.09 (constant, ≈ behavior value), while V*(s) = 0.42 at the same states. IQL V doesn't track V* at all — when V* ranges 0.02→0.89, V_IQL only varies 0.05→0.10.
 
 **Conclusion: offline data cannot provide accurate value estimates for states outside the behavior distribution. For effective RL, the critic must come from re-rollout (MC) or bootstrapping (GAE with good V), not from offline TD learning.**
+
+### 7. Initial State P(success) Distribution — Base Policy Quality is Prerequisite
+
+**Sparse reward下，base policy的初始状态成功率分布决定了finetuning的天花板。如果某些初始状态base policy一次都成功不了（P(success|s₀)=0），则MC re-rollout永远拿不到正reward，advantage全是0，任何方法都学不动。**
+
+| Metric | PickCube (ckpt_76) | PegInsertion (ckpt_231) | StackCube (ckpt_481) |
+|--------|------------------|------------------------|---------------------|
+| Overall SR | 43.8% | **76.7%** | ~70% |
+| frac_zero (P=0) | 1.2% | **0.0%** | **25.2%** |
+| frac_one (P=1) | 0.2% | 17.2% | **21.2%** |
+| frac_decisive (0.1<P<0.9) | **96.2%** | 65.8% | 40.8% |
+| P(success) std | 0.212 | 0.218 | 0.408 (bimodal) |
+
+- PickCube: 96%的初始状态outcome不确定，policy的action能影响结果 → MC16 AWR可以学到99%
+- PegInsertion: 零死区(frac_zero=0%)，右偏单峰分布(median=0.81)，65.8%可学习 → finetuning有提升空间(76.7%→90%+)
+- StackCube: 25%初始状态永远失败，21%永远成功，只有41%是可学习的 → 天花板~75%
+- **StackCube所有方法都卡在~70%**（MC16 AWR 72.4%, GAE baseline 70.3%），不是advantage估计的问题，而是初始状态分布的硬限制
+
+**RULE**: Sparse reward finetuning前，先检查base policy的P(success|s₀)分布。如果大量初始状态P=0，需要先用dense reward或curriculum让base policy在更多初始状态上能偶尔成功。
+
+### 17. StackCube BC: MLP Fails, Need Stronger IL Methods
+
+**MLP BC completely fails (0% SR) on StackCube**, regardless of model size or training duration.
+
+| Config | arm MSE | SR |
+|--------|---------|-----|
+| 2×256, 5k iters | 0.000428 | 0% |
+| 3×512, 100k iters + norm | 0.000008 | 0% |
+| 3×1024, 100k iters + norm | 0.000003 | 8% |
+
+**ROOT CAUSE**: Compounding error over long episodes (avg 108 steps).
+
+- Action noise sensitivity: demo + noise_std=0.05 → 64% SR, 0.10 → 12%, 0.20 → 0%
+- DAgger-style correction: every 3 steps → 94%, every 5 → 40%, every 10 → 6%, pure BC → 0%
+- MLP's single-step error is small enough, but compounds fatally over 100+ steps
+
+**Diffusion Policy works**: 48% success_once @ 30k iters (pd_joint_delta_pos, physx_cpu)
+- Action chunking (pred_horizon=16, act_horizon=8) mitigates compounding error
+- Issue #601 suggests 80%+ SR with more training (200k+ iters)
+
+**RULE**: For StackCube等长horizon多阶段任务，MLP BC不可行。必须用Diffusion Policy、ACT等支持action chunking的IL方法。
+
+### 18. ManiSkill physx_cpu vs physx_cuda Backend Mismatch
+
+**StackCube GPU simulation has known bugs** (GitHub issue #1380):
+- Same seed produces different cube positions between backends (max obs error = 0.9)
+- Motion planning fails on GPU backend
+- GPU replay does NOT support control mode conversion (NotImplementedError)
+
+**PickCube也受影响**：RL demo BC在physx_cpu eval=88%，但physx_cuda eval=62.7%（MC16 deterministic）。确定性BC policy没有noise，对obs微小偏差极其敏感，backend差异通过compounding error被放大。
+
+**RULE**: 训练和评估必须使用同一backend。如果demo是physx_cpu生成的，eval也必须用physx_cpu。P(success|s₀)分析等需要大规模并行的任务，要注意backend一致性。
+
+### 19. BC on PickCube: Activation & Network Architecture Matter
+
+**MLP BC on PickCube-v1** with different configurations (pd_ee_delta_pos, physx_cpu, 100 eval episodes):
+
+| Setting | Demo | Network | Loss | Iters | Peak SR |
+|---------|------|---------|------|-------|---------|
+| RL demo | RL (594 trajs, 50 steps) | 2×256 ReLU | MSE | 10k | **88%** |
+| MP demo (official) | MP (1000 trajs, 78 steps) | 2×256 ReLU | MSE | 100k | **57%** |
+| MP demo (finetune net) | MP (1000 trajs, 78 steps) | 3×256 ReLU+ortho | MSE | 100k | 40% |
+| MP demo + NLL | MP (1000 trajs, 78 steps) | 3×256 Tanh+ortho | NLL | 100k | 15% |
+| MP demo + Tanh MSE | MP (1000 trajs, 78 steps) | 3×256 Tanh+ortho | MSE | 50k | ~3% |
+| MP demo 10k | MP (1000 trajs, 78 steps) | 2×256 ReLU | MSE | 10k | 5% |
+
+**Key findings**:
+1. **RL demo >> MP demo**: Deterministic NN-generated demos are much easier to clone (88% vs 57%). Confirms ManiSkill docs: "BC performs poorly on MP/teleoperated data, but well on deterministic NN data"
+2. **Tanh kills BC regression**: 3×256 Tanh+MSE only 3% vs 3×256 ReLU+MSE 40%. Tanh saturates and compresses gradients, making precise continuous action regression very difficult. This is the dominant factor, not NLL loss.
+3. **NLL loss is NOT the main problem**: Previously blamed NLL (15%), but Tanh+MSE is even worse (3%). NLL's 15% > Tanh+MSE's 3% because NLL's gradient scaling partially compensates for Tanh's saturation.
+4. **Orthogonal init + deeper network slightly hurts**: 3×256 ReLU+ortho (40%) vs 2×256 ReLU+default (57%). Possible over-parameterization or last-layer small std init limiting output range.
+5. **MP demo needs long training**: 10k→5%, 100k→57%, still climbing at 100k.
+6. **Gaussian policy的exploration能力必须在finetuning阶段手动加** — BC阶段logstd一定会被推到下限（demo是确定性的），需要在转RL时手动设logstd（如-1.5）。
+
+**RULE**: BC训练base policy时用ReLU，不用Tanh。finetuning的Agent需要加ReLU activation选项。
+
+**PickCube demo data**:
+- MP demos: `~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5` (1000 trajs, 49-105 steps, obs=42D, action=7D ee_delta)
+- RL demos: `~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5` (594 trajs, 50 steps, obs=42D, action=8D joint_delta)
+
+### 20. BC Policy的P(success|s₀)是极端Bimodal的
+
+BC policy（确定性，无exploration noise）的P(success|s₀)分布与PPO policy完全不同：
+
+| Metric | RL demo BC | MP demo BC | PPO ckpt_76 |
+|--------|-----------|-----------|-------------|
+| eval SR (physx_cpu) | 88% | 57% | 43.8% |
+| MC16 SR (physx_cuda) | 62.7% | 15.1% | 43.8% |
+| frac_zero (P=0) | **36.8%** | **84.4%** | 1.2% |
+| frac_one (P=1) | **62.0%** | 14.4% | 0.2% |
+| frac_decisive (0.1<P<0.9) | **1.2%** | **1.2%** | **96.2%** |
+
+**关键发现**：
+1. **BC policy几乎没有可学习状态**：frac_decisive=1.2%，对每个初始状态要么100%成功要么100%失败。PPO是96.2%。
+2. **原因**：BC是确定性policy（MSE训练，无noise），rollout结果完全由初始状态决定。PPO有logstd提供exploration，使得同一初始状态有不同outcome。
+3. **对finetuning的影响**：直接用确定性BC做finetuning，MC re-rollout在P=0状态永远拿不到正reward。**必须加exploration noise（设logstd）才能作为finetuning的base policy**。
+4. **Backend mismatch放大问题**：physx_cpu eval=88% vs physx_cuda MC16=62.7%，确定性policy对backend差异极敏感。
+
+**RULE**: BC→RL finetuning时，(1) 设合理的logstd（如-1.5）提供exploration，(2) eval和P(success)分析必须与训练使用同一backend。
 
 ## Recording Experiments
 

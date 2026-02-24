@@ -67,6 +67,8 @@ class Args:
 
     # TD+EMA V learning
     td_epochs_per_iter: int = 200
+    td_n_step: int = 1
+    """N-step TD for V target. 1=standard TD(0), 10=10-step."""
     td_target_steps: int = 0
     """If >0, dynamically set td_epochs = td_target_steps * td_batch_size / data_size
     (overrides td_epochs_per_iter). E.g. 7000 keeps ~7000 gradient steps regardless of data size."""
@@ -104,6 +106,10 @@ class Args:
     ent_coef: float = 0.0
     max_grad_norm: float = 0.5
 
+    # Eval env overrides (needed for StackCube etc.)
+    eval_reconfiguration_freq: int = 0
+    """reconfiguration_freq for eval envs (1 for StackCube)"""
+
     # Other
     seed: int = 1
     cuda: bool = True
@@ -134,7 +140,7 @@ if __name__ == "__main__":
     print(f"=== Online TD+EMA AWR ({args.advantage_mode.upper()}) ===")
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Reward: {args.reward_mode}, gamma: {args.gamma}")
-    print(f"  TD+EMA: rs={args.td_reward_scale}, tau={args.ema_tau}, epochs/iter={args.td_epochs_per_iter}")
+    print(f"  TD+EMA: rs={args.td_reward_scale}, tau={args.ema_tau}, n_step={args.td_n_step}, epochs/iter={args.td_epochs_per_iter}")
     print(f"  AWR: beta={args.awr_beta}, max_weight={args.awr_max_weight}, epochs={args.update_epochs}")
     print(f"  Envs: {args.num_envs}, Steps: {args.num_steps}")
     print(f"  Batch: {args.batch_size}, Minibatch: {args.minibatch_size}")
@@ -162,8 +168,11 @@ if __name__ == "__main__":
     )
 
     envs = gym.make(args.env_id, num_envs=args.num_envs, **env_kwargs)
+    eval_env_kwargs = dict(env_kwargs)
+    if args.eval_reconfiguration_freq > 0:
+        eval_env_kwargs["reconfiguration_freq"] = args.eval_reconfiguration_freq
     eval_envs = gym.make(
-        args.env_id, num_envs=args.num_eval_envs, **env_kwargs,
+        args.env_id, num_envs=args.num_eval_envs, **eval_env_kwargs,
     )
 
     if isinstance(envs.action_space, gym.spaces.Dict):
@@ -231,33 +240,62 @@ if __name__ == "__main__":
     replay_buffer = []  # list of dicts per rollout
 
     def prepare_td_data():
-        """Concatenate all replay data into flat TD tuples."""
+        """Concatenate all replay data into flat TD tuples with n-step support."""
         all_obs = torch.cat([d["obs"] for d in replay_buffer], dim=1)  # (T, N*E, D)
         all_rewards = torch.cat([d["rewards"] for d in replay_buffer], dim=1)  # (T, N*E)
         all_dones = torch.cat([d["dones"] for d in replay_buffer], dim=1)  # (T, N*E)
         all_next_obs = torch.cat([d["next_obs"] for d in replay_buffer], dim=0)  # (N*E, D)
         all_next_done = torch.cat([d["next_done"] for d in replay_buffer], dim=0)  # (N*E,)
 
-        T_steps, total_E, D = all_obs.shape
+        Tl, El, D = all_obs.shape
         rs = args.td_reward_scale
+        n = args.td_n_step
 
-        # Build (s, r*rs, s', d) tuples
         flat_s = all_obs.reshape(-1, D)
-        flat_r = all_rewards.reshape(-1) * rs
 
-        # Next obs: obs[t+1] for t<T-1, next_obs for t=T-1
-        flat_ns = torch.zeros_like(all_obs)
-        flat_ns[:-1] = all_obs[1:]
-        flat_ns[-1] = all_next_obs
-        flat_ns = flat_ns.reshape(-1, D)
+        if n == 1:
+            flat_nstep_ret = all_rewards.reshape(-1) * rs
+            flat_ns = torch.zeros_like(all_obs)
+            flat_ns[:-1] = all_obs[1:]
+            flat_ns[-1] = all_next_obs
+            flat_boot_obs = flat_ns.reshape(-1, D)
+            flat_d = torch.zeros_like(all_rewards)
+            flat_d[:-1] = all_dones[1:]
+            flat_d[-1] = all_next_done
+            flat_boot_mask = args.gamma * (1 - flat_d.reshape(-1))
+        else:
+            nstep_ret = torch.zeros(Tl, El, device=device)
+            nstep_boot_obs = torch.zeros(Tl, El, D, device=device)
+            nstep_boot_mask = torch.zeros(Tl, El, device=device)
 
-        # Next done: dones[t+1] for t<T-1, next_done for t=T-1
-        flat_d = torch.zeros_like(all_rewards)
-        flat_d[:-1] = all_dones[1:]
-        flat_d[-1] = all_next_done
-        flat_d = flat_d.reshape(-1)
+            for t in range(Tl):
+                cumul = torch.zeros(El, device=device)
+                discount = torch.ones(El, device=device)
+                alive = torch.ones(El, device=device)
+                for k in range(n):
+                    step = t + k
+                    if step < Tl:
+                        cumul += discount * alive * all_rewards[step]
+                        if k < n - 1 and step + 1 < Tl:
+                            alive *= (1.0 - all_dones[step + 1])
+                        elif k < n - 1 and step + 1 == Tl:
+                            alive *= (1.0 - all_next_done)
+                        discount *= args.gamma
+                    else:
+                        break
+                nstep_ret[t] = cumul * rs
+                boot_step = min(t + n, Tl)
+                if boot_step < Tl:
+                    nstep_boot_obs[t] = all_obs[boot_step]
+                else:
+                    nstep_boot_obs[t] = all_next_obs
+                nstep_boot_mask[t] = discount * alive
 
-        return flat_s, flat_r, flat_ns, flat_d
+            flat_nstep_ret = nstep_ret.reshape(-1)
+            flat_boot_obs = nstep_boot_obs.reshape(-1, D)
+            flat_boot_mask = nstep_boot_mask.reshape(-1)
+
+        return flat_s, flat_nstep_ret, flat_boot_obs, flat_boot_mask
 
     # ── Logger ─────────────────────────────────────────────────────────
     writer = SummaryWriter(f"runs/{run_name}")
@@ -422,7 +460,7 @@ if __name__ == "__main__":
             critic_optimizer = optim.Adam(critic.parameters(), lr=args.td_lr, eps=1e-5)
 
         td_t0 = time.time()
-        flat_s, flat_r, flat_ns, flat_d = prepare_td_data()
+        flat_s, flat_nstep_ret, flat_boot_obs, flat_boot_mask = prepare_td_data()
         N = flat_s.shape[0]
         mb = min(args.td_batch_size, N)
         num_batches = max(1, N // mb)
@@ -438,7 +476,8 @@ if __name__ == "__main__":
             for start in range(0, N, mb):
                 idx = perm[start:start + mb]
                 with torch.no_grad():
-                    target = flat_r[idx] + args.gamma * critic_target(flat_ns[idx]).view(-1) * (1 - flat_d[idx])
+                    v_boot = critic_target(flat_boot_obs[idx]).view(-1)
+                    target = flat_nstep_ret[idx] + flat_boot_mask[idx] * v_boot
                 v_pred = critic(flat_s[idx]).view(-1)
                 v_loss = 0.5 * ((v_pred - target) ** 2).mean()
 
@@ -454,7 +493,7 @@ if __name__ == "__main__":
         td_time = time.time() - td_t0
 
         # Free flat TD data
-        del flat_s, flat_r, flat_ns, flat_d
+        del flat_s, flat_nstep_ret, flat_boot_obs, flat_boot_mask
 
         # ── Compute final_values with UPDATED critic ───────────────
         # For envs that terminated mid-rollout, obs[t+1] is the reset obs.
