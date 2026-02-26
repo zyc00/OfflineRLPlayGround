@@ -293,6 +293,68 @@ Evidence:
 
 **IMPLICATION**: For sparse reward with small V magnitudes, scale up rewards before TD/regression. The bottleneck is NN expressiveness at small signal levels, not the learning algorithm (TD vs MC vs n-step).
 
+### 21. BC Eval必须设正确的max_episode_steps
+
+**WRONG**: 用环境默认的max_episode_steps做BC eval
+- PickCube-v1默认max_episode_steps=50，但MP demo平均78步（范围49-103）
+- BC policy按demo轨迹走，50步截断 → eval显示0% SR（看起来完全失败）
+- 曾导致所有BC实验看起来都是0%，浪费大量debug时间
+
+**CORRECT**: 根据demo长度设max_episode_steps
+```bash
+# PickCube MP demos avg 78 steps → 用100
+python bc_official.py --max-episode-steps 100 ...
+
+# StackCube MP demos avg 108 steps → 用200
+python bc_official.py --max-episode-steps 200 ...
+```
+
+**RULE**: BC eval的max_episode_steps必须 ≥ demo最大长度。`bc_official.py`已改默认值为100。其他eval脚本也要注意。
+
+### 22. LFF/Fourier Features不帮助BC
+
+**TESTED**: Learned Fourier Features (geyang/ffn paper) on PickCube BC
+- MLP2 (2×256 ReLU): **42.8% ± 10.0%** (5 seeds)
+- FFN scale=0.1 (best): **7.2% ± 6.3%** (5 seeds)
+- FFN loss比MLP高3-5x（收敛到1.1e-4 vs 3.0e-5）
+
+**WHY**: Spectral bias paper针对Q-value approximation（value landscape有高频特征），BC regression不需要高频拟合。sin activation反而让action regression更难。
+
+### 23. DPPO Pretrain: Eval必须用CPU，batch_size必须1024
+
+**WRONG**: 用physx_cuda做Diffusion Policy eval
+- DPPO pretrain 4k iters: cuda eval=75%, cpu eval=**97%**（差22%！）
+- 确定性DP policy对backend obs微小差异极其敏感，compounding error over 100 steps
+- Cuda eval严重低估性能，导致误判"收敛慢"
+
+**WRONG**: 用batch_size=256训练（DPPO pretrain默认）
+- dp_train默认batch_size=1024
+- bs=256在5k iters只处理1.28M samples，bs=1024处理5.12M
+- 结果：bs=256 cuda eval 54% vs bs=1024 cuda eval 75% @ 4k iters
+
+**CORRECT config**（已验证和dp_train完全对齐）:
+```bash
+python -m DPPO.pretrain \
+  --env_id PickCube-v1 \
+  --demo_path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 \
+  --control_mode pd_ee_delta_pos \
+  --network_type unet --denoising_steps 100 --horizon_steps 16 --cond_steps 2 --act_steps 8 \
+  --batch_size 1024 --no_obs_norm --no_action_norm
+```
+
+**验证结果**（bs=1024, UNet, T=100, ee_delta_pos, 1000 MP demos, cpu eval）:
+
+| Iter | CUDA eval | CPU eval |
+|------|-----------|----------|
+| 4k | 75% | **97%** |
+| 6k | 86% | **97%** |
+| 8k | 83% | **98%** |
+| 10k | 85% | **100%** |
+
+dp_train baseline: 5k→99%, 10k→100%（cpu eval）。完全一致。
+
+**RULE**: DPPO/DP最终eval用cpu backend（`eval_cpu.py`），发现异常先换cpu排查。需要高效迭代时可用cuda粗筛。batch_size用1024。
+
 ---
 
 ## Key Research Findings
@@ -321,9 +383,11 @@ In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2)
 
 **Conclusion: offline data cannot provide accurate value estimates for states outside the behavior distribution. For effective RL, the critic must come from re-rollout (MC) or bootstrapping (GAE with good V), not from offline TD learning.**
 
-### 7. Initial State P(success) Distribution — Base Policy Quality is Prerequisite
+### 7. Coverage（初始状态成功率分布）— Base Policy Quality is Prerequisite
 
-**Sparse reward下，base policy的初始状态成功率分布决定了finetuning的天花板。如果某些初始状态base policy一次都成功不了（P(success|s₀)=0），则MC re-rollout永远拿不到正reward，advantage全是0，任何方法都学不动。**
+**Coverage** = P(success|s₀)分布的三个fraction：frac_zero（P=0，死区）、frac_decisive（0.1<P<0.9，可学习）、frac_one（P=1，已掌握）。
+
+**Sparse reward下，base policy的coverage决定了finetuning的天花板。如果某些初始状态base policy一次都成功不了（frac_zero高），则MC re-rollout永远拿不到正reward，advantage全是0，任何方法都学不动。**
 
 | Metric | PickCube (ckpt_76) | PegInsertion (ckpt_231) | StackCube (ckpt_481) |
 |--------|------------------|------------------------|---------------------|
@@ -336,9 +400,14 @@ In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2)
 - PickCube: 96%的初始状态outcome不确定，policy的action能影响结果 → MC16 AWR可以学到99%
 - PegInsertion: 零死区(frac_zero=0%)，右偏单峰分布(median=0.81)，65.8%可学习 → finetuning有提升空间(76.7%→90%+)
 - StackCube: 25%初始状态永远失败，21%永远成功，只有41%是可学习的 → 天花板~75%
-- **StackCube所有方法都卡在~70%**（MC16 AWR 72.4%, GAE baseline 70.3%），不是advantage估计的问题，而是初始状态分布的硬限制
+- **StackCube所有方法都卡在~70%**（MC16 AWR 72.4%, GAE baseline 70.3%），不是advantage估计的问题，而是coverage的硬限制
 
-**RULE**: Sparse reward finetuning前，先检查base policy的P(success|s₀)分布。如果大量初始状态P=0，需要先用dense reward或curriculum让base policy在更多初始状态上能偶尔成功。
+**RULE**: Sparse reward finetuning前，先检查base policy的coverage。如果frac_zero高，需要先用dense reward或curriculum让base policy在更多初始状态上能偶尔成功。
+
+**Coverage分析脚本**（按policy类型选用）：
+- `RL/p_success_analysis.py` — PPO/Gaussian policy，cuda env，分析轨迹中每个state的P(success|s)
+- `bc_p_success_cpu.py` — BC policy，cpu env，支持noise sweep分析确定性policy的bimodality
+- `dp_p_success_cpu.py` — dp_train格式的Diffusion Policy，cpu env，MC rollouts on initial states
 
 ### 17. StackCube BC: MLP Fails, Need Stronger IL Methods
 
@@ -371,7 +440,21 @@ In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2)
 
 **PickCube也受影响**：RL demo BC在physx_cpu eval=88%，但physx_cuda eval=62.7%（MC16 deterministic）。确定性BC policy没有noise，对obs微小偏差极其敏感，backend差异通过compounding error被放大。
 
-**RULE**: 训练和评估必须使用同一backend。如果demo是physx_cpu生成的，eval也必须用physx_cpu。P(success|s₀)分析等需要大规模并行的任务，要注意backend一致性。
+**pd_joint_delta_pos在cuda上不可replay**：
+- `none→state -b cuda` replay保存 **0/997** demos（对比ee：1000/1000）
+- 原因：RL数据用num_envs=1024收集，replay用num_envs=1，cuda物理模拟的微小差异导致joint轨迹完全发散
+- pd_ee_delta_pos可以replay因为IK solver吸收物理差异；joint delta直接累积误差
+- 预存的cuda joint state文件（997 trajs）来源不明，训练出来只有~12% SR
+- `none→state -b cpu` replay保存594/997（60%存活率），训练出来90.2% SR
+
+**Replay存活率汇总**（PickCube RL demos, 997 source trajectories）：
+
+| Control Mode | cuda→cuda | cuda→cpu |
+|-------------|-----------|----------|
+| pd_ee_delta_pos | **1000/1000** (100%) | 152/1022 (15%) |
+| pd_joint_delta_pos | **0/997** (0%) | 594/997 (60%) |
+
+**RULE**: **Replay（轨迹转换）**必须使用同一backend，pd_joint_delta_pos只能用cpu replay，pd_ee_delta_pos优先用cuda→cuda（100%存活）。**最终eval用cpu，cuda eval做粗筛**——cuda eval对确定性policy（BC、Diffusion Policy）严重低估成功率（DPPO pretrain: cpu=97% vs cuda=75%，差距20%+），compounding error放大backend obs微小偏差。需要高效eval时可以先用cuda快速迭代，但最终结果和发现异常时必须用cpu eval确认。
 
 ### 19. BC on PickCube: Activation & Network Architecture Matter
 
@@ -400,9 +483,9 @@ In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2)
 - MP demos: `~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5` (1000 trajs, 49-105 steps, obs=42D, action=7D ee_delta)
 - RL demos: `~/.maniskill/demos/PickCube-v1/rl/trajectory.state.pd_joint_delta_pos.physx_cpu.h5` (594 trajs, 50 steps, obs=42D, action=8D joint_delta)
 
-### 20. BC Policy的P(success|s₀)是极端Bimodal的
+### 20. BC Policy的Coverage是极端Bimodal的
 
-BC policy（确定性，无exploration noise）的P(success|s₀)分布与PPO policy完全不同：
+BC policy（确定性，无exploration noise）的coverage与PPO policy完全不同：
 
 | Metric | RL demo BC | MP demo BC | PPO ckpt_76 |
 |--------|-----------|-----------|-------------|
@@ -418,7 +501,7 @@ BC policy（确定性，无exploration noise）的P(success|s₀)分布与PPO po
 3. **对finetuning的影响**：直接用确定性BC做finetuning，MC re-rollout在P=0状态永远拿不到正reward。**必须加exploration noise（设logstd）才能作为finetuning的base policy**。
 4. **Backend mismatch放大问题**：physx_cpu eval=88% vs physx_cuda MC16=62.7%，确定性policy对backend差异极敏感。
 
-**RULE**: BC→RL finetuning时，(1) 设合理的logstd（如-1.5）提供exploration，(2) eval和P(success)分析必须与训练使用同一backend。
+**RULE**: BC→RL finetuning时，必须设合理的logstd（如-1.5）提供exploration。确定性BC的P(success)分析对backend敏感（cpu=88% vs cuda=62.7%），但加noise后差异不大，eval用cuda即可。
 
 ## Recording Experiments
 

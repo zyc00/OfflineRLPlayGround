@@ -4278,3 +4278,307 @@ Analyze P(success|s₀) distribution of the two best BC policies on PickCube-v1 
 
 ---
 
+## [BC P(success|s₀) — physx_cpu Deterministic Rerun] - 2026-02-24 11:00
+
+**Command**: `python -u /tmp/bc_p_success_cpu.py`
+**Git**: ac5aa39 (main)
+**Output**: `runs/p_initial_state_bc_pickcube_cpu.png`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env | PickCube-v1 |
+| backend | physx_cpu (single CPU env) |
+| E (initial states) | 500 |
+| MC samples | 1 (deterministic → MC1 suffices) |
+| max_episode_steps | 100 |
+| seed per state | seed=i for i in 0..499 |
+| reconfiguration_freq | 1 |
+
+### Policies Tested
+| Policy | Checkpoint | Control Mode |
+|--------|-----------|-------------|
+| RL demo BC (88% eval SR) | `runs/bc_pickcube_rl_demo/checkpoints/best_eval_success_once.pt` | pd_joint_delta_pos |
+| MP demo BC (57% eval SR) | `runs/bc_pickcube_mp_100k/checkpoints/best_eval_success_once.pt` | pd_ee_delta_pos |
+
+### Results
+| Metric | RL demo BC | MP demo BC |
+|--------|-----------|-----------|
+| physx_cpu SR | **81.0%** | **57.0%** |
+| frac_zero (P=0) | 19.0% | 43.0% |
+| frac_one (P=1) | 81.0% | 57.0% |
+| frac_decisive | 0.0% | 0.0% |
+
+### Backend Comparison (physx_cpu vs physx_cuda)
+| Policy | cpu SR | cuda SR | Gap |
+|--------|--------|---------|-----|
+| RL demo BC | 81.0% | 62.7% | -18.3pp |
+| MP demo BC | 57.0% | 15.1% | **-41.9pp** |
+
+### Notes
+1. **physx_cpu numbers match training eval**: 81% ≈ 88% (RL demo), 57% = 57% (MP demo), confirming backend mismatch was the cause of the previous low physx_cuda numbers.
+2. **Still fully bimodal** (frac_decisive=0%): deterministic policy → every initial state either always succeeds or always fails. No intermediate P values.
+3. **MP demo BC far more sensitive to backend**: 42pp gap (cpu→cuda) vs 18pp for RL demo. Likely because `pd_ee_delta_pos` control is more sensitive to obs differences than `pd_joint_delta_pos`.
+
+---
+
+## [BC P(success|s₀) — Stochastic (Gaussian Noise) Analysis] - 2026-02-24 11:34
+
+**Command**: `python -u /tmp/bc_p_success_stochastic.py`
+**Git**: ac5aa39 (main)
+**Status**: Partial (RL demo BC complete for logstd={-3, -2}, logstd=-1.5 at 150/200; MP demo BC not started; killed early)
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env | PickCube-v1 |
+| backend | physx_cpu (single CPU env) |
+| E (initial states) | 200 |
+| MC samples per state | 16 |
+| max_episode_steps | 100 |
+| logstd values tested | -3.0, -2.0, -1.5, -1.0 |
+| noise method | `action = mean + randn * exp(logstd)`, then clamp to action bounds |
+
+### Results — RL demo BC only (partial)
+
+| logstd | std | SR | frac_zero | frac_one | frac_decisive |
+|--------|-----|-----|-----------|----------|--------------|
+| det | 0 | 81.5% | 18.5% | 81.5% | 0.0% |
+| -3.0 | 0.050 | 83.8% | **1.5%** | 60.5% | **38.0%** |
+| -2.0 | 0.135 | 75.4% | **0.0%** | 18.0% | **82.0%** |
+| -1.5 | 0.223 | ~52% | — | — | — |
+
+### Notes
+1. **Tiny noise rescues dead states**: logstd=-3 (std=0.05) reduces frac_zero from 18.5% → 1.5%. logstd=-2 (std=0.135) eliminates frac_zero entirely (0.0%).
+2. **frac_decisive explodes with noise**: From 0% (deterministic) → 38% (logstd=-3) → **82%** (logstd=-2). Most initial states become "learnable" — outcomes depend on action noise, so MC re-rollout can produce non-zero advantages.
+3. **SR trade-off**: More noise → lower overall SR (81.5% → 83.8% → 75.4% → ~52%). Small noise (logstd=-3) actually INCREASES SR slightly because it helps some edge-case states succeed. But logstd=-2 and beyond degrade performance.
+4. **Optimal finetuning logstd**: logstd=-2 appears ideal for finetuning start — frac_zero=0%, frac_decisive=82%, and SR still reasonable at 75%. logstd=-1.5 (which we use for PPO finetuning) drops SR significantly to ~52%.
+5. **Key insight for offline-to-online**: BC alone produces a deterministic policy with no learning signal for finetuning (frac_decisive=0%). Simply adding logstd=-2 noise makes 82% of states learnable. This confirms that the "exploration must be manually added" principle (from earlier experiments) is quantitatively critical — without it, advantage estimation is degenerate.
+6. **MP demo BC not tested** — killed before reaching second policy. Expected to show similar pattern but with higher baseline frac_zero.
+
+---
+
+## [BC Learned Fourier Features (LFF) vs MLP2] - 2026-02-24 16:06
+
+**Command**: `python bc_official.py --env-id PickCube-v1 --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 --control-mode pd_ee_delta_pos --sim-backend cpu --total-iters 100000 --batch-size 1024 --seed {1-5} --network-type {mlp2,fourier} --b-scale {scale} --no-capture-video`
+**Git**: ac5aa39 (main)
+**Run Dirs**: `runs/lff_fix_mlp2_s{1-5}/`, `runs/lff_fix_f1_s{1-5}/`, `runs/lff_fix_f{001,01,10}_s1/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PickCube-v1 |
+| demo | MP demos (1000 trajs, avg 78 steps, pd_ee_delta_pos) |
+| total_iters | 100000 |
+| batch_size | 1024 |
+| lr | 3e-4 |
+| network | 2×256 hidden, ReLU |
+| eval | max_episode_steps=100, 100 episodes, physx_cpu |
+| LFF implementation | Official (geyang/ffn): weight~N(0, scale/d), bias~U(-1,1), sin(π·(Wx+b)) |
+
+### Results — Scale Sweep (seed=1)
+| Config | Final Loss | SR (avg 3 trials) |
+|--------|-----------|-------------------|
+| MLP2 | 3.0e-5 | **47.7%** |
+| FFN scale=0.001 | 1.6e-4 | 3.3% |
+| FFN scale=0.01 | 1.5e-4 | 7.3% |
+| **FFN scale=0.1** | **1.1e-4** | **20.0%** |
+| FFN scale=1.0 | 1.3e-4 | 7.0% |
+
+### Results — Multi-Seed (5 seeds)
+| Method | s1 | s2 | s3 | s4 | s5 | Avg ± Std |
+|--------|-----|-----|-----|-----|-----|-----------|
+| MLP2 | 50% | 31% | 41% | 34% | 58% | **42.8% ± 10.0%** |
+| FFN scale=0.1 | 19% | 1% | 8% | 5% | 3% | **7.2% ± 6.3%** |
+
+### Notes
+1. **FFN significantly worse than MLP2** (7% vs 43%). The spectral bias paper targeted Q-value approximation (where high-frequency features in value landscape matter), not BC regression. BC on PickCube doesn't have the same spectral challenge.
+2. **LFF implementation had two bugs** (now fixed):
+   - Weight init: had extra π factor (`π*scale/d` instead of `scale/d`) — 3.14x too large
+   - Bias init: `U(-π, π)` instead of `U(-1, 1)` — effective phase range `(-π², π²)` instead of `(-π, π)` after the sin(π·) multiplication
+3. **Critical eval bug discovered**: PickCube-v1 default `max_episode_steps=50`, but MP demos average 78 steps (range 49-103). BC policies need >50 steps → **all evals showed 0% SR with default setting**. Must use `max_episode_steps=100` for BC on MP demos.
+4. **FFN loss is 3-5x higher than MLP2** at convergence (1.1e-4 vs 3.0e-5), suggesting the sin activation makes it harder to fit the action space precisely.
+5. **Scale=0.1 is optimal** among tested values (0.001-1.0). Official paper uses 0.001-0.003 for SAC, but those are for different state/action dimensions.
+6. **High seed variance** for both methods — BC on MP demos is inherently noisy due to multimodal demonstration distribution.
+
+---
+
+## [BC: Gaussian NLL + Control Mode Comparison] - 2026-02-24 17:05
+
+**Git**: ac5aa39 (main)
+
+### Experiment 1: Gaussian NLL vs MSE (pd_ee_delta_pos)
+
+**Command**: `python bc_gaussian.py --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 --loss-type nll --seed {1-5} --eval-freq 25000`
+**Run Dirs**: `runs/bc_gauss_nll_s{1-5}/`
+
+| Seed | det SR | sto SR | Final logstd (xyz, gripper) |
+|------|--------|--------|---------------------------|
+| 1 | 50% | 5% | [-5, -5, -5, 0.0] |
+| 2 | 33% | 0% | [-5, -5, -5, 0.0] |
+| 3 | 66% | 0% | [-5, -5, -5, 0.0] |
+| 4 | 54% | 5% | [-5, -5, -5, 0.0] |
+| 5 | 42% | 25% | [-5, -5, -5, -4.3] |
+| **avg** | **49.0%** | **7.0%** | |
+
+Comparison: MLP2+MSE (pd_ee_delta_pos) avg = **42.8%** det SR.
+
+**Notes**:
+1. NLL det SR (49%) slightly better than MSE (43%), but stochastic eval is terrible (7%) because gripper logstd=0 (std=1.0) adds too much noise.
+2. **Per-dim logstd reveals uncertainty structure**: xyz → -5 (clamp floor, essentially deterministic), gripper → 0 (high uncertainty). The gripper action is bimodal (open=1, close=-1) — mean network can't fit the transition, so NLL keeps gripper logstd high to absorb the large residual.
+3. For finetuning, this learned logstd is not ideal — gripper noise too large, xyz noise too small. Still need manual logstd setting.
+
+### Experiment 2: pd_joint_delta_pos vs pd_ee_delta_pos (MLP2+MSE)
+
+**Command**: `python bc_official.py --demo-path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 --control-mode pd_joint_delta_pos --network-type mlp2 --seed {1-5} ...`
+**Run Dirs**: `runs/bc_joint_mlp2_s{1-5}/`
+
+#### Full 2×2 Comparison: Demo Source × Control Mode (MLP2+MSE, 100k iters)
+
+| Demo | Control Mode | action_dim | Trajs | Backend | s1 | s2 | s3 | s4 | s5 | Avg ± Std |
+|------|-------------|-----------|-------|---------|-----|-----|-----|-----|-----|-----------|
+| RL | pd_ee_delta_pos | 4 | 1000 | cuda→cuda | 98% | 100% | 97% | 99% | 100% | **98.8% ± 1.2%** |
+| RL | pd_joint_delta_pos | 8 | 594 | cpu→cpu | 89% | 91% | 86% | 95% | 90% | **90.2% ± 2.9%** |
+| MP | pd_ee_delta_pos | 4 | 1000 | cpu→cpu | 50% | 31% | 41% | 34% | 58% | **42.8% ± 10.0%** |
+| MP | pd_joint_delta_pos | 8 | 1000 | cpu→cpu | 8% | 2% | 4% | 5% | 2% | **4.2% ± 2.2%** |
+
+**Run Dirs**: `runs/bc_rl_ee_cuda_mlp2_s{1-5}/`, `runs/bc_rl_joint_mlp2_s{1-5}/`, `runs/lff_fix_mlp2_s{1-5}/`, `runs/bc_joint_mlp2_s{1-5}/`
+
+**Notes**:
+1. **RL demo + ee space = near-perfect** (98.8%). RL demos are deterministic NN-generated (unimodal, smooth actions) + ee space is low-dimensional (4D) and directly interpretable.
+2. **Demo quality >> control mode**: RL demos in joint space (90%) still far better than MP demos in ee space (43%). The dominant factor is demo unimodality, not action dimensionality.
+3. **Joint space amplifies errors**: For the same demo source, joint space is consistently worse (RL: 90 vs 99%, MP: 4 vs 43%). Small joint errors propagate through the kinematic chain.
+4. **MP demos are multimodal**: Different motion plans for similar initial states → MLP averages across modes → worse cloning. High seed variance (10% std) confirms this.
+5. **Backend matters for RL ee demo**: cuda→cpu replay only saved 15% of demos (152/1022) due to physx mismatch. Must match train/eval backend. cuda→cuda replay saved 98% (1000/1022).
+6. **Joint cuda replay is fundamentally broken**: Re-generating `none→state` on cuda saves **0/997** demos (vs ee: 1000/1000). The pre-existing cuda state file (Dec 30, 997 trajs) was generated with unknown settings and produces bad training data (~12% SR on both cuda and cpu eval). Root cause: pd_joint_delta_pos is NOT replay-stable on cuda — small physics differences between num_envs=1024 (original data collection) and num_envs=1 (replay) cause trajectory divergence. pd_ee_delta_pos works because IK solver absorbs physics differences; joint deltas accumulate errors directly. **RL joint demos can only be used via cpu→cpu (594 trajs, 90.2%).**
+
+---
+
+## [BC + Noise P(success|s₀) Analysis] - 2026-02-24
+
+**Question**: MLP BC policy (57% SR on cpu) 加noise后能否获得适合finetuning的P(success)分布？
+
+**Setup**: `python bc_p_success_cpu.py --ckpt runs/lff_fix_mlp2_s1/checkpoints/final.pt --mc-samples 16 --num-states 100 --noise-levels 0.0 0.01 0.03`
+- Checkpoint: MP demo BC, MLP2+MSE, pd_ee_delta_pos, physx_cpu eval
+- MC16 per initial state, 100 initial states
+
+| noise_std | SR | frac_zero | frac_one | frac_decisive | 可否finetuning |
+|-----------|------|-----------|----------|---------------|--------------|
+| 0.000 | 50.0% | 50.0% | 50.0% | **0.0%** | 不可 — 完全bimodal |
+| 0.010 | 18.6% | 13.0% | 2.0% | **67.0%** | 勉强 — SR太低 |
+| 0.030 | 4.3% | 69.0% | 2.0% | **6.0%** | 不可 — SR≈0 |
+
+对比PPO ckpt_76: SR=43.8%, frac_zero=1.2%, frac_decisive=96.2%
+
+**结论**: MLP BC + 后设noise在state coverage和SR之间天然无法平衡。
+- noise=0: 确定性policy → 完全bimodal (frac_decisive=0%)
+- noise=0.01: 打破bimodal (frac_decisive=67%) 但SR暴跌到18%，且仍有13% dead zone
+- noise=0.03+: SR趋近0%，noise太大导致precision丧失
+
+**根本原因**: MLP BC学到的是确定性映射（MSE训练），没有内在的exploration结构。后设noise均匀扰动所有action维度，破坏了对precision敏感的维度（如grasp timing），同时对不敏感维度的扰动不够。而PPO的logstd是在RL训练过程中per-dimension自适应学出来的，能自然平衡exploration和precision。
+
+**对finetuning的implication**: MLP BC不适合作为sparse reward finetuning的base policy。需要：
+1. 用Diffusion Policy等本身有stochasticity的IL方法，或
+2. 用RL训练的base policy（天然有learned logstd），或
+3. 用dense reward做finetuning（不依赖MC re-rollout的正reward信号）
+
+---
+
+## [Diffusion Policy Data Scaling on PickCube] - 2026-02-25 05:30
+
+**Git**: ac5aa39 (main)
+
+### Overview
+Test Diffusion Policy data efficiency on PickCube-v1 with varying number of MP demonstrations. All use pd_ee_delta_pos, physx_cpu backend, 100 eval episodes.
+
+### Setup
+- Model: ConditionalUnet1D, 4.39M params, obs_horizon=2, act_horizon=8, pred_horizon=16
+- Training: 50k iters, eval every 5k iters
+- Demo source: `~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5`
+- max_episode_steps=100
+
+### Commands
+```bash
+# 1000 trajs (batch_size=1024)
+python dp_train.py --env-id PickCube-v1 --demo-path ... --num-demos 1000 --total-iters 50000 --eval-freq 5000
+
+# 100 trajs (batch_size=1024)
+python dp_train.py --env-id PickCube-v1 --demo-path ... --num-demos 100 --total-iters 50000 --eval-freq 5000
+
+# 50 trajs (batch_size=1024)
+python dp_train.py --env-id PickCube-v1 --demo-path ... --num-demos 50 --total-iters 50000 --eval-freq 5000
+
+# 10 trajs (batch_size=256, because 726 transitions < 1024)
+python dp_train.py --env-id PickCube-v1 --demo-path ... --num-demos 10 --batch-size 256 --total-iters 50000 --eval-freq 5000
+```
+
+### Results — success_once (%) by iteration
+
+| Trajs | 5k | 10k | 15k | 20k | 25k | 30k | 35k | 40k | 45k | 50k |
+|-------|-----|------|------|------|------|------|------|------|------|------|
+| 1000 | 99 | 100 | 100 | — | — | — | — | — | — | — |
+| 100 | 100 | — | — | — | — | — | — | — | — | — |
+| 50 | 98 | 97 | 95 | — | — | — | — | — | — | — |
+| 10 | 3 | 0 | 3 | 2 | 5 | 1 | 4 | 3 | 1 | 1 |
+
+Note: 1000/100/50-traj runs were killed early once performance was established.
+
+### Summary — Peak success_once
+
+| Trajs | Transitions | Peak SR | Best iter | Notes |
+|-------|------------|---------|-----------|-------|
+| 1000 | ~77k | **100%** | 10k | Perfect from 10k onwards |
+| 100 | ~7.7k | **100%** | 5k | Perfect immediately at 5k |
+| 50 | ~3.8k | **98%** | 5k | Near-perfect, slight decline later |
+| 10 | ~726 | **5%** | 25k | Essentially fails |
+
+### Key Findings
+
+1. **DP is extremely data-efficient up to a cliff**: 50 trajs achieves 98%, but 10 trajs only 5%. Sharp transition between 10-50 demos.
+2. **100 trajs is sufficient for perfect performance**: 100% at just 5k iters (vs MLP BC needing 100k for 57%).
+3. **10-traj failure**: Loss keeps dropping (0.005→0.0001) but SR stays ~0-5%. Model overfits to 10 demos without learning generalizable behavior. Also note batch_size had to be reduced from 1024→256 since only 726 transitions available (original batch_size > dataset size causes infinite hang with drop_last=True).
+4. **Comparison to MLP BC**: DP with 50 trajs (98%) >> MLP BC with 1000 trajs (57%). DP's action chunking is the key advantage.
+
+### Bug Found
+- `dp_train.py` with `batch_size=1024` and `drop_last=True` on a dataset smaller than 1024 transitions causes the `IterationBasedBatchSampler` to hang forever (zero batches per epoch). Fixed by using `--batch-size 256` for 10-traj experiment. This should be auto-detected.
+
+---
+
+## [Diffusion Policy on StackCube and PegInsertion] - 2026-02-25 05:30
+
+### StackCube (pd_ee_delta_pos, physx_cpu, 990 MP demos)
+
+```bash
+python dp_train.py --env-id StackCube-v1 --demo-path ~/.maniskill/demos/StackCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 \
+  --control-mode pd_ee_delta_pos --sim-backend physx_cpu --max-episode-steps 200 --total-iters 100000 --eval-freq 5000
+```
+
+| Iter | success_once |
+|------|-------------|
+| 5k | 77% |
+| 10k | 94% |
+| 15k | 96% |
+| 20k-100k | 96-100% |
+
+**Peak: 100%**. DP completely solves StackCube where MLP BC gets 0%.
+
+### PegInsertionSide (pd_joint_delta_pos, physx_cpu, 1000 MP demos)
+
+Note: ee replay of PegInsertion demos has only 0.7% survival rate (7/1000). Joint replay is 100% (1000/1000).
+
+```bash
+python dp_train.py --env-id PegInsertionSide-v1 --demo-path ~/.maniskill/demos/PegInsertionSide-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --control-mode pd_joint_delta_pos --sim-backend physx_cpu --max-episode-steps 200 --total-iters 50000 --eval-freq 5000
+```
+
+| Iter | success_once |
+|------|-------------|
+| 5k | 6% |
+| 10k | 16% |
+| 15k | 13% |
+| 20k | 21% |
+
+Training was killed at 20k. Performance is low but still climbing. Would likely need 100k+ iters for convergence (consistent with ManiSkill docs).
+
+---
+

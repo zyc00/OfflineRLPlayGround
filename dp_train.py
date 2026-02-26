@@ -93,9 +93,21 @@ class Args:
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
 
+    # Group DRO arguments
+    dro: bool = False
+    """enable Group DRO training (Sagawa et al. 2020)"""
+    dro_n_groups: int = 10
+    """number of initial-state clusters for Group DRO"""
+    dro_step_size: float = 0.01
+    """exponentiated gradient step size eta for group weight update"""
+    dro_min_weight: Optional[float] = None
+    """minimum group weight floor (default: 1/(2*dro_n_groups))"""
+    dro_log_freq: int = 1000
+    """frequency to log per-group DRO statistics"""
+
 
 class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memory
-    def __init__(self, data_path, device, num_traj):
+    def __init__(self, data_path, device, num_traj, dro_n_groups=0):
         if data_path[-4:] == '.pkl':
             raise NotImplementedError()
         else:
@@ -139,7 +151,38 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
 
         print(f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}")
 
+        # Group DRO: cluster initial states into groups
+        self.traj_group_ids = None
+        if dro_n_groups > 0:
+            self.traj_group_ids = self._cluster_initial_states(
+                trajectories, num_traj, dro_n_groups)
+
         self.trajectories = trajectories
+
+    def _cluster_initial_states(self, trajectories, num_traj, n_groups):
+        """Cluster trajectory initial states via K-means, return per-traj group ids."""
+        from sklearn.cluster import KMeans
+        # Extract initial observation (s_0) from each trajectory
+        init_obs = []
+        for i in range(num_traj):
+            init_obs.append(trajectories['observations'][i][0].cpu().numpy())
+        init_obs = np.stack(init_obs)  # (num_traj, obs_dim)
+
+        # Standardize before clustering
+        mean = init_obs.mean(axis=0)
+        std = init_obs.std(axis=0) + 1e-8
+        init_obs_norm = (init_obs - mean) / std
+
+        n_groups = min(n_groups, num_traj)
+        kmeans = KMeans(n_clusters=n_groups, random_state=0, n_init=10)
+        labels = kmeans.fit_predict(init_obs_norm)
+
+        # Print group statistics
+        for g in range(n_groups):
+            count = (labels == g).sum()
+            print(f"  Group {g}: {count} trajectories ({count/num_traj*100:.1f}%)")
+
+        return torch.tensor(labels, dtype=torch.long)
 
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
@@ -157,10 +200,13 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
             act_seq = torch.cat([act_seq, pad_action.repeat(end-L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         assert obs_seq.shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon
-        return {
+        result = {
             'observations': obs_seq,
             'actions': act_seq,
         }
+        if self.traj_group_ids is not None:
+            result['group_id'] = self.traj_group_ids[traj_idx]
+        return result
 
     def __len__(self):
         return len(self.slices)
@@ -193,7 +239,7 @@ class Agent(nn.Module):
             prediction_type='epsilon' # predict noise (instead of denoised action)
         )
 
-    def compute_loss(self, obs_seq, action_seq):
+    def compute_loss(self, obs_seq, action_seq, reduction='mean'):
         B = obs_seq.shape[0]
 
         # observation as FiLM conditioning
@@ -217,6 +263,9 @@ class Agent(nn.Module):
         noise_pred = self.noise_pred_net(
             noisy_action_seq, timesteps, global_cond=obs_cond)
 
+        if reduction == 'none':
+            # Per-sample loss: mean over (pred_horizon, act_dim) dimensions
+            return F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2))  # (B,)
         return F.mse_loss(noise_pred, noise)
 
     def get_action(self, obs_seq):
@@ -261,6 +310,58 @@ def save_ckpt(run_name, tag):
         'agent': agent.state_dict(),
         'ema_agent': ema_agent.state_dict(),
     }, f'runs/{run_name}/checkpoints/{tag}.pt')
+
+
+class GroupDRO:
+    """Group Distributionally Robust Optimization (Sagawa et al. 2020).
+
+    Maintains per-group weights updated via exponentiated gradient ascent.
+    Upweights groups with higher loss to optimize worst-case group performance.
+    """
+    def __init__(self, n_groups, step_size=0.01, min_weight=None, device='cpu'):
+        self.n_groups = n_groups
+        self.step_size = step_size
+        self.min_weight = min_weight if min_weight is not None else 1.0 / (2 * n_groups)
+        self.group_weights = torch.ones(n_groups, device=device) / n_groups
+        self.device = device
+
+    def compute_loss(self, per_sample_loss, group_ids):
+        """Compute Group DRO weighted loss.
+
+        Args:
+            per_sample_loss: (B,) per-sample losses
+            group_ids: (B,) group assignment for each sample
+
+        Returns:
+            weighted_loss: scalar loss for backprop
+            group_losses: (n_groups,) per-group average loss (for logging)
+            group_counts: (n_groups,) samples per group in this batch
+        """
+        group_losses = torch.zeros(self.n_groups, device=self.device)
+        group_counts = torch.zeros(self.n_groups, device=self.device)
+
+        for g in range(self.n_groups):
+            mask = (group_ids == g)
+            count = mask.sum()
+            group_counts[g] = count
+            if count > 0:
+                group_losses[g] = per_sample_loss[mask].mean()
+
+        # Update group weights via exponentiated gradient ascent
+        with torch.no_grad():
+            # Only update weights for groups present in this batch
+            present = group_counts > 0
+            self.group_weights[present] *= torch.exp(self.step_size * group_losses[present])
+            # Apply minimum weight floor
+            self.group_weights.clamp_(min=self.min_weight)
+            # Renormalize
+            self.group_weights /= self.group_weights.sum()
+
+        # Compute weighted loss (only over groups present in batch)
+        weighted_loss = (self.group_weights[present] * group_losses[present]).sum()
+
+        return weighted_loss, group_losses, group_counts
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -321,9 +422,14 @@ if __name__ == "__main__":
     )
 
     # dataloader setup
-    dataset = SmallDemoDataset_DiffusionPolicy(args.demo_path, device, num_traj=args.num_demos)
+    dataset = SmallDemoDataset_DiffusionPolicy(
+        args.demo_path, device, num_traj=args.num_demos,
+        dro_n_groups=args.dro_n_groups if args.dro else 0)
+    effective_batch_size = min(args.batch_size, len(dataset))
+    if effective_batch_size < args.batch_size:
+        print(f"Warning: dataset size ({len(dataset)}) < batch_size ({args.batch_size}), using batch_size={effective_batch_size}", flush=True)
     sampler = RandomSampler(dataset, replacement=False)
-    batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
+    batch_sampler = BatchSampler(sampler, batch_size=effective_batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     train_dataloader = DataLoader(
         dataset,
@@ -353,12 +459,23 @@ if __name__ == "__main__":
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
     ema_agent = Agent(envs, args).to(device)
 
+    # Group DRO setup
+    group_dro = None
+    if args.dro:
+        group_dro = GroupDRO(
+            n_groups=args.dro_n_groups,
+            step_size=args.dro_step_size,
+            min_weight=args.dro_min_weight,
+            device=device,
+        )
+        print(f"\nGroup DRO enabled: {args.dro_n_groups} groups, eta={args.dro_step_size}")
+
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
-        if iteration % args.eval_freq == 0:
+        if iteration > 0 and iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
@@ -366,11 +483,11 @@ if __name__ == "__main__":
             )
             timings["eval"] += time.time() - last_tick
 
-            print(f"Evaluated {len(eval_metrics['success_at_end'])} episodes")
+            print(f"Evaluated {len(eval_metrics['success_at_end'])} episodes", flush=True)
             for k in eval_metrics.keys():
                 eval_metrics[k] = np.mean(eval_metrics[k])
                 writer.add_scalar(f"eval/{k}", eval_metrics[k], iteration)
-                print(f"{k}: {eval_metrics[k]:.4f}")
+                print(f"{k}: {eval_metrics[k]:.4f}", flush=True)
 
             save_on_best_metrics = ["success_once", "success_at_end"]
             for k in save_on_best_metrics:
@@ -381,18 +498,44 @@ if __name__ == "__main__":
                         f"New best {k}_rate: {eval_metrics[k]:.4f}. Saving checkpoint."
                     )
     def log_metrics(iteration):
-        if iteration % args.log_freq == 0:
+        if iteration > 0 and iteration % args.log_freq == 0:
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
             )
             writer.add_scalar("losses/total_loss", total_loss.item(), iteration)
             for k, v in timings.items():
                 writer.add_scalar(f"time/{k}", v, iteration)
+            print(f"iter={iteration:>6d}  loss={total_loss.item():.6f}", flush=True)
+
+        # Group DRO logging
+        if group_dro is not None and iteration > 0 and iteration % args.dro_log_freq == 0:
+            gl = group_losses.detach()
+            gw = group_dro.group_weights.detach()
+            present = group_counts > 0
+            if present.any():
+                max_loss = gl[present].max().item()
+                min_loss = gl[present].min().item()
+                max_weight = gw.max().item()
+                min_weight = gw.min().item()
+                max_group = gl.argmax().item()
+                writer.add_scalar("dro/max_group_loss", max_loss, iteration)
+                writer.add_scalar("dro/min_group_loss", min_loss, iteration)
+                writer.add_scalar("dro/loss_ratio", max_loss / (min_loss + 1e-8), iteration)
+                writer.add_scalar("dro/max_weight", max_weight, iteration)
+                writer.add_scalar("dro/min_weight", min_weight, iteration)
+                writer.add_scalar("dro/weight_ratio", max_weight / (min_weight + 1e-8), iteration)
+                for g in range(group_dro.n_groups):
+                    writer.add_scalar(f"dro_groups/loss_g{g}", gl[g].item(), iteration)
+                    writer.add_scalar(f"dro_groups/weight_g{g}", gw[g].item(), iteration)
+                print(f"  DRO: max_loss={max_loss:.6f} (g{max_group}), "
+                      f"loss_ratio={max_loss/(min_loss+1e-8):.2f}, "
+                      f"weight_range=[{min_weight:.4f}, {max_weight:.4f}]", flush=True)
 
     # ---------------------------------------------------------------------------- #
     # Training begins.
     # ---------------------------------------------------------------------------- #
     agent.train()
+    group_losses = group_counts = None  # initialized in DRO branch
     pbar = tqdm(total=args.total_iters)
     last_tick = time.time()
     for iteration, data_batch in enumerate(train_dataloader):
@@ -400,10 +543,19 @@ if __name__ == "__main__":
 
         # forward and compute loss
         last_tick = time.time()
-        total_loss = agent.compute_loss(
-            obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
-            action_seq=data_batch["actions"],  # (B, L, act_dim)
-        )
+        if group_dro is not None:
+            per_sample_loss = agent.compute_loss(
+                obs_seq=data_batch["observations"],
+                action_seq=data_batch["actions"],
+                reduction='none',
+            )
+            total_loss, group_losses, group_counts = group_dro.compute_loss(
+                per_sample_loss, data_batch["group_id"].to(device))
+        else:
+            total_loss = agent.compute_loss(
+                obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
+                action_seq=data_batch["actions"],  # (B, L, act_dim)
+            )
         timings["forward"] += time.time() - last_tick
 
         # backward
