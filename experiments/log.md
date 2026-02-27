@@ -4582,3 +4582,528 @@ Training was killed at 20k. Performance is low but still climbing. Would likely 
 
 ---
 
+
+## [DPPO DDPM/DDIM Alignment + EtaFixed + Coverage] - 2026-02-25 23:13
+
+**Git**: 69cc8c5 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_25traj_aligned_v2/best.pt` (25 MP demos, PickCube-v1, ee_delta_pos)
+**Files Modified**: `DPPO/model/diffusion.py`, `dp_p_success_cpu.py`, `DPPO/eval_cpu.py`, `DPPO/eval_cpu_test.py`, `DPPO/diagnose.py`
+
+### Context
+
+Debugged and fully aligned DDPM/DDIM sampling with original DPPO (`irom-princeton/dppo`). Multi-stage fix:
+
+**Bugs fixed:**
+1. **DDIM `t_prev==0` bypass**: `x = x_0_pred` directly at last step → noise injection had zero effect. Network denoised away all noise.
+2. **DDPM non-deterministic `t==0`**: Set `std=0` at last step even when stochastic. Original clips to `min_sampling_denoising_std`.
+3. **DDIM timesteps**: Used `linspace` instead of original's `arange(0, ddim_steps) * step_ratio`.
+4. **DDIM noise recomputation**: Missing `noise_pred` recompute after `x_recon` clipping.
+5. **eta=0 (implicit)**: DDIM mean formula used `dir_xt_coef = sqrt(1-α_prev)` (no sigma correction). Original uses `eta=1` via `EtaFixed(base_eta=1)`, giving `dir_xt_coef = sqrt(1-α_prev-σ²)`. With eta=0, noise_pred direction is 1.4-7.4x too strong per step, destroying the policy.
+
+**Final implementation**: Added `EtaFixed` nn.Module (matching original exactly: learnable `eta_logit` → tanh → `[min_eta, max_eta]`). Stored as `self.eta` on `DiffusionModel`. DDIM uses `self.eta(cond)` for stochastic, `zeros` for deterministic.
+
+### Action Std (real obs, N=50 samples, DDIM10 eta=1)
+
+**Command**: inline Python script, single initial state
+
+| Setting | mean_std | max_std |
+|---------|----------|---------|
+| DDIM10 eta=1 det | 0.0040 | 0.0193 |
+| DDIM10 eta=1 std=0.01 | 0.0094 | 0.0147 |
+| DDIM10 eta=1 std=0.03 | 0.0272 | 0.0437 |
+| DDIM10 eta=1 std=0.1 | 0.1006 | 0.1503 |
+| DDPM100 det | 0.0032 | 0.0119 |
+| DDPM100 std=0.03 | 0.0274 | 0.0405 |
+
+### Coverage Results (50 states, MC16, seeds 0-49, fully aligned code with EtaFixed)
+
+**Command**: `python dp_p_success_cpu.py --ckpt runs/dppo_pretrain/dppo_25traj_aligned_v2/best.pt --num-states 50 --mc-samples 16 --min-sampling-denoising-std X --ddim-steps 10 --ddim-eta 1.0`
+
+| Setting | SR | frac_zero | frac_one | frac_decisive | std P |
+|---------|------|-----------|----------|---------------|-------|
+| Det DDPM100 (baseline) | 71.4% | 26.0% | 64.0% | 10.0% | 0.432 |
+| DDPM100 std=0.03 | 70.8% | 22.0% | 60.0% | 12.0% | 0.430 |
+| DDIM10 eta=1 std=0.01 | **68.5%** | **16.0%** | **38.0%** | **32.0%** | 0.392 |
+| DDIM10 eta=1 std=0.1 | 3.0% | 82.0% | 0.0% | 2.0% | 0.132 |
+
+### Key Findings
+
+1. **std=0.01 is the sweet spot**: SR drops only slightly (71.4%→68.5%) but frac_decisive triples (10%→32%), frac_one halved (64%→38%). This is the best coverage for finetuning — many more learnable states.
+2. **std=0.1 still destroys the policy (3% SR)**: Even with correct eta=1 implementation. This is NOT a code bug — 25-traj pretrained model (det SR~71%) is too weak to tolerate std=0.1. Original DPPO's 0.8→0.4 is on a much stronger base (1000 demos, SR>95%).
+3. **EtaFixed as module vs float makes no numerical difference** (same results), but matches the original architecture for future DPPO finetuning where eta could be learned.
+4. **DP coverage is still far more bimodal than PPO**: frac_decisive=32% (best case, std=0.01) vs PPO ckpt_76=96.2%. Diffusion sampling noise is fundamentally different from Gaussian action noise.
+
+### Notes
+- Coverage with 50 states (seeds 0-49) biased towards easier seeds — 200-state run showed SR=45.3% vs 71.4% here
+- PPO ckpt_76 action std ≈ 0.223 (logstd=-1.5), much higher than DP's best std=0.01→0.009
+- `strict=False` added to all `load_state_dict` calls for backward compat with old checkpoints missing `eta.eta_logit`
+
+---
+
+## [DP Init State Similarity to Training Demos vs P(success)] - 2026-02-26 00:35
+
+**Command**: `python analyze_init_similarity.py` (default args)
+**Git**: 69cc8c5 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_25traj_aligned_v2/best.pt`
+**Output**: `runs/dp_init_similarity_vs_success_25traj.png`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| ckpt | runs/dppo_pretrain/dppo_25traj_aligned_v2/best.pt |
+| demo_path | ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 |
+| num_train_demos | 25 (first 25 trajs = traj_0..traj_24) |
+| num_states | 50 |
+| mc_samples | 16 |
+| max_episode_steps | 100 |
+| env_id | PickCube-v1 |
+| control_mode | pd_ee_delta_pos |
+| inference device | cuda (env on cpu) |
+| init state dims | 5D: cube_xy (dims 29,30) + goal_xyz (dims 26,27,28) |
+
+### Context
+
+PickCube-v1 初始状态随机性是5D：cube_xy (2D, uniform [-0.1, 0.1]) + goal_xyz (3D, z=[0.02, 0.32])。Cube z固定0.02。
+
+25条training demos从uniform分布采样，但太稀疏——只覆盖46%的cube_xy空间(阈值0.02内)，1000条demo则100%覆盖。
+
+**假设**：25-traj pretrained DP overfit在training demos附近，离demo越远越失败。
+
+### Results — Per-dimension correlation with P(success)
+
+单个维度都不显著：
+
+| Dim | ρ (Det) | p-val | ρ (DDIM10) | p-val |
+|-----|---------|-------|------------|-------|
+| cube_x | 0.059 | 0.686 | 0.110 | 0.446 |
+| cube_y | -0.202 | 0.160 | -0.175 | 0.225 |
+| goal_x | -0.166 | 0.248 | -0.221 | 0.124 |
+| goal_y | 0.103 | 0.478 | 0.138 | 0.339 |
+| goal_z | 0.281 | 0.048 | 0.221 | 0.123 |
+
+### Results — Distance-to-nearest-training-demo vs P(success)
+
+| Setting | Dist type | Spearman ρ | p-val | Pearson r | p-val |
+|---------|-----------|------------|-------|-----------|-------|
+| Det DDPM100 | **5D (all)** | **-0.787** | <0.0001 | **-0.715** | <0.0001 |
+| Det DDPM100 | cube_xy | -0.758 | <0.0001 | -0.681 | <0.0001 |
+| Det DDPM100 | goal_xyz | -0.709 | <0.0001 | -0.554 | <0.0001 |
+| DDIM10 std=0.01 | **5D (all)** | **-0.807** | <0.0001 | **-0.796** | <0.0001 |
+| DDIM10 std=0.01 | cube_xy | -0.795 | <0.0001 | -0.685 | <0.0001 |
+| DDIM10 std=0.01 | goal_xyz | -0.739 | <0.0001 | -0.624 | <0.0001 |
+
+### Coverage (reproduced, consistent with previous)
+
+| Setting | SR | frac_zero | frac_one | frac_decisive |
+|---------|------|-----------|----------|---------------|
+| Det DDPM100 | 71.5% | 26.0% | — | — |
+| DDIM10 eta=1 std=0.01 | 66.8% | 20.0% | — | — |
+
+### Key Findings
+
+1. **假设验证：25-traj DP确实overfit在training demos附近**。dist_to_nearest_train_demo和P(success)的Spearman ρ=-0.79~-0.81 (p<0.0001)，极强负相关。
+2. **没有单一dominant维度**：cube_xy和goal_xyz都贡献distance，单个维度ρ<0.3（不显著），但5D距离ρ=-0.81。说明policy需要在整个5D init space的组合上泛化，不只是某一个因素。
+3. **cube_xy distance稍强于goal_xyz** (ρ=-0.76~-0.80 vs -0.71~-0.74)，可能因为cube位置更直接影响reach/grasp trajectory。
+4. **25 demos太稀疏**：只覆盖46%的cube_xy空间(阈值0.02内)，1000 demos则100%覆盖。这解释了25-traj pretrain的det SR~71% vs 1000-traj的~100%。
+
+### Notes
+- 新增脚本: `analyze_init_similarity.py` (可复用，支持 --num-train-demos, --num-states 等参数)
+- 新增脚本: `dp_eval_video.py` (保存success/failure视频，支持多种采样模式)
+- Videos saved: `runs/videos/dppo_25traj_det/` (35 success, 15 failure, seeds 0-49)
+- GPU inference + CPU env simulation: DDPM100 272s, DDIM10 190s (vs pure CPU ~575s/257s)
+- **Implication for DPPO finetuning**: 需要在训练数据覆盖不到的init states上探索并成功。std=0.01提供了一些exploration (frac_decisive 10%→32%)，但fundamental limit是25 demos的覆盖范围。增加demos数量或curriculum是更直接的解法。
+
+---
+
+## [DP Pretrain: 1000-traj UNet SR Curve + Coverage for DPPO Base Policy] - 2026-02-26 01:16
+
+**Command**: `python -m DPPO.pretrain --env_id PickCube-v1 --demo_path ~/.maniskill/demos/PickCube-v1/motionplanning/trajectory.state.pd_ee_delta_pos.physx_cpu.h5 --control_mode pd_ee_delta_pos --network_type unet --denoising_steps 100 --horizon_steps 16 --cond_steps 2 --act_steps 8 --batch_size 1024 --no_obs_norm --no_action_norm --max_grad_norm 0 --seed 1 --torch_deterministic --total_iters 5000 --eval_freq 500 --exp_name dppo_1000traj_unet_5k`
+**Git**: 69cc8c5 (main)
+**Run Dir**: `runs/dppo_pretrain/dppo_1000traj_unet_5k/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| num_demos | 1000 (all MP demos) |
+| network_type | unet |
+| denoising_steps | 100 |
+| horizon_steps | 16 |
+| cond_steps | 2 |
+| act_steps | 8 |
+| batch_size | 1024 |
+| total_iters | 5000 |
+| eval_freq | 500 |
+| obs/action norm | off |
+| max_grad_norm | 0 (no clip) |
+
+### Results — SR Curve (cpu eval, 100 episodes)
+
+| Iter | success_once | success_at_end |
+|------|-------------|----------------|
+| 500 | 2% | 0% |
+| 1000 | 42% | 8% |
+| **1500** | **53%** | **20%** |
+| 2000 | 87% | 46% |
+| 2500 | 82% | 60% |
+| 3000 | 96% | 85% |
+| 3500 | 99% | 94% |
+| 4000 | 99% | 94% |
+| 4500 | 100% | 97% |
+| 5000 | 99% | 98% |
+
+### Results — Coverage: ckpt_1500 (50 states, MC16, deterministic)
+
+**Command**: `python dp_p_success_cpu.py --ckpt runs/dppo_pretrain/dppo_1000traj_unet_5k/ckpt_1500.pt --num-states 50 --mc-samples 16`
+
+| Metric | 25-traj best | **1000-traj ckpt_1500** |
+|--------|-------------|------------------------|
+| SR | 71.4% | **57.5%** |
+| frac_zero | 26.0% | **0.0%** |
+| frac_one | 64.0% | **2.0%** |
+| frac_decisive | 10.0% | **98.0%** |
+| std P | 0.432 | **0.178** |
+
+### Hypothesis to Verify (DPPO RL finetuning)
+
+Coverage (frac_zero) determines the RL finetuning ceiling under sparse reward:
+
+| Base Policy | frac_zero | Predicted RL Ceiling | To Verify |
+|-------------|-----------|---------------------|-----------|
+| 25-traj best (sr_once=44%) | 26% | ~74% | DPPO RL on this ckpt |
+| 1000-traj ckpt_1500 (sr_once=53%) | 0% | ~98%+ | DPPO RL on this ckpt |
+
+If confirmed, this proves that **coverage is the binding constraint for sparse-reward RL finetuning**, not advantage estimation quality or policy optimization method.
+
+### Notes
+- MLP network (default) too small: 572K params, 5k iters → 2% SR. Must use `--network_type unet` (4.39M params)
+- ckpt_1500 profile very similar to PPO ckpt_76 (SR=43.8%, frac_decisive=96.2%) — ideal for finetuning experiments
+- Training time: 784s (13min) for 5000 iters on GPU
+
+---
+
+## [DPPO Finetune: Bug Fixes + Hyperparameter Sweep] - 2026-02-26 14:13
+
+**Git**: 69cc8c5 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt` (GPU DDIM-10 SR=53.6%, CPU SR=80.4%, frac_zero=0%, frac_decisive=65%)
+
+### Bug Fixes Applied
+
+**BUG 1 (CRITICAL): `reward_horizon` slicing ignores `act_offset`**
+- File: `DPPO/model/diffusion_ppo.py` loss()
+- Before: `newlogprobs[:, :reward_horizon, :]` → optimizes positions 0..7 (position 0 = conditioning, never executed)
+- After: `newlogprobs[:, act_offset:act_offset+reward_horizon, :]` → optimizes positions 1..8 (actually executed)
+- Root cause: our dp_train convention uses `cond_steps=2, act_offset=1`, reference DPPO uses `cond_steps=1` (no offset)
+
+**BUG 2 (LATENT): Chain recording off-by-one for ft < ddim**
+- File: `DPPO/model/diffusion_ppo.py` _forward_ddim()
+- Before: `i >= ft_start` → K states (K-1 transitions) when ft < ddim
+- After: `i >= max(ft_start - 1, 0)` → K+1 states (K transitions)
+- Not active with current config (ft=ddim=10), but would break if ft < ddim
+
+**BUG 3 (REVERTED): GAE terminated vs done**
+- Attempted: use `terminated` only (not `terminated|truncated`) for GAE bootstrap
+- **REVERTED**: with auto-reset envs, truncated episodes get V(initial_state_next_ep) ≈ 0.5 as bootstrap, creating false positive advantages for failed episodes. Original `dones = terminated|truncated` is safer.
+
+**BUG 4 (CRITICAL DISCOVERY): logprob clamping + std mismatch kills PPO constraint**
+- File: `DPPO/model/diffusion_ppo.py` loss()
+- Before: `newlogprobs.clamp(min=-5, max=2)` with `min_logprob_std=0.1`, `min_sampling_std=0.01`
+- Problem: 10x mismatch between logprob std (0.1) and sampling std (0.01) makes PPO ratio completely insensitive to behavioral changes. Policy drifts silently (ratio=1.0000, KL=0.000000) while performance collapses.
+- After: removed logprob clamping, set `min_logprob_std = min_sampling_std = 0.01`
+
+**BUG 5: Critic `residual_style=False`**
+- Reference uses `residual_style=True` for critic. Fixed.
+
+### Experiments
+
+#### Run 1: Original bugs (pre-fix baseline, from earlier session)
+**Command**: `python -m DPPO.finetune --pretrain_checkpoint runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt --n_envs 200 --n_steps 200 --use_ddim --ddim_steps 10 --ft_denoising_steps 10 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.1 --no-norm_adv --clip_adv_min 0 --actor_lr 1e-5 --update_epochs 5 --minibatch_size 2000 --n_critic_warmup_itr 5 --n_train_itr 100 --eval_freq 5`
+**Result**: 53.6% → **20.7%** after 5 actor iters. **COLLAPSED**.
+
+#### Run 2: BUG 1+2+3 fixed, min_logprob_std=0.1 (still mismatched)
+**Command**: `python -m DPPO.finetune ... --min_logprob_denoising_std 0.1 --update_epochs 1 --actor_lr 1e-5 --n_envs 100 --n_steps 100`
+**Result**: 54.0% → **4.0%** at iter 10. **COLLAPSED WORSE** (BUG 3 fix was harmful).
+
+#### Run 3: BUG 3 reverted, ddim=5 ft=5
+**Command**: `... --ft_denoising_steps 5 --ddim_steps 5 --min_logprob_denoising_std 0.1`
+**Result**: 36.0% → **1.0%** at iter 15. **COLLAPSED**. Shorter chain doesn't help.
+
+#### Run 4: 1 gradient step per iteration (grad_accumulate=200)
+**Command**: `... --grad_accumulate 200 --min_logprob_denoising_std 0.1`
+**Result**: 54.0% → **1.0%** at iter 10. ratio=1.0000, KL=0.000000 but succ 586→3.
+**KEY INSIGHT**: PPO ratio is BLIND. Policy changes behavior without ratio detecting it.
+
+#### Run 5: Matched logprob_std=0.01, clip=0.1, 200 steps/epoch
+**Command**: `... --min_logprob_denoising_std 0.01 --clip_ploss_coef 0.1 --update_epochs 1 --minibatch_size 500`
+**Result**: ratio now informative (0.98), but still declining: 54% → 34% → 20% → 1.7%. Too many gradient steps + wide clip.
+
+#### Run 6: Matched logprob_std, ref batch_size=10000, lr=1e-4
+**Command**: `... --min_logprob_denoising_std 0.01 --clip_ploss_coef 0.01 --update_epochs 10 --minibatch_size 10000 --actor_lr 1e-4`
+**Result**: KL=3.09 at iter 3. **lr=1e-4 too aggressive** with 100x more sensitive logprobs.
+
+#### Run 7: lr=1e-6, batch=10000, 10 epochs ★ BEST RUN
+**Command**: `python -m DPPO.finetune --pretrain_checkpoint runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt --n_envs 100 --n_steps 100 --ft_denoising_steps 10 --use_ddim --ddim_steps 10 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 --gamma_denoising 0.99 --clip_ploss_coef 0.01 --update_epochs 10 --actor_lr 1e-6 --minibatch_size 10000 --n_critic_warmup_itr 2 --reward_scale_running --n_train_itr 100 --eval_freq 5 --exp_name dppo_ft_ref_lr1e6`
+**Run Dir**: `runs/dppo_finetune/dppo_ft_ref_lr1e6`
+
+| Iter | GPU Eval SR | Rollout Succ |
+|------|-------------|-------------|
+| 1 | 54.0% | 558 |
+| 5 | 55.7% | 656 |
+| 10 | 63.7% | 747 |
+| 15 | 72.0% | 785 |
+| 20 | 72.7% | 849 |
+| 25 | 72.0% | 870 |
+| 30 | 79.7% | 886 |
+| 35 | 77.7% | 924 |
+| 40 | 75.7% | 906 |
+| 45 | 78.7% | 937 |
+| 50 | 75.3% | 941 |
+| 55 | **80.7%** | 982 |
+| 60 | 77.7% | 956 |
+| 65 | **85.0%** | — |
+| 70 | **85.7%** | — |
+
+**Killed at iter 70** (to test critic residual fix). Peak = 85.7%. Still climbing.
+
+#### Run 8: lr=1e-5, batch=10000, 10 epochs
+**Command**: same as Run 7 but `--actor_lr 1e-5`
+**Result**: Initial dip 54% → 31.7% (iter 5), recovering to 40% (iter 15). **Killed early** — lr too aggressive initially.
+
+#### Run 9: lr=1e-6 + critic residual_style=True (IN PROGRESS)
+**Command**: same as Run 7 but with critic `residual_style=True`
+
+| Iter | GPU Eval SR | Rollout Succ |
+|------|-------------|-------------|
+| 1 | 54.0% | 558 |
+| 5 | **60.3%** | 684 |
+
+**Still running.** Early results show +5% over Run 7 at same iter (60.3% vs 55.7%).
+
+### Settings (Run 7 — best completed run)
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | dppo_200traj_unet_T100_5k/ckpt_3000.pt |
+| network_type | unet (4.39M params) |
+| denoising_steps | 100 |
+| ft_denoising_steps | 10 |
+| use_ddim | True |
+| ddim_steps | 10 |
+| horizon_steps | 16 |
+| cond_steps | 2 |
+| act_steps | 8 |
+| act_offset | 1 |
+| n_envs | 100 |
+| n_steps | 100 |
+| batch_size (minibatch) | 10000 |
+| update_epochs | 10 |
+| actor_lr | 1e-6 |
+| critic_lr | 1e-3 |
+| critic_dims | [256, 256, 256] |
+| critic_activation | Mish |
+| critic_residual | False (Run 7) / True (Run 9) |
+| gamma | 0.999 |
+| gae_lambda | 0.95 |
+| gamma_denoising | 0.99 |
+| clip_ploss_coef | 0.01 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| reward_scale_running | True |
+| n_critic_warmup_itr | 2 |
+| norm_adv | True |
+| target_kl | 1.0 |
+| max_grad_norm | 1.0 |
+
+### Notes
+- **Root cause of collapse**: `min_logprob_std` (0.1) >> `min_sampling_std` (0.01) makes PPO ratio completely blind to behavioral changes in nearly-deterministic DDIM policy. Policy drifts through "shadow region" where logprob ratio ≈ 1 but actions change significantly. Removing logprob clamping and matching the two stds fixes this.
+- **lr scaling rule**: reference uses lr=2e-5 with logprob_std=0.1. Since logprob sensitivity ∝ 1/sigma², with sigma 10x smaller, need lr ~100x smaller → lr=2e-7 to 1e-6.
+- **Reference config** (from `ft_ppo_diffusion_unet.yaml`): batch=10000, n_steps=400, n_envs=50, update_epochs=10, actor_lr=2e-5, critic residual=True, min_logprob_std=min_sampling_std=0.1
+- **GPU utilization**: rollout phase ~70-80% (batch=100 too small for UNet), PPO update phase ~90%+ (batch=10000). Increasing n_envs would help.
+- This is the first successful DPPO finetuning: 54% → 85.7% in 70 iters with no collapse.
+
+---
+
+## [DPPO Finetune: LR Sweep + GPU Coverage] - 2026-02-26 14:51
+
+**Git**: 69cc8c5 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt`
+
+### LR Sweep (all with critic residual_style=True)
+
+All runs use same base config as Run 7 above but with `critic_residual=True` and varying `actor_lr`.
+
+#### Run 9: lr=1e-6 + critic residual (continued from previous log)
+**Killed at iter 10** to test higher lr. Peak = 71.3%.
+
+| Iter | GPU Eval SR | Rollout Succ | KL |
+|------|-------------|-------------|-----|
+| 1 | 54.0% | 558 | 0.000000 |
+| 5 | 60.3% | 684 | 0.000008 |
+| 10 | **71.3%** | 762 | 0.000009 |
+
+#### Run 10: lr=3e-6 + critic residual ★ BEST LR
+**Command**: `python -m DPPO.finetune --pretrain_checkpoint runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt --n_envs 100 --n_steps 100 --ft_denoising_steps 10 --use_ddim --ddim_steps 10 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 --gamma_denoising 0.99 --clip_ploss_coef 0.01 --update_epochs 10 --actor_lr 3e-6 --minibatch_size 10000 --n_critic_warmup_itr 2 --reward_scale_running --n_train_itr 100 --eval_freq 5 --exp_name dppo_ft_lr3e-6_residual`
+**Killed at iter 20** to test higher lr.
+
+| Iter | GPU Eval SR | Rollout Succ | KL |
+|------|-------------|-------------|-----|
+| 1 | 54.0% | 558 | 0.000000 |
+| 5 | **67.3%** | 672 | 0.000018 |
+| 10 | **77.7%** | 771 | 0.000020 |
+| 15 | **84.0%** | 811 | 0.000021 |
+| 20 | 82.0% | 842 | 0.000021 |
+
+**3x faster than lr=1e-6.** KL still very low (0.000021). No instability. Projected to reach 95%+ by iter 50-60.
+
+#### Run 11: lr=1e-5 + critic residual — COLLAPSED
+**Killed at iter 5.** Policy gradient flipped positive (wrong direction), succ dropped 635→461.
+
+| Iter | GPU Eval SR | Rollout Succ | KL | pg |
+|------|-------------|-------------|-----|-----|
+| 3 | — | 635 | 0.000138 | +0.000925 |
+| 5 | **47.3%** | 461 | 0.000090 | +0.000439 |
+
+**KL=0.000138 (7x Run 10) → overshooting.** pg > 0 means clipped PPO pushes wrong direction.
+
+#### Run 12: lr=5e-6 + critic residual — WORSE THAN 3e-6
+**Killed at iter 10.**
+
+| Iter | GPU Eval SR | Rollout Succ | KL |
+|------|-------------|-------------|-----|
+| 5 | 62.3% | 654 | 0.000034 |
+| 10 | 60.3% | 767 | 0.000034 |
+
+Eval SR lower than lr=3e-6 despite similar rollout succ. Policy less stable for deterministic inference.
+
+### LR Sweep Summary
+
+| lr | Iter 5 Eval | Iter 10 Eval | Status |
+|----|-------------|-------------|--------|
+| 1e-6 | 60.3% | 71.3% | Stable, slow |
+| **3e-6** | **67.3%** | **77.7%** | **Stable, fast** ★ |
+| 5e-6 | 62.3% | 60.3% | Mild instability |
+| 1e-5 | 47.3% | — | Collapsed |
+
+**Optimal lr = 3e-6** with critic residual_style=True. Sweet spot between speed and stability.
+
+**Why reference uses lr=2e-5 but we need 3e-6**: logprob gradient ∝ 1/σ². Reference uses σ=0.1, we use σ=0.01. Effective update: lr/σ² = 3e-6/1e-4 = 30 (us) vs 2e-5/0.01 = 2e-3 (reference). Our effective update is 15x reference — already aggressive.
+
+### GPU Coverage Analysis
+
+**Command**: `python dp_p_success_gpu.py --ckpt runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt --num_states 100 --mc_samples 16 --ddim_steps 10 --min_sampling_denoising_std 0.01`
+
+| Metric | GPU (DDIM-10, std=0.01) | CPU (previous) |
+|--------|------------------------|----------------|
+| SR | 68.1% | 80.4% |
+| **frac_zero** | **0.0%** | 0.0% |
+| frac_one | 1.0% | 35% |
+| **frac_decisive** | **90.0%** | 65% |
+| std P | 0.189 | — |
+| median P | 0.688 | — |
+
+**Theoretical ceiling = ~100%** (frac_zero=0%, no dead zones on GPU).
+
+90% of states are in the decisive range (0.1 < P < 0.9), providing strong gradient signal for RL. The GPU coverage is actually better for finetuning than CPU — more room to improve.
+
+### Notes
+- **Coverage script**: `dp_p_success_gpu.py` — new GPU coverage analysis using ManiSkill state save/restore (`get_state_dict`/`set_state_dict`). 100 states × 16 MC in 41 seconds.
+- GPU SR (68.1%) > previous GPU eval (53.6%) — likely due to different seeds and MC16 averaging.
+- Next step: run lr=3e-6 + residual critic for full 100 iters to verify 95%+ target.
+
+---
+
+## [DPPO Finetune: lr=3e-6 Full 100 Iters + Coverage Analysis] - 2026-02-26 16:19
+
+**Git**: 69cc8c5 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt`
+**Run Dir**: `runs/dppo_finetune/dppo_ft_lr3e-6_residual_full/`
+
+### Command
+```bash
+python -m DPPO.finetune \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_200traj_unet_T100_5k/ckpt_3000.pt \
+  --n_envs 100 --n_steps 100 \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --gamma_denoising 0.99 --clip_ploss_coef 0.01 \
+  --update_epochs 10 --actor_lr 3e-6 \
+  --minibatch_size 10000 --n_critic_warmup_itr 2 \
+  --reward_scale_running --n_train_itr 100 --eval_freq 5 \
+  --exp_name dppo_ft_lr3e-6_residual_full
+```
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| actor_lr | **3e-6** |
+| critic_residual_style | **True** |
+| n_envs | 100 |
+| n_steps | 100 |
+| update_epochs | 10 |
+| minibatch_size | 10000 |
+| clip_ploss_coef | 0.01 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| gamma | 0.999 |
+| gamma_denoising | 0.99 |
+| n_critic_warmup_itr | 2 |
+| reward_scale_running | True |
+
+### Results — Training Curve (GPU Inline Eval, n_rounds=3)
+
+| Iter | GPU Eval SR | Rollout Succ | KL |
+|------|-------------|-------------|-----|
+| 1 | 54.0% | 558 | 0.000000 |
+| 5 | 60.0% | 670 | 0.000023 |
+| 10 | 74.7% | 791 | 0.000019 |
+| 15 | 74.0% | 873 | 0.000024 |
+| 20 | 81.0% | 818 | 0.000026 |
+| 25 | 84.3% | 857 | 0.000020 |
+| 30 | 86.7% | 884 | 0.000021 |
+| 35 | 90.0% | 921 | 0.000023 |
+| 40 | **91.0%** | 969 | 0.000025 |
+| 45 | 88.3% | 970 | 0.000025 |
+| 50 | 89.7% | 989 | 0.000026 |
+| 55 | 88.3% | 983 | 0.000020 |
+| 60 | 92.0% | 1003 | 0.000023 |
+| 65 | 85.3% | 976 | 0.000022 |
+| 70 | 87.7% | 1011 | 0.000023 |
+| 75 | 90.7% | 1043 | 0.000027 |
+| 80 | **95.7%** | 1047 | 0.000025 |
+| 85 | 92.7% | 1016 | 0.000022 |
+| 90 | **96.0%** | 1022 | 0.000022 |
+| 95 | 92.3% | — | 0.000031 |
+| 100 | 92.3% | 1043 | — |
+
+**Peak inline eval = 96.0%** (iter 90), best checkpoint saved at iter 90.
+
+### Results — High-Precision Eval (dp_p_success_gpu.py)
+
+**BUG FOUND**: Finetuned checkpoint saves `actor_ft.unet.*` (finetuned weights) and `network.unet.*` (frozen pretrained copy). Loading into DiffusionModel with `strict=False` matches `network.unet.*` → loads pretrained weights, silently ignoring finetuned weights. **Fix**: remap `actor_ft.unet.* → network.unet.*` before loading.
+
+Verified: `actor_ft` weights differ from pretrained (max_diff=0.0008), `network` weights are identical to pretrained (max_diff=0.0).
+
+#### Deterministic Eval (300 states, MC1)
+| Metric | Value |
+|--------|-------|
+| **SR** | **91.3%** |
+| frac_zero | 8.7% |
+| frac_one | 91.3% |
+| frac_decisive | 0.0% |
+
+#### Stochastic Coverage (200 states, MC16, min_std=0.01)
+| Metric | Pretrained | **Finetuned** |
+|--------|-----------|--------------|
+| **SR** | 68.1% | **94.4%** |
+| frac_zero | 0.0% | **0.0%** |
+| frac_one | 1.0% | **56.0%** |
+| frac_decisive | 90.0% | **24.5%** |
+| std P | 0.189 | **0.082** |
+
+### Notes
+
+- **Inline eval (n_rounds=3) overestimates**: Reports 96% peak, but high-precision deterministic eval (300 states) shows **91.3%**. SE of inline eval at 90% SR ≈ 1.7%, so 96% is within 3σ fluctuation.
+- **Rollout succ is inflated by partial reset**: `n_success_rollout` counts all reward events across ~8 episodes per env (800 env steps / 100 max_steps). Succ=1047 doesn't mean 104.7% SR — it includes post-reset episode successes. True first-episode SR should be tracked separately.
+- **Stochastic > deterministic** (94.4% vs 91.3%): MC16 counts a state as "successful" if any of 16 stochastic rollouts succeed. So some states fail deterministically but occasionally succeed with DDIM noise.
+- **Remaining gap to 98%**: 8.7% of states fail deterministically. These are the "hard" initial configs. Need more training iterations, or try larger n_steps/n_envs for better gradient signal on hard states.
+- **`dp_p_success_gpu.py` key remap bug**: Must remap `actor_ft.unet.*` → `network.unet.*` when loading finetuned checkpoints into DiffusionModel. Without this, silently loads pretrained weights.
+
+---

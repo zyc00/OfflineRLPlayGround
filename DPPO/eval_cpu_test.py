@@ -149,7 +149,7 @@ def main():
         final_action_clip_value=1.0,
         predict_epsilon=True,
     )
-    model.load_state_dict(ckpt["ema"])
+    model.load_state_dict(ckpt["ema"], strict=False)
     model.eval()
 
     obs_mean = ckpt["obs_mean"].to(device)

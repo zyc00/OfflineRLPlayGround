@@ -141,7 +141,7 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         final_action_clip_value=1.0,
         predict_epsilon=True,
     )
-    model.load_state_dict(ckpt["ema"])
+    model.load_state_dict(ckpt["ema"], strict=False)
     model.eval()
 
     no_obs_norm = ckpt.get("no_obs_norm", False)

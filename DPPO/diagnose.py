@@ -63,7 +63,7 @@ def main():
     )
 
     # Load EMA weights
-    model.load_state_dict(ckpt["ema"])
+    model.load_state_dict(ckpt["ema"], strict=False)
     model.eval()
     print(f"Loaded EMA model from {ckpt_path}")
 

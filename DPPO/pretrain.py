@@ -80,6 +80,9 @@ class Args:
     seed: int = 0
     save_dir: str = "runs/dppo_pretrain"
 
+    # Resume
+    resume: Optional[str] = None  # Path to checkpoint to resume from
+
 
 from diffusers.training_utils import EMAModel as DiffusersEMA
 
@@ -182,6 +185,16 @@ def main():
     ema = DiffusersEMA(parameters=model.parameters(), power=0.75)
     ema_model = copy.deepcopy(model)
 
+    # Resume from checkpoint
+    start_iter = 0
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt["model"])
+        ema_model.load_state_dict(resume_ckpt["ema"])
+        start_iter = resume_ckpt.get("step", 0)
+        print(f"Resumed from {args.resume} at iter {start_iter}")
+        del resume_ckpt
+
     # Norm stats on GPU for eval
     obs_min = dataset.obs_min.to(device)
     obs_max = dataset.obs_max.to(device)
@@ -191,8 +204,15 @@ def main():
     best_sr = -1.0
     t_start = time.time()
 
-    print(f"Starting training...")
+    # Fast-forward LR scheduler to resume point
+    if start_iter > 0 and lr_scheduler is not None:
+        for _ in range(start_iter):
+            lr_scheduler.step()
+
+    print(f"Starting training from iter {start_iter + 1}...")
     for iteration, batch in enumerate(dataloader, 1):
+        if iteration <= start_iter:
+            continue
         model.train()
         actions = batch["actions"].to(device)
         cond = {k: v.to(device) for k, v in batch["cond"].items()}

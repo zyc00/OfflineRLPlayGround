@@ -50,6 +50,10 @@ class Args:
     seed: int = 0
     min_sampling_denoising_std: Optional[float] = None
     """If set, use stochastic sampling with this min std (DPPO exploration noise). Default: deterministic."""
+    ddim_steps: Optional[int] = None
+    """If set, use DDIM sampling with this many steps instead of full DDPM."""
+    ddim_eta: float = 1.0
+    """DDIM eta (EtaFixed base_eta): 0=deterministic DDIM, 1=DDPM-like (original DPPO uses 1)."""
     # DP architecture args (must match training)
     obs_horizon: int = 2
     act_horizon: int = 8
@@ -226,29 +230,39 @@ if __name__ == "__main__":
             denoising_steps=ckpt_args.get("denoising_steps", 100),
             denoised_clip_value=1.0, randn_clip_value=10,
             final_action_clip_value=1.0, predict_epsilon=True,
+            base_eta=args.ddim_eta,
         )
-        dppo_model.load_state_dict(ckpt["ema"])
+        dppo_model.load_state_dict(ckpt["ema"], strict=False)
+        # Fix NaN eta_logit from checkpoints trained with AdamW weight decay
+        # (atanh(1.0)=inf → AdamW: inf - lr*wd*inf = NaN)
+        if torch.isnan(dppo_model.eta.eta_logit.data).any() or torch.isinf(dppo_model.eta.eta_logit.data).any():
+            dppo_model.eta.eta_logit.data = torch.atanh(torch.tensor([0.999]))
+            print(f"  [fix] Sanitized NaN/inf eta_logit → {dppo_model.eta.eta_logit.data.item():.4f}")
         dppo_model.eval()
         act_offset = cond_steps - 1
         min_std = args.min_sampling_denoising_std
 
         class DPPOAgentWrapper:
-            def __init__(self, model, act_offset, act_steps, min_std):
+            def __init__(self, model, act_offset, act_steps, min_std, ddim_steps):
                 self.model = model
                 self.act_offset = act_offset
                 self.act_steps = act_steps
                 self.min_std = min_std
+                self.ddim_steps = ddim_steps
             def get_action(self, obs_seq):
                 cond = {"state": obs_seq}
                 deterministic = (self.min_std is None)
                 samples = self.model(cond, deterministic=deterministic,
-                                     min_sampling_denoising_std=self.min_std)
+                                     min_sampling_denoising_std=self.min_std,
+                                     ddim_steps=self.ddim_steps)
                 return samples.trajectories[:, self.act_offset:self.act_offset + self.act_steps]
-        agent = DPPOAgentWrapper(dppo_model, act_offset, act_steps, min_std)
+        agent = DPPOAgentWrapper(dppo_model, act_offset, act_steps, min_std,
+                                 args.ddim_steps)
+        ddim_info = f", ddim={args.ddim_steps}, eta={args.ddim_eta}" if args.ddim_steps else ""
         if min_std is not None:
-            print(f"Loaded DPPO checkpoint: {args.ckpt} (min_std={min_std})")
+            print(f"Loaded DPPO checkpoint: {args.ckpt} (min_std={min_std}{ddim_info})")
         else:
-            print(f"Loaded DPPO checkpoint: {args.ckpt} (deterministic)")
+            print(f"Loaded DPPO checkpoint: {args.ckpt} (deterministic{ddim_info})")
     else:
         raise ValueError(f"Unknown checkpoint format, keys: {list(ckpt.keys())}")
     print(f"Env: {args.env_id}, {args.control_mode}, max_steps={args.max_episode_steps}")
