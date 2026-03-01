@@ -270,14 +270,18 @@ def main():
 
     @torch.no_grad()
     def evaluate_gpu_inline(n_rounds=5):
-        """Eval using training GPU env: reset + deterministic rollout, count successes."""
+        """Eval using training env: reset + deterministic rollout, track success_once."""
         model.eval()
         total_success = 0
         total_eps = 0
         for _ in range(n_rounds):
             obs_r, _ = train_envs.reset()
-            obs_r = obs_r.float().to(device) if not isinstance(obs_r, torch.Tensor) else obs_r.float()
+            if isinstance(obs_r, np.ndarray):
+                obs_r = torch.from_numpy(obs_r).float().to(device)
+            else:
+                obs_r = obs_r.float().to(device)
             obs_h = obs_r.unsqueeze(1).repeat(1, args.cond_steps, 1)
+            success_once = torch.zeros(args.n_envs, dtype=torch.bool, device=device)
             for step in range(args.max_episode_steps // args.act_steps + 1):
                 cond_eval = {"state": normalize_obs(obs_h)}
                 samples_eval = model(cond_eval, deterministic=True)
@@ -285,13 +289,24 @@ def main():
                 for a_idx in range(args.act_steps):
                     act_idx = act_offset + a_idx
                     action_eval = ac_eval[:, min(act_idx, ac_eval.shape[1] - 1)]
-                    obs_new_eval, rew_eval, term_eval, trunc_eval, _ = train_envs.step(action_eval)
-                    obs_new_eval = obs_new_eval.float()
-                    total_success += (rew_eval.float() > 0.5).sum().item()
+                    if use_gpu_env:
+                        obs_new_eval, rew_eval, term_eval, trunc_eval, _ = train_envs.step(action_eval)
+                        obs_new_eval = obs_new_eval.float()
+                        rew_eval = rew_eval.float()
+                        term_eval = term_eval.bool()
+                        trunc_eval = trunc_eval.bool()
+                    else:
+                        obs_new_eval, rew_eval, term_eval, trunc_eval, _ = train_envs.step(action_eval.cpu().numpy())
+                        obs_new_eval = torch.from_numpy(np.array(obs_new_eval)).float().to(device)
+                        rew_eval = torch.from_numpy(np.array(rew_eval)).float().to(device)
+                        term_eval = torch.from_numpy(np.array(term_eval)).bool().to(device)
+                        trunc_eval = torch.from_numpy(np.array(trunc_eval)).bool().to(device)
+                    success_once |= (rew_eval > 0.5).bool()
                     rm = term_eval | trunc_eval
                     if rm.any():
                         obs_h[rm] = obs_new_eval[rm].unsqueeze(1).repeat(1, args.cond_steps, 1)
                     obs_h[~rm] = torch.cat([obs_h[~rm, 1:], obs_new_eval[~rm].unsqueeze(1)], dim=1)
+            total_success += success_once.sum().item()
             total_eps += args.n_envs
         return total_success / max(total_eps, 1)
 

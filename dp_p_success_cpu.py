@@ -184,7 +184,15 @@ if __name__ == "__main__":
     # Load checkpoint (auto-detect dp_train vs DPPO format)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
 
-    if "ema_agent" in ckpt:
+    # Auto-detect checkpoint format
+    # dp_train: has "ema_agent"
+    # DPPO pretrain: has "ema" + "step" (no "iteration")
+    # DPPO finetune: has "model" + "iteration" (no "ema")
+    is_dp_train = "ema_agent" in ckpt
+    is_dppo_finetune = "iteration" in ckpt and "model" in ckpt
+    is_dppo_pretrain = "ema" in ckpt and not is_dppo_finetune
+
+    if is_dp_train:
         # dp_train format — probe obs_dim from env
         tmp_env = gym.make(args.env_id, obs_mode="state", render_mode="rgb_array",
                            reward_mode="sparse", control_mode=args.control_mode,
@@ -197,23 +205,23 @@ if __name__ == "__main__":
         act_dim = tmp_env.action_space.shape[0]
         tmp_env.close()
         print(f"obs_dim={obs_dim}, act_dim={act_dim}")
-    elif "ema" in ckpt:
-        # DPPO format — read dims from checkpoint
+    elif is_dppo_pretrain or is_dppo_finetune:
         obs_dim = ckpt["obs_dim"]
         act_dim = ckpt["action_dim"]
         print(f"obs_dim={obs_dim}, act_dim={act_dim}")
 
-    if "ema_agent" in ckpt:
+    if is_dp_train:
         # dp_train format
         agent = DPAgent(obs_dim, act_dim, args).to(device)
         agent.load_state_dict(ckpt["ema_agent"])
         agent.eval()
         print(f"Loaded dp_train checkpoint: {args.ckpt}")
-    elif "ema" in ckpt:
-        # DPPO format
+    elif is_dppo_pretrain or is_dppo_finetune:
+        # DPPO pretrained or finetuned format
         from DPPO.model.unet_wrapper import DiffusionUNet
         from DPPO.model.diffusion import DiffusionModel
-        ckpt_args = ckpt["args"]
+        ckpt_args = ckpt["args"] if is_dppo_pretrain else ckpt.get("pretrain_args", ckpt["args"])
+        ft_args = ckpt["args"] if is_dppo_finetune else None
         cond_steps = ckpt_args.get("cond_steps", args.obs_horizon)
         horizon_steps = ckpt_args.get("horizon_steps", args.pred_horizon)
         act_steps = ckpt_args.get("act_steps", args.act_horizon)
@@ -232,15 +240,30 @@ if __name__ == "__main__":
             final_action_clip_value=1.0, predict_epsilon=True,
             base_eta=args.ddim_eta,
         )
-        dppo_model.load_state_dict(ckpt["ema"], strict=False)
+        if is_dppo_pretrain:
+            dppo_model.load_state_dict(ckpt["ema"], strict=False)
+        else:
+            # Finetuned: extract actor_ft weights → network.*
+            model_sd = ckpt["model"]
+            ft_sd = {}
+            for k, v in model_sd.items():
+                if k.startswith("actor_ft."):
+                    ft_sd["network." + k[len("actor_ft."):]] = v
+            dppo_model.load_state_dict(ft_sd, strict=False)
+            ft_iter = ckpt.get("iteration", "?")
+            print(f"  [finetune] Loaded actor_ft weights from iter {ft_iter}")
         # Fix NaN eta_logit from checkpoints trained with AdamW weight decay
-        # (atanh(1.0)=inf → AdamW: inf - lr*wd*inf = NaN)
         if torch.isnan(dppo_model.eta.eta_logit.data).any() or torch.isinf(dppo_model.eta.eta_logit.data).any():
             dppo_model.eta.eta_logit.data = torch.atanh(torch.tensor([0.999]))
             print(f"  [fix] Sanitized NaN/inf eta_logit → {dppo_model.eta.eta_logit.data.item():.4f}")
         dppo_model.eval()
         act_offset = cond_steps - 1
         min_std = args.min_sampling_denoising_std
+        # For finetuned checkpoints, default to DDIM with finetuned ddim_steps
+        ddim_steps_use = args.ddim_steps
+        if is_dppo_finetune and ddim_steps_use is None:
+            ddim_steps_use = ft_args.get("ddim_steps", 10)
+            print(f"  [finetune] Auto-set ddim_steps={ddim_steps_use} from checkpoint")
 
         class DPPOAgentWrapper:
             def __init__(self, model, act_offset, act_steps, min_std, ddim_steps):
@@ -257,12 +280,13 @@ if __name__ == "__main__":
                                      ddim_steps=self.ddim_steps)
                 return samples.trajectories[:, self.act_offset:self.act_offset + self.act_steps]
         agent = DPPOAgentWrapper(dppo_model, act_offset, act_steps, min_std,
-                                 args.ddim_steps)
-        ddim_info = f", ddim={args.ddim_steps}, eta={args.ddim_eta}" if args.ddim_steps else ""
+                                 ddim_steps_use)
+        ddim_info = f", ddim={ddim_steps_use}, eta={args.ddim_eta}" if ddim_steps_use else ""
+        ckpt_type = "DPPO finetuned" if is_dppo_finetune else "DPPO pretrained"
         if min_std is not None:
-            print(f"Loaded DPPO checkpoint: {args.ckpt} (min_std={min_std}{ddim_info})")
+            print(f"Loaded {ckpt_type}: {args.ckpt} (min_std={min_std}{ddim_info})")
         else:
-            print(f"Loaded DPPO checkpoint: {args.ckpt} (deterministic{ddim_info})")
+            print(f"Loaded {ckpt_type}: {args.ckpt} (deterministic{ddim_info})")
     else:
         raise ValueError(f"Unknown checkpoint format, keys: {list(ckpt.keys())}")
     print(f"Env: {args.env_id}, {args.control_mode}, max_steps={args.max_episode_steps}")
