@@ -25,6 +25,7 @@ def evaluate_cpu_model(
     no_obs_norm=False,
     no_action_norm=False,
     act_offset=0,
+    ddim_steps=None,
 ):
     """Evaluate diffusion policy using CPU envs with FrameStack (matches dp_train)."""
     model.eval()
@@ -62,7 +63,7 @@ def evaluate_cpu_model(
             else:
                 cond = {"state": (obs - o_lo) / (o_hi - o_lo + 1e-8) * 2.0 - 1.0}
 
-            samples = model(cond, deterministic=True)
+            samples = model(cond, deterministic=True, ddim_steps=ddim_steps)
             action_chunk = samples.trajectories
 
             if not no_action_norm:
@@ -103,14 +104,16 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
 
     device = torch.device("cuda")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    args = ckpt["args"]
+    is_finetune = "iteration" in ckpt and "model" in ckpt
+    # For finetuned checkpoints, use pretrain_args for architecture
+    args = ckpt.get("pretrain_args", ckpt["args"]) if is_finetune else ckpt["args"]
 
     obs_dim = ckpt["obs_dim"]
     action_dim = ckpt["action_dim"]
-    cond_steps = args["cond_steps"]
-    horizon_steps = args["horizon_steps"]
-    act_steps = args["act_steps"]
-    denoising_steps = args["denoising_steps"]
+    cond_steps = args.get("cond_steps", 2)
+    horizon_steps = args.get("horizon_steps", 16)
+    act_steps = args.get("act_steps", 8)
+    denoising_steps = args.get("denoising_steps", 100)
 
     if args.get("network_type") == "unet":
         network = DiffusionUNet(
@@ -141,12 +144,38 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         final_action_clip_value=1.0,
         predict_epsilon=True,
     )
-    model.load_state_dict(ckpt["ema"], strict=False)
+    is_finetune = "iteration" in ckpt and "model" in ckpt
+    if is_finetune:
+        # Finetuned: extract actor_ft weights → network.*
+        model_sd = ckpt["model"]
+        ft_sd = {}
+        for k, v in model_sd.items():
+            if k.startswith("actor_ft."):
+                ft_sd["network." + k[len("actor_ft."):]] = v
+        model.load_state_dict(ft_sd, strict=False)
+        # Read pretrain_args for architecture params
+        pretrain_args = ckpt.get("pretrain_args", args)
+        cond_steps = pretrain_args.get("cond_steps", cond_steps)
+        act_steps = pretrain_args.get("act_steps", act_steps)
+        print(f"  Loaded finetuned checkpoint (iter {ckpt.get('iteration', '?')})")
+    else:
+        model.load_state_dict(ckpt["ema"], strict=False)
+    # Fix NaN eta_logit from checkpoints trained with AdamW weight decay
+    if hasattr(model, 'eta') and torch.isnan(model.eta.eta_logit.data).any():
+        model.eta.eta_logit.data = torch.atanh(torch.tensor([0.999], device=device))
     model.eval()
 
     no_obs_norm = ckpt.get("no_obs_norm", False)
     no_action_norm = ckpt.get("no_action_norm", False)
     act_offset = cond_steps - 1 if args.get("network_type") == "unet" else 0
+
+    # For finetuned DDIM checkpoints, use ddim_steps from training args
+    ddim_steps = None
+    if is_finetune:
+        ft_args = ckpt["args"]
+        if ft_args.get("use_ddim"):
+            ddim_steps = ft_args.get("ddim_steps", 10)
+            print(f"  Using DDIM with {ddim_steps} steps")
 
     metrics = evaluate_cpu_model(
         n_episodes=n_episodes,
@@ -164,6 +193,7 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         no_obs_norm=no_obs_norm,
         no_action_norm=no_action_norm,
         act_offset=act_offset,
+        ddim_steps=ddim_steps,
     )
     print(f"\nCPU Eval ({n_episodes} eps): success_once={metrics['success_once']:.3f}, "
           f"success_at_end={metrics['success_at_end']:.3f}")

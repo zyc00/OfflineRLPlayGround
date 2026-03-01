@@ -192,6 +192,12 @@ def main():
         model.load_state_dict(resume_ckpt["model"])
         ema_model.load_state_dict(resume_ckpt["ema"])
         start_iter = resume_ckpt.get("step", 0)
+        if "optimizer" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer"])
+        if "ema_state" in resume_ckpt:
+            ema.load_state_dict(resume_ckpt["ema_state"])
+        if "lr_scheduler" in resume_ckpt and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(resume_ckpt["lr_scheduler"])
         print(f"Resumed from {args.resume} at iter {start_iter}")
         del resume_ckpt
 
@@ -290,24 +296,28 @@ def main():
 
             # Save checkpoint at every eval
             _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, iteration,
-                       os.path.join(run_dir, f"ckpt_{iteration}.pt"))
+                       os.path.join(run_dir, f"ckpt_{iteration}.pt"),
+                       optimizer=optimizer, ema_state=ema, lr_scheduler=lr_scheduler)
 
             if sr_once > best_sr:
                 best_sr = sr_once
                 _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, iteration,
-                           os.path.join(run_dir, "best.pt"))
+                           os.path.join(run_dir, "best.pt"),
+                           optimizer=optimizer, ema_state=ema, lr_scheduler=lr_scheduler)
                 print(f"  Saved best checkpoint (sr_once={best_sr:.3f})")
 
     # Save final (copy EMA to ema_model first)
     ema.copy_to(ema_model.parameters())
     _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, args.total_iters,
-               os.path.join(run_dir, "final.pt"))
+               os.path.join(run_dir, "final.pt"),
+               optimizer=optimizer, ema_state=ema, lr_scheduler=lr_scheduler)
     elapsed = time.time() - t_start
     print(f"Training complete in {elapsed:.0f}s. Best sr_once={best_sr:.3f}")
     writer.close()
 
 
-def _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, step, path):
+def _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, step, path,
+               optimizer=None, ema_state=None, lr_scheduler=None):
     ckpt = {
         "model": {k: v.cpu() for k, v in model.state_dict().items()},
         "ema": {k: v.cpu() for k, v in ema_model.state_dict().items()},
@@ -322,6 +332,12 @@ def _save_ckpt(model, ema_model, dataset, obs_dim, action_dim, args, step, path)
         "no_obs_norm": args.no_obs_norm,
         "no_action_norm": args.no_action_norm,
     }
+    if optimizer is not None:
+        ckpt["optimizer"] = optimizer.state_dict()
+    if ema_state is not None:
+        ckpt["ema_state"] = ema_state.state_dict()
+    if lr_scheduler is not None:
+        ckpt["lr_scheduler"] = lr_scheduler.state_dict()
     torch.save(ckpt, path)
 
 

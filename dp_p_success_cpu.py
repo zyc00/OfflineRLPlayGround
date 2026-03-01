@@ -339,3 +339,9 @@ if __name__ == "__main__":
     out_path = args.output or "runs/dp_p_success_cpu.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"\nSaved plot: {out_path}")
+
+    # Save raw data as .npz for downstream use (e.g., seed pool filtering)
+    npz_path = os.path.splitext(out_path)[0] + ".npz"
+    seeds = np.arange(args.seed, args.seed + args.num_states)
+    np.savez(npz_path, p_success=p, seeds=seeds, mc_samples=args.mc_samples)
+    print(f"Saved data: {npz_path}")

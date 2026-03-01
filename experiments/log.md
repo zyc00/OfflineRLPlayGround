@@ -5107,3 +5107,96 @@ Verified: `actor_ft` weights differ from pretrained (max_diff=0.0008), `network`
 - **`dp_p_success_gpu.py` key remap bug**: Must remap `actor_ft.unet.*` → `network.unet.*` when loading finetuned checkpoints into DiffusionModel. Without this, silently loads pretrained weights.
 
 ---
+
+## [DPPO Filtered Finetuning: Only Train on Easy States] - 2026-03-01
+
+**Git**: bd7a026 (main)
+
+### Hypothesis
+Conservative DPPO finetuning plateaus at ~85% after iter 5. Analysis shows adv_pos_frac ~30% — most transitions have negative advantage from hard states. If we restrict training to seeds with P(success) > 0.5, the learning signal should be cleaner (higher adv_pos_frac), enabling faster convergence.
+
+### Implementation
+- `SeedPoolWrapper` in `DPPO/make_env.py`: overrides `reset()` to sample from pre-computed easy seed pool
+- `dp_p_success_cpu.py`: now saves `.npz` alongside plot for seed pool filtering
+- `DPPO/finetune.py`: `--seed_pool_path` and `--seed_pool_threshold` args
+
+### Step 1: Coverage Analysis (500 seeds, MC8)
+```bash
+python -u dp_p_success_cpu.py \
+  --ckpt runs/dppo_pretrain/dppo_pretrain_PegInsertionSide-v1_T100_H16_1M/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --num-states 500 --mc-samples 8 \
+  --ddim_steps 10 \
+  --output runs/coverage_pretrained_ddim10_500seeds.png
+```
+
+### Step 2: Filtered Finetuning (P > 0.5 seeds only)
+```bash
+python -u -m DPPO.finetune \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_PegInsertionSide-v1_T100_H16_1M/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 100 --sim_backend cpu \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --n_steps 100 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --gamma_denoising 0.99 --clip_ploss_coef 0.01 \
+  --update_epochs 10 --actor_lr 3e-6 --minibatch_size 10000 --n_critic_warmup_itr 2 \
+  --reward_scale_running --n_train_itr 30 --eval_freq 5 \
+  --seed_pool_path runs/coverage_pretrained_ddim10_500seeds.npz \
+  --seed_pool_threshold 0.5 \
+  --exp_name dppo_ft_peg_filtered_easy
+```
+
+### What to Compare
+- **adv_pos_frac**: filtered ~50%+ vs baseline ~30%
+- **Convergence speed**: reach 85%+ in fewer iterations
+- **Eval SR**: eval uses train envs (also filtered), so compare with `eval_cpu.py` for true generalization
+- Baseline: `dppo_ft_peg_conservative` (best.pt @ iter 20, 90.3% inline eval)
+
+### Coverage Analysis (Pretrained, DDIM-10, 500 seeds, MC8)
+```
+SR=66.6%, frac_zero=18.6%, frac_one=46.2%, frac_decisive=35.2%
+P>0.5: 335/500 seeds (67.0%) → used as seed pool
+```
+
+### Filtered Finetuning Results (inline eval on filtered seeds)
+
+| Iter | Reward | Succ | PG Loss | V Loss | KL | adv_pos_frac | Eval SR |
+|------|--------|------|---------|--------|-----|-------------|---------|
+| 1 [W] | 3.044 | 127 | 0.000000 | 0.2178 | 0.000000 | **0.83** | 92.0% |
+| 2 [W] | 3.507 | 151 | -0.000002 | 0.2121 | 0.000000 | 0.47 | — |
+| 5 | 2.410 | 96 | -0.000662 | 0.1752 | 0.000371 | 0.27 | **97.3%** |
+| 10 | 2.876 | 115 | -0.000662 | 0.1938 | 0.000257 | 0.32 | **99.7%** |
+| 15 | 2.652 | 107 | -0.000647 | 0.1769 | 0.000031 | 0.32 | 95.7% |
+| 20 | 3.106 | 126 | -0.000651 | 0.1948 | 0.000062 | 0.37 | 95.0% |
+| 25 | 2.554 | 104 | -0.000539 | 0.1802 | 0.000290 | 0.36 | 92.3% |
+| 30 | 2.890 | 118 | -0.000624 | 0.1806 | 0.000056 | 0.34 | 92.3% |
+
+### CPU Eval — True Generalization (500 eps, random seeds)
+
+| Checkpoint | CPU success_once |
+|-----------|-----------------|
+| Pretrained (no finetuning) | **53.6%** |
+| Conservative baseline (iter 20) | **79.6%** |
+| Filtered best (iter 10) | **79.4%** |
+| Filtered final (iter 30) | **80.2%** |
+
+### Analysis
+
+1. **adv_pos_frac in warmup was very high (0.83)** — confirmed hypothesis that easy states produce cleaner learning signal. But after critic warmup calibrates V, adv_pos_frac drops to ~0.30, similar to baseline. This makes sense: once V accurately predicts expected return for easy states, advantages reflect the deviation from expectation, which is roughly symmetric.
+
+2. **Inline eval was inflated**: 99.7% inline (on filtered easy seeds) vs 79.4% CPU eval (on random seeds). The inline eval reuses `train_envs` which has `SeedPoolWrapper` — so eval was also on easy seeds. This is a methodological issue to fix in future experiments (use separate eval envs without seed pool).
+
+3. **Filtered ≈ Baseline on generalization**: CPU eval shows 79.4-80.2% (filtered) vs 79.6% (baseline conservative). No significant difference. Both improve +26% over pretrained (53.6%).
+
+4. **Why filtering didn't help more**: The hypothesis was that hard states create noisy gradients. But in practice:
+   - With only P>0.5 filtering, 335/500 seeds still include many "decisive" states (0.5 < P < 1.0) that DO sometimes fail — so negative advantages still exist
+   - The critic adapts to the filtered state distribution, so adv_pos_frac converges to ~30% regardless
+   - The real bottleneck may be the 18.6% frac_zero states that are never trained on → never improve
+
+5. **Both methods plateau at ~80%**: This aligns with coverage analysis — 18.6% of states have P=0. Even with finetuning, the policy can't learn states it never sees reward on.
+
+### Conclusion
+
+Seed pool filtering (P>0.5) **does not significantly improve generalization** over the conservative baseline. The inline eval was misleadingly high because it evaluated on filtered seeds. The real bottleneck is the ~19% of states with zero success probability — these need different approaches (dense reward, curriculum, or longer training with exploration).
+
+**Key insight**: Eval must use separate envs without seed pool filtering for accurate generalization measurement.

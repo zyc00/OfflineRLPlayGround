@@ -41,7 +41,6 @@ class Args:
     control_mode: str = "pd_ee_delta_pos"
     max_episode_steps: int = 100
     n_envs: int = 200
-    n_eval_envs: int = 10
     sim_backend: str = "gpu"  # "gpu" for fast CUDA envs, "cpu" for CPU
 
     # DPPO specific (overridden from checkpoint at runtime)
@@ -93,7 +92,14 @@ class Args:
 
     # Eval
     eval_freq: int = 10
-    num_eval_episodes: int = 100
+    eval_n_rounds: int = 3
+    """Number of eval rounds (each round = n_envs episodes). Total eval episodes = eval_n_rounds * n_envs."""
+
+    # Seed pool filtering (train only on easy states)
+    seed_pool_path: Optional[str] = None
+    """Path to .npz from dp_p_success_cpu.py with p_success and seeds arrays."""
+    seed_pool_threshold: float = 0.5
+    """P(success) threshold: only train on seeds with P > threshold."""
 
     # Logging
     exp_name: Optional[str] = None
@@ -143,6 +149,15 @@ def main():
     args.cond_steps = pretrain_args.get("cond_steps", args.cond_steps)
     args.act_steps = pretrain_args.get("act_steps", args.act_steps)
     network_type = pretrain_args.get("network_type", "mlp")
+
+    # Validate control_mode matches pretrained checkpoint
+    ckpt_control_mode = pretrain_args.get("control_mode")
+    if ckpt_control_mode is not None and ckpt_control_mode != args.control_mode:
+        raise ValueError(
+            f"control_mode mismatch: checkpoint was trained with '{ckpt_control_mode}' "
+            f"but finetune is configured with '{args.control_mode}'. "
+            f"Pass --control_mode {ckpt_control_mode} to fix."
+        )
 
     cond_dim = obs_dim * args.cond_steps
     # UNet predicts for full horizon; executable actions start at cond_steps-1
@@ -242,6 +257,22 @@ def main():
     # Running reward scaler (normalizes rewards by running std of discounted returns)
     reward_scaler = RunningRewardScaler(gamma=args.gamma) if args.reward_scale_running else None
 
+    # Load seed pool for filtered training
+    seed_pool = None
+    if args.seed_pool_path is not None:
+        data = np.load(args.seed_pool_path)
+        p_success = data["p_success"]
+        seeds = data["seeds"]
+        mask = p_success > args.seed_pool_threshold
+        seed_pool = seeds[mask]
+        print(f"Seed pool: {len(seed_pool)}/{len(seeds)} seeds with P(success)>{args.seed_pool_threshold}")
+        if len(seed_pool) == 0:
+            raise ValueError(f"No seeds pass threshold {args.seed_pool_threshold}. "
+                             f"Max P(success)={p_success.max():.3f}")
+        if args.sim_backend == "gpu":
+            print("WARNING: seed_pool only works with CPU envs (sim_backend=cpu)")
+            seed_pool = None
+
     # Train environments (obs_history managed manually, no FrameStack)
     use_gpu_env = args.sim_backend == "gpu"
     train_envs = make_train_envs(
@@ -251,10 +282,15 @@ def main():
         control_mode=args.control_mode,
         max_episode_steps=args.max_episode_steps,
         seed=args.seed,
+        seed_pool=seed_pool,
     )
 
     n_decision_steps = args.n_steps
     K = args.ft_denoising_steps
+    assert K > 1, (
+        f"ft_denoising_steps must be > 1 (got {K}). "
+        f"K=1 causes PPO clip coefficient to degenerate to 0."
+    )
 
     def normalize_obs(obs):
         """Apply obs normalization (min-max to [-1,1]) if enabled."""
@@ -607,7 +643,7 @@ def main():
 
         # ===== EVALUATE =====
         if iteration == 1 or iteration % args.eval_freq == 0:
-            sr_once = evaluate_gpu_inline(n_rounds=3)
+            sr_once = evaluate_gpu_inline(n_rounds=args.eval_n_rounds)
             writer.add_scalar("eval/success_once", sr_once, iteration)
             print(f"  EVAL @ iter {iteration}: gpu_sr={sr_once:.3f}")
 
