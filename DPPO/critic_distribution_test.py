@@ -7,7 +7,7 @@ widely, critic regression is harder, and advantages carry more state noise.
 
 Uses pretrained DP model + coverage data to define two seed groups:
   - Narrow: seeds with P ∈ [narrow_lo, narrow_hi]
-  - Wide: same number of seeds sampled uniformly from full [0, 1]
+  - Wide: same number of seeds sampled from remaining seeds (excluding narrow)
 Collects on-policy rollouts from each, trains identical critic MLPs,
 then compares V quality, advantage quality, and advantage SNR.
 
@@ -182,7 +182,7 @@ def collect_rollouts(args, model, envs, obs_dim, cond_dim, act_offset,
     all_rewards = []   # list of (T, E)
     all_dones = []     # list of (T, E)
     all_next_obs = []  # list of (E, cond_steps, obs_dim)
-    all_seed_ids = []  # list of (T, E)
+    all_episode_ids = []  # list of (T, E)
 
     total_reward_events = 0
 
@@ -192,14 +192,15 @@ def collect_rollouts(args, model, envs, obs_dim, cond_dim, act_offset,
         obs_raw = torch.from_numpy(obs_raw).float().to(device)
         obs_history = obs_raw.unsqueeze(1).repeat(1, args.cond_steps, 1)
 
-        # Track episode boundaries for per-episode SNR.
-        # episode_id changes when an env terminates/truncates and resets.
+        # Track episode boundaries for per-episode SNR analysis.
+        # Each continuous episode segment gets a unique ID (not the actual env seed).
+        # ID increments by 10000 on reset, so steps within one episode share the same ID.
         current_episode_id = torch.arange(n_envs, device=device) + rollout_idx * n_envs * 10
 
         obs_trajs = []
         reward_trajs = []
         done_trajs = []
-        seed_id_trajs = []
+        episode_id_trajs = []
         n_reward_events = 0
 
         for step in range(args.n_steps):
@@ -217,7 +218,7 @@ def collect_rollouts(args, model, envs, obs_dim, cond_dim, act_offset,
                 action_chunk = samples.trajectories
 
             obs_trajs.append(obs_norm.clone())
-            seed_id_trajs.append(current_episode_id.clone())
+            episode_id_trajs.append(current_episode_id.clone())
             action_chunk_denorm = denormalize_actions(action_chunk)
 
             step_reward = torch.zeros(n_envs, device=device)
@@ -255,13 +256,13 @@ def collect_rollouts(args, model, envs, obs_dim, cond_dim, act_offset,
         rew_t = torch.stack(reward_trajs)      # (T, E)
         don_t = torch.stack(done_trajs)        # (T, E)
         next_obs_t = normalize_obs(obs_history)  # (E, cond_steps, obs_dim)
-        seed_ids_t = torch.stack(seed_id_trajs)  # (T, E)
+        episode_ids_t = torch.stack(episode_id_trajs)  # (T, E)
 
         all_obs.append(obs_t)
         all_rewards.append(rew_t)
         all_dones.append(don_t)
         all_next_obs.append(next_obs_t)
-        all_seed_ids.append(seed_ids_t)
+        all_episode_ids.append(episode_ids_t)
 
         total_reward_events += n_reward_events
         elapsed = time.time() - t0
@@ -271,7 +272,7 @@ def collect_rollouts(args, model, envs, obs_dim, cond_dim, act_offset,
     print(f"    Total reward events: {total_reward_events} "
           f"across {args.n_rollouts} rollouts x {n_envs} envs")
 
-    return all_obs, all_rewards, all_dones, all_next_obs, all_seed_ids
+    return all_obs, all_rewards, all_dones, all_next_obs, all_episode_ids
 
 
 def compute_mc1(rewards, dones, gamma):
@@ -352,19 +353,28 @@ def main():
     print(f"  {n_narrow} seeds, mean P={narrow_p.mean():.3f}, "
           f"std P={narrow_p.std():.3f}, range=[{narrow_p.min():.3f}, {narrow_p.max():.3f}]")
 
-    # Wide group: same size, sampled uniformly from all seeds
+    # Wide group: same size, sampled from seeds OUTSIDE narrow range (no overlap)
     rng = np.random.RandomState(args.seed + 42)
-    wide_idx = rng.choice(len(seeds), size=n_narrow, replace=False)
+    wide_pool_mask = ~narrow_mask
+    wide_pool_indices = np.where(wide_pool_mask)[0]
+    if len(wide_pool_indices) < n_narrow:
+        print(f"WARNING: Only {len(wide_pool_indices)} seeds outside narrow range, "
+              f"need {n_narrow}. Using all of them.")
+        wide_idx = wide_pool_indices
+    else:
+        wide_idx = rng.choice(wide_pool_indices, size=n_narrow, replace=False)
     wide_seeds = seeds[wide_idx]
     wide_p = p_success[wide_idx]
 
-    print(f"Wide group: {n_narrow} seeds from full [0, 1] range")
+    print(f"Wide group: {len(wide_idx)} seeds from outside [{args.narrow_lo}, {args.narrow_hi})")
     print(f"  mean P={wide_p.mean():.3f}, std P={wide_p.std():.3f}, "
           f"range=[{wide_p.min():.3f}, {wide_p.max():.3f}]")
 
-    # Adjust n_envs to match group size
-    actual_n_envs = min(args.n_envs, n_narrow)
-    print(f"\nUsing n_envs={actual_n_envs} (min of requested {args.n_envs} and group size {n_narrow})")
+    # Adjust n_envs to match smallest group size
+    n_wide = len(wide_seeds)
+    actual_n_envs = min(args.n_envs, n_narrow, n_wide)
+    print(f"\nUsing n_envs={actual_n_envs} (min of requested {args.n_envs}, "
+          f"narrow={n_narrow}, wide={n_wide})")
 
     # ===== Load pretrained DP model =====
     print(f"\n{'='*70}")
@@ -485,7 +495,7 @@ def main():
 
         # Collect rollouts (returns per-rollout lists, not concatenated)
         print(f"\n  Phase 1: Collecting {args.n_rollouts} rollouts")
-        roll_obs, roll_rew, roll_don, roll_nobs, roll_sids = collect_rollouts(
+        roll_obs, roll_rew, roll_don, roll_nobs, roll_eids = collect_rollouts(
             args, model, envs, obs_dim, cond_dim, act_offset,
             normalize_obs, denormalize_actions, device, actual_n_envs,
         )
@@ -500,7 +510,7 @@ def main():
         rew = torch.cat(roll_rew, dim=0)       # (T_total, E)
         don = torch.cat(roll_don, dim=0)       # (T_total, E)
         mc1 = torch.cat(mc1_per_roll, dim=0)   # (T_total, E)
-        seed_ids = torch.cat(roll_sids, dim=0)  # (T_total, E)
+        episode_ids = torch.cat(roll_eids, dim=0)  # (T_total, E)
 
         T_total, E = rew.shape
         N_total = T_total * E
@@ -562,13 +572,13 @@ def main():
         print(f"    r(GAE, MC_adv)={adv_r:.3f}, rho(GAE, MC_adv)={adv_rho:.3f}")
 
         # Per-episode SNR: variance of advantages within vs across episodes
-        seed_flat = seed_ids.reshape(-1).cpu().numpy()
-        unique_episodes = np.unique(seed_flat)
+        episode_flat = episode_ids.reshape(-1).cpu().numpy()
+        unique_episodes = np.unique(episode_flat)
 
         within_vars = []
         episode_means = []
         for ep_id in unique_episodes:
-            mask = seed_flat == ep_id
+            mask = episode_flat == ep_id
             if mask.sum() < 2:
                 continue
             ep_adv = gae_flat[mask]
