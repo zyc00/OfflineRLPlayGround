@@ -80,6 +80,10 @@ class Args:
     seed: int = 0
     save_dir: str = "runs/dppo_pretrain"
 
+    # Augmentation
+    obs_noise_std: float = 0.0  # Gaussian noise on obs cond (fraction of per-dim std, 0=off)
+    zero_qvel: bool = False  # Zero out qvel dims (9:18) in obs — reduces GPU/CPU sensitivity
+
     # Resume
     resume: Optional[str] = None  # Path to checkpoint to resume from
 
@@ -187,6 +191,7 @@ def main():
 
     # Resume from checkpoint
     start_iter = 0
+    _lr_scheduler_restored = False
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(resume_ckpt["model"])
@@ -196,8 +201,15 @@ def main():
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         if "ema_state" in resume_ckpt:
             ema.load_state_dict(resume_ckpt["ema_state"])
+            # Fix device: shadow params may end up on CPU after deepcopy in load_state_dict
+            ema.shadow_params = [p.to(device) for p in ema.shadow_params]
+        else:
+            # Old checkpoint without ema_state: sync ema shadow params from loaded ema_model
+            # so that ema.copy_to(ema_model) at eval time won't overwrite with fresh EMA
+            ema.shadow_params = [p.clone() for p in ema_model.parameters()]
         if "lr_scheduler" in resume_ckpt and lr_scheduler is not None:
             lr_scheduler.load_state_dict(resume_ckpt["lr_scheduler"])
+            _lr_scheduler_restored = True
         print(f"Resumed from {args.resume} at iter {start_iter}")
         del resume_ckpt
 
@@ -207,11 +219,16 @@ def main():
     action_min = dataset.action_min.to(device)
     action_max = dataset.action_max.to(device)
 
+    # Precompute per-dim obs std for scaled noise augmentation
+    if args.obs_noise_std > 0:
+        obs_std_dev = dataset.obs_std.to(device)  # (obs_dim,)
+        print(f"Obs noise augmentation: {args.obs_noise_std} * per-dim std")
+
     best_sr = -1.0
     t_start = time.time()
 
-    # Fast-forward LR scheduler to resume point
-    if start_iter > 0 and lr_scheduler is not None:
+    # Fast-forward LR scheduler to resume point (only if not restored from checkpoint)
+    if start_iter > 0 and lr_scheduler is not None and not _lr_scheduler_restored:
         for _ in range(start_iter):
             lr_scheduler.step()
 
@@ -223,6 +240,15 @@ def main():
         actions = batch["actions"].to(device)
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
+        # Zero out qvel dims (9:18) to reduce GPU/CPU sensitivity
+        if args.zero_qvel:
+            cond["state"][..., 9:18] = 0.0
+
+        # Obs noise augmentation: per-dim Gaussian noise scaled by data std
+        if args.obs_noise_std > 0:
+            noise = torch.randn_like(cond["state"]) * obs_std_dev * args.obs_noise_std
+            cond["state"] = cond["state"] + noise
+
         loss = model.loss(actions, cond)
         optimizer.zero_grad()
         loss.backward()
@@ -231,6 +257,10 @@ def main():
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()
+        # Debug: check devices before ema.step on first iter
+        if iteration == start_iter + 1:
+            p0 = next(model.parameters())
+            print(f"  [debug] model param device: {p0.device}, ema shadow[0] device: {ema.shadow_params[0].device}", flush=True)
         ema.step(model.parameters())
 
         writer.add_scalar("train/loss", loss.item(), iteration)
@@ -266,6 +296,7 @@ def main():
                     no_obs_norm=args.no_obs_norm,
                     no_action_norm=args.no_action_norm,
                     act_offset=act_offset,
+                    zero_qvel=args.zero_qvel,
                 )
             else:
                 eval_metrics = evaluate_gpu(
@@ -285,6 +316,7 @@ def main():
                     no_obs_norm=args.no_obs_norm,
                     no_action_norm=args.no_action_norm,
                     act_offset=act_offset,
+                    zero_qvel=args.zero_qvel,
                 )
 
             sr = eval_metrics.get("success_at_end", 0.0)

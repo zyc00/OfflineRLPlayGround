@@ -26,6 +26,7 @@ def evaluate_cpu_model(
     no_action_norm=False,
     act_offset=0,
     ddim_steps=None,
+    zero_qvel=False,
 ):
     """Evaluate diffusion policy using CPU envs with FrameStack (matches dp_train)."""
     model.eval()
@@ -58,6 +59,9 @@ def evaluate_cpu_model(
         obs = torch.from_numpy(obs).float().to(device)
 
         for step in range(max_episode_steps):
+            if zero_qvel:
+                obs[..., 9:18] = 0.0
+
             if no_obs_norm:
                 cond = {"state": obs}
             else:

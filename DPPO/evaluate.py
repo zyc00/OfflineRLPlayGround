@@ -27,6 +27,7 @@ def evaluate_gpu(
     no_obs_norm=False,
     no_action_norm=False,
     act_offset=0,
+    zero_qvel=False,
 ):
     """
     Evaluate diffusion policy using GPU-parallel envs (ManiSkillVectorEnv).
@@ -67,6 +68,9 @@ def evaluate_gpu(
     episodes_done = 0
 
     for _ in range(max_episode_steps):
+        if zero_qvel:
+            obs_history[..., 9:18] = 0.0
+
         # Normalize obs (min-max → [-1, 1])
         if no_obs_norm:
             cond = {"state": obs_history}

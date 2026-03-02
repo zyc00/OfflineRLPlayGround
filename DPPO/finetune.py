@@ -101,6 +101,9 @@ class Args:
     seed_pool_threshold: float = 0.5
     """P(success) threshold: only train on seeds with P > threshold."""
 
+    # Augmentation
+    zero_qvel: bool = False  # Zero out qvel dims (9:18) — eliminates GPU/CPU eval gap
+
     # Logging
     exp_name: Optional[str] = None
     seed: int = 0
@@ -109,16 +112,6 @@ class Args:
 
 def main():
     args = tyro.cli(Args)
-
-    if args.exp_name is None:
-        args.exp_name = (
-            f"dppo_ft_{args.env_id}_T{args.denoising_steps}_K{args.ft_denoising_steps}"
-            f"_envs{args.n_envs}_steps{args.n_steps}"
-        )
-
-    run_dir = os.path.join(args.save_dir, args.exp_name)
-    os.makedirs(run_dir, exist_ok=True)
-    writer = SummaryWriter(run_dir)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -159,15 +152,31 @@ def main():
             f"Pass --control_mode {ckpt_control_mode} to fix."
         )
 
+    # Inherit zero_qvel from pretrain checkpoint if not explicitly set
+    if pretrain_args.get("zero_qvel", False) and not args.zero_qvel:
+        args.zero_qvel = True
+        print("  Inherited zero_qvel=True from pretrain checkpoint")
+
     cond_dim = obs_dim * args.cond_steps
     # UNet predicts for full horizon; executable actions start at cond_steps-1
     act_offset = args.cond_steps - 1 if network_type == "unet" else 0
+
+    # Generate exp_name AFTER checkpoint params override (so name matches actual config)
+    if args.exp_name is None:
+        args.exp_name = (
+            f"dppo_ft_{args.env_id}_T{args.denoising_steps}_K{args.ft_denoising_steps}"
+            f"_envs{args.n_envs}_steps{args.n_steps}"
+        )
+
+    run_dir = os.path.join(args.save_dir, args.exp_name)
+    os.makedirs(run_dir, exist_ok=True)
+    writer = SummaryWriter(run_dir)
 
     print(f"Pretrained: {args.pretrain_checkpoint}")
     print(f"  network_type={network_type}, obs_dim={obs_dim}, action_dim={action_dim}")
     print(f"  denoising_steps={args.denoising_steps}, ft_denoising_steps={args.ft_denoising_steps}")
     print(f"  horizon_steps={args.horizon_steps}, cond_steps={args.cond_steps}, act_steps={args.act_steps}")
-    print(f"  act_offset={act_offset}, no_obs_norm={no_obs_norm}, no_action_norm={no_action_norm}")
+    print(f"  act_offset={act_offset}, no_obs_norm={no_obs_norm}, no_action_norm={no_action_norm}, zero_qvel={args.zero_qvel}")
 
     # Build actor network (match pretrained architecture)
     if network_type == "unet":
@@ -293,7 +302,10 @@ def main():
     )
 
     def normalize_obs(obs):
-        """Apply obs normalization (min-max to [-1,1]) if enabled."""
+        """Apply zero_qvel masking and obs normalization (min-max to [-1,1]) if enabled."""
+        if args.zero_qvel:
+            obs = obs.clone()
+            obs[..., 9:18] = 0.0
         if no_obs_norm:
             return obs
         return (obs - obs_min) / (obs_max - obs_min + 1e-8) * 2.0 - 1.0
@@ -306,7 +318,7 @@ def main():
 
     @torch.no_grad()
     def evaluate_gpu_inline(n_rounds=5):
-        """Eval using training env: reset + deterministic rollout, track success_once."""
+        """Eval using training env: reset + deterministic rollout, track first episode only."""
         model.eval()
         total_success = 0
         total_eps = 0
@@ -318,6 +330,7 @@ def main():
                 obs_r = obs_r.float().to(device)
             obs_h = obs_r.unsqueeze(1).repeat(1, args.cond_steps, 1)
             success_once = torch.zeros(args.n_envs, dtype=torch.bool, device=device)
+            ep_done = torch.zeros(args.n_envs, dtype=torch.bool, device=device)
             for step in range(args.max_episode_steps // args.act_steps + 1):
                 cond_eval = {"state": normalize_obs(obs_h)}
                 samples_eval = model(cond_eval, deterministic=True)
@@ -337,11 +350,15 @@ def main():
                         rew_eval = torch.from_numpy(np.array(rew_eval)).float().to(device)
                         term_eval = torch.from_numpy(np.array(term_eval)).bool().to(device)
                         trunc_eval = torch.from_numpy(np.array(trunc_eval)).bool().to(device)
-                    success_once |= (rew_eval > 0.5).bool()
+                    # Only track success for first episode per env slot
+                    success_once |= (rew_eval > 0.5).bool() & ~ep_done
                     rm = term_eval | trunc_eval
+                    ep_done = ep_done | rm
                     if rm.any():
                         obs_h[rm] = obs_new_eval[rm].unsqueeze(1).repeat(1, args.cond_steps, 1)
                     obs_h[~rm] = torch.cat([obs_h[~rm, 1:], obs_new_eval[~rm].unsqueeze(1)], dim=1)
+                if ep_done.all():
+                    break
             total_success += success_once.sum().item()
             total_eps += args.n_envs
         return total_success / max(total_eps, 1)
@@ -415,6 +432,12 @@ def main():
                 else:
                     action = action_chunk_denorm[:, -1]
 
+                # Zero out actions for envs that already terminated this decision step
+                # Prevents old action chunk from polluting new episode's initial state
+                if step_done.any():
+                    action = action.clone()
+                    action[step_done] = 0.0
+
                 if use_gpu_env:
                     obs_new, reward, terminated, truncated, info = train_envs.step(action)
                     obs_new = obs_new.float()
@@ -429,9 +452,12 @@ def main():
                     term_t = torch.from_numpy(np.array(terminated)).bool().to(device)
                     trunc_t = torch.from_numpy(np.array(truncated)).bool().to(device)
 
+                # Only accumulate reward for envs still in their current episode
+                newly_done = (term_t | trunc_t) & ~step_done
                 step_reward += reward_t * (~step_done).float()
+                # Count episode-level successes (only on episode boundary)
+                n_success_rollout += ((reward_t > 0.5) & newly_done).sum().item()
                 step_done = step_done | term_t | trunc_t
-                n_success_rollout += (reward_t > 0.5).sum().item()
 
                 # Reset obs_history for envs that terminated/truncated
                 reset_mask = term_t | trunc_t
@@ -624,7 +650,7 @@ def main():
         writer.add_scalar("train/pg_loss", avg_pg_loss, iteration)
         writer.add_scalar("train/v_loss", avg_v_loss, iteration)
         writer.add_scalar("train/approx_kl", avg_kl, iteration)
-        writer.add_scalar("train/rollout_successes", n_success_rollout, iteration)
+        writer.add_scalar("train/rollout_ep_successes", n_success_rollout, iteration)
         writer.add_scalar("train/global_step", global_step, iteration)
         writer.add_scalar("train/ratio_mean", avg_ratio, iteration)
         writer.add_scalar("train/adv_pos_frac", adv_pos_frac, iteration)

@@ -5200,3 +5200,330 @@ P>0.5: 335/500 seeds (67.0%) → used as seed pool
 Seed pool filtering (P>0.5) **does not significantly improve generalization** over the conservative baseline. The inline eval was misleadingly high because it evaluated on filtered seeds. The real bottleneck is the ~19% of states with zero success probability — these need different approaches (dense reward, curriculum, or longer training with exploration).
 
 **Key insight**: Eval must use separate envs without seed pool filtering for accurate generalization measurement.
+
+## [StackCube GPU-CPU Gap: Obs Augmentation & Zero-Qvel Ablation] - 2026-03-01 17:27
+
+**Git**: 54b5382 (main)
+
+### Background
+
+StackCube DP policy trained on CPU data shows massive GPU-CPU eval gap (CPU 59% vs GPU 0.6-2.6%). Root cause analysis:
+1. GPU physics produces slightly different joint velocities (qvel) from step 1 (~0.02 diff)
+2. Through closed-loop policy-physics interaction, obs diverge exponentially (0.02 → 0.19 by decision step 8)
+3. At decision step 8, model outputs completely different actions (grip action diff = 2.0, max possible)
+4. GPU robot pushes/hovers instead of lifting — task fails
+
+Gripper joints (7,8) have **7x more high-frequency jitter** on GPU vs CPU. qvel is the first and most divergent dimension.
+
+### Experiment 1: Baseline (no modifications)
+
+**Command**: `python -u -m DPPO.pretrain --env_id StackCube-v1 --demo_path ~/.maniskill/demos/StackCube-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 --control_mode pd_joint_delta_pos --network_type unet --denoising_steps 100 --horizon_steps 16 --cond_steps 2 --act_steps 8 --batch_size 1024 --no_obs_norm --no_action_norm --max_grad_norm 0 --seed 1 --torch_deterministic --total_iters 200000 --eval_freq 10000 --num_eval_episodes 100 --max_episode_steps 200 --cpu_eval`
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_200k/`
+
+| Iter | CPU sr_once | GPU sr_once (500 eps) |
+|------|-----------|---------|
+| 10k | 37.0% | — |
+| 30k | 54.0% | — |
+| 170k (best) | **59.0%** | **2.6%** |
+
+### Experiment 2: Obs Noise Augmentation (noise_std=0.1)
+
+Per-dim Gaussian noise scaled by data std: `noise = randn * obs_std * 0.1`
+
+**Command**: `python -u -m DPPO.pretrain ... --obs_noise_std 0.1 --exp_name dppo_pretrain_stackcube_noise0.1`
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_noise0.1/`
+
+| Iter | CPU sr_once | GPU sr_once (500 eps) |
+|------|-----------|---------|
+| 10k | 43.0% | — |
+| 30k (best) | **59.0%** | **27.0%** |
+| 40k | 41.0% | — |
+
+GPU improved 2.6% → 27% (10x), but still large gap vs CPU 59%.
+Reason: training noise is i.i.d. per sample (~0.017/dim), but GPU divergence compounds to 0.19 by decision step 8.
+
+### Experiment 3: Obs Noise Augmentation (noise_std=0.3)
+
+**Command**: `python -u -m DPPO.pretrain ... --obs_noise_std 0.3 --exp_name dppo_pretrain_stackcube_noise0.3`
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_noise0.3/`
+
+| Iter | CPU sr_once | GPU sr_once (500 eps) |
+|------|-----------|---------|
+| 10k | 25.0% | — |
+| 30k (best) | **31.0%** | **23.0%** |
+
+Too aggressive — hurts CPU learning significantly. GPU/CPU ratio highest (74%) but absolute performance low.
+
+### Experiment 4: Zero Qvel (zero_qvel=True) ⭐
+
+Zero out qvel dims (9:18) during training and eval. Model relies on cond_steps=2 (position differencing) for implicit velocity.
+
+**Command**: `python -u -m DPPO.pretrain ... --zero_qvel --total_iters 100000 --exp_name dppo_pretrain_stackcube_zeroqvel`
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_zeroqvel/`
+
+| Iter | CPU sr_once | GPU sr_once (500 eps) |
+|------|-----------|---------|
+| 10k | **84.0%** | **84.2%** |
+
+**GPU-CPU gap = 0.** Both at 84%. Also a 25% absolute improvement over baseline CPU eval (59% → 84%).
+
+### Experiment 5: Zero Qvel + Noise (zero_qvel + noise_std=0.1)
+
+**Command**: `python -u -m DPPO.pretrain ... --zero_qvel --obs_noise_std 0.1 --total_iters 100000 --exp_name dppo_pretrain_stackcube_zeroqvel_noise0.1`
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_zeroqvel_noise0.1/`
+
+| Iter | CPU sr_once | GPU sr_once (500 eps) |
+|------|-----------|---------|
+| 10k | **84.0%** | **78.4%** |
+
+Adding noise on top of zero_qvel slightly hurts GPU (84.2% → 78.4%). Noise is unnecessary when qvel is already removed.
+
+### Summary Table
+
+| Config | CPU eval | GPU eval (500 eps) | GPU/CPU |
+|--------|---------|-------------------|---------|
+| baseline | 59% | 2.6% | 4% |
+| noise=0.1 | 59% | 26.6% | 45% |
+| noise=0.3 | 31% | 23.0% | 74% |
+| **zero_qvel** | **84%** | **84.2%** | **100%** |
+| zero_qvel + noise=0.1 | 84% | 78.4% | 93% |
+
+### Notes
+- **qvel is the root cause of GPU-CPU gap for StackCube**: explicit joint velocities from GPU physics are noisy (7x gripper jitter) and diverge first in closed-loop
+- **Removing qvel improves BOTH GPU and CPU**: 59% → 84% on CPU. qvel was harmful even on CPU — it's a noisy, redundant signal when cond_steps=2 provides implicit velocity via position differencing
+- **Obs noise augmentation helps but doesn't close the gap**: i.i.d. noise can't simulate compounding closed-loop divergence
+- **Implementation**: `--zero_qvel` flag in `DPPO/pretrain.py`, `DPPO/evaluate.py`, `DPPO/eval_cpu.py` — zeros dims 9:18 in obs
+- **StackCube obs layout (48D)**: qpos(0:9), qvel(9:18), cubeA_pose(18:25), cubeB_pose(25:32), other(32:48)
+- All experiments use: UNet, T=100, H=16, cond=2, act=8, bs=1024, no_obs_norm, no_action_norm, pd_joint_delta_pos
+- GPU eval uses `evaluate_gpu` with ManiSkillVectorEnv (proper temporal stacking), 500 episodes
+
+---
+
+---
+
+## [StackCube DPPO Pretrain: zero_qvel (BC 99%)] - 2026-03-01 17:37
+
+**Command**: `python -u -m DPPO.pretrain --env_id StackCube-v1 --demo_path ~/.maniskill/demos/StackCube-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 --control_mode pd_joint_delta_pos --network_type unet --denoising_steps 100 --horizon_steps 16 --cond_steps 2 --act_steps 8 --batch_size 1024 --no_obs_norm --no_action_norm --max_grad_norm 0 --seed 1 --torch_deterministic --total_iters 100000 --eval_freq 10000 --num_eval_episodes 100 --max_episode_steps 200 --cpu_eval --zero_qvel --save_dir runs/dppo_pretrain --exp_name dppo_pretrain_stackcube_zeroqvel`
+**Git**: 54b5382 (main)
+**Run Dir**: `runs/dppo_pretrain/dppo_pretrain_stackcube_zeroqvel/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | StackCube-v1 |
+| demo_path | trajectory.state.pd_joint_delta_pos.physx_cpu.h5 (999 MP demos) |
+| control_mode | pd_joint_delta_pos |
+| network_type | unet |
+| denoising_steps | 100 |
+| horizon_steps | 16 |
+| cond_steps | 2 |
+| act_steps | 8 |
+| batch_size | 1024 |
+| no_obs_norm | True |
+| no_action_norm | True |
+| max_grad_norm | 0 (no clipping) |
+| seed | 1 |
+| total_iters | 100000 |
+| eval_freq | 10000 |
+| num_eval_episodes | 100 |
+| max_episode_steps | 200 |
+| cpu_eval | True |
+| **zero_qvel** | **True (dims 9:18 zeroed in train + eval)** |
+| obs_noise_std | 0 (no augmentation) |
+
+### Results (in progress — currently 39k/100k)
+| Iter | success_once | success_at_end | loss |
+|------|-------------|----------------|------|
+| 10k | 84.0% | 74.0% | ~0.008 |
+| 20k | 93.0% | 90.0% | ~0.006 |
+| **30k** | **99.0%** | **97.0%** | ~0.005 |
+
+### Key Finding
+- **zero_qvel completely solves StackCube GPU-CPU eval gap AND dramatically improves IL quality**
+- Previous baseline (with qvel): CPU peak ~61.5%, GPU ~2.6%
+- zero_qvel: CPU 99% @ 30k, GPU 84.2% @ 10k (gap eliminated at 10k eval)
+- Removing qvel (dims 9:18) works because cond_steps=2 provides implicit velocity via position differencing [obs_{t-1}, obs_t]
+- Explicit qvel is redundant AND harmful: GPU physics produces noisier qvel than CPU, causing closed-loop divergence
+
+### Notes
+- This is the **first StackCube IL result approaching 99%** — previous best was dp_train ~48% at 30k (with qvel)
+- MLP BC on StackCube was 0% regardless of config (compounding error over 108 steps)
+- Diffusion Policy + action chunking + zero_qvel = solved StackCube IL
+- Experiment still running to 100k, will update with final results
+- Checkpoint: `runs/dppo_pretrain/dppo_pretrain_stackcube_zeroqvel/best.pt` (30k, sr_once=0.990)
+
+---
+
+## [DPPO GPU Finetune: PegInsertion zero_qvel — First GPU RL Success] - 2026-03-01 20:23
+
+**Command**:
+```bash
+python -u -m DPPO.finetune \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 \
+  --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 \
+  --n_envs 200 \
+  --sim_backend gpu \
+  --ft_denoising_steps 10 \
+  --use_ddim --ddim_steps 10 \
+  --n_steps 100 \
+  --n_train_itr 30 \
+  --gamma 0.999 \
+  --actor_lr 3e-6 \
+  --critic_lr 1e-3 \
+  --n_critic_warmup_itr 2 \
+  --update_epochs 10 \
+  --minibatch_size 10000 \
+  --min_sampling_denoising_std 0.01 \
+  --min_logprob_denoising_std 0.01 \
+  --eval_freq 5 \
+  --eval_n_rounds 3 \
+  --zero_qvel \
+  --exp_name dppo_ft_peg_zeroqvel_v2
+```
+**Git**: 54b5382 (main)
+**Run Dir**: `runs/dppo_finetune/dppo_ft_peg_zeroqvel_v2/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | dppo_pretrain_peg_zeroqvel_500k/best.pt (50k iter, 59% SR) |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| sim_backend | **gpu** |
+| zero_qvel | True |
+| n_envs | 200 |
+| n_steps | 100 |
+| n_train_itr | 30 |
+| ft_denoising_steps | 10 |
+| use_ddim / ddim_steps | True / 10 |
+| gamma | 0.999 |
+| actor_lr | 3e-6 |
+| critic_lr | 1e-3 |
+| n_critic_warmup_itr | 2 |
+| update_epochs | 10 |
+| minibatch_size | 10000 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| eval_n_rounds | 3 (600 eval episodes) |
+
+### Results
+| Iter | GPU Eval SR | Rollout succ | time/iter |
+|------|------------|--------------|-----------|
+| 1 (warmup) | 53.2% | 489 | 52.9s |
+| 5 | 80.8% | 697 | 70.8s |
+| 10 | 89.8% | 909 | 71.4s |
+| 15 | 92.5% | 914 | 71.3s |
+| 20 | 92.8% | 952 | 104.6s |
+| 25 | **94.2%** | 965 | 105.6s |
+| 30 | 93.0% | 966 | 70.8s |
+
+**Best**: 94.2% @ iter 25
+
+### Notes
+- **First successful GPU-based DPPO RL finetune** — zero_qvel eliminates GPU-CPU eval gap, making GPU training viable
+- **3.5x faster than CPU finetune**: ~70s/iter (GPU) vs ~233s/iter (CPU). 30 iters in ~35 min
+- Surpasses previous CPU finetune best (90.3% @ iter 20, 1M pretrain) despite using weaker pretrain (only 50k)
+- **Critical settings that prevented crash**: `minibatch_size=10000` (not 500), `min_logprob_denoising_std=0.01` (not 0.1). Previous attempt with wrong defaults crashed at iter 3 (succ 438→64→14)
+- Convergence curve shows rapid improvement iter 1-10, then plateau 10-30. Slight drop at iter 30 is normal variance
+- **Code fixes applied in this session**: (1) zero out actions for done envs in action chunk, (2) eval tracks first episode only per env slot, (3) episode-level success counting, (4) exp_name generated after checkpoint param override
+
+---
+
+## [PegInsertion IL Policy Coverage Analysis — GPU Parallel] - 2026-03-01 20:23
+
+**Command**:
+```bash
+python -u dp_p_success_cpu.py \
+  --ckpt runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 \
+  --control_mode pd_joint_delta_pos \
+  --max_episode_steps 300 \
+  --num-states 200 \
+  --mc-samples 16 \
+  --zero_qvel \
+  --gpu
+```
+**Git**: 54b5382 (main)
+**Output**: `runs/dp_p_success_cpu.png`, `runs/dp_p_success_cpu.npz`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| checkpoint | dppo_pretrain_peg_zeroqvel_500k/best.pt (50k iter IL policy) |
+| env_id | PegInsertionSide-v1 |
+| zero_qvel | True |
+| num_states | 200 |
+| mc_samples | 16 |
+| mode | GPU parallel (3200 envs) |
+| total time | **62 seconds** (vs ~40 min CPU) |
+
+### Results — P(success|s₀) Distribution
+| Metric | Value |
+|--------|-------|
+| SR | 60.5% |
+| frac_zero (P=0) | **0.0%** |
+| frac_one (P=1) | 0.0% |
+| frac_decisive (0.1<P<0.9) | **98.5%** |
+| mean P | 0.605 |
+| std P | 0.130 |
+
+**Fine-grained distribution (0.1 bins)**:
+| Bin | Count | Frac |
+|-----|-------|------|
+| [0.0,0.1) | 0 | 0.0% |
+| [0.1,0.2) | 1 | 0.5% |
+| [0.2,0.3) | 0 | 0.0% |
+| [0.3,0.4) | 13 | 6.5% |
+| [0.4,0.5) | 13 | 6.5% |
+| [0.5,0.6) | 63 | 31.5% |
+| [0.6,0.7) | 73 | 36.5% |
+| [0.7,0.8) | 26 | 13.0% |
+| [0.8,0.9) | 8 | 4.0% |
+| [0.9,1.0) | 3 | 1.5% |
+
+### Notes
+- **Zero dead zones** (frac_zero=0%) — every initial state has nonzero success probability. RL always has learning signal.
+- **98.5% decisive** — almost all states have uncertain outcomes, maximizing learning potential for RL finetuning.
+- Distribution is unimodal, centered at 0.5-0.7 (68% of states). No bimodality unlike BC policies (which are typically extreme: all-or-nothing).
+- This explains the smooth finetune curve (59%→94% in 25 iters): excellent coverage means RL can improve everywhere.
+- **Comparison with other tasks/policies**:
+
+| Policy | Task | frac_zero | frac_decisive | SR |
+|--------|------|-----------|---------------|-----|
+| PPO ckpt_76 | PickCube | 1.2% | 96.2% | 43.8% |
+| PPO ckpt_231 | PegInsertion | 0.0% | 65.8% | 76.7% |
+| PPO ckpt_481 | StackCube | 25.2% | 40.8% | ~70% |
+| **DP IL (this)** | **PegInsertion** | **0.0%** | **98.5%** | **60.5%** |
+
+- DP IL policy has BETTER coverage than PPO checkpoint for PegInsertion (98.5% vs 65.8% decisive). The diffusion sampling noise provides natural exploration, making every state learnable.
+- **GPU parallel coverage is 40x faster** than CPU sequential (62s vs ~40min for 200 states × MC16)
+
+---
+
+## [DPPO Finetune Code Fixes — 4 Bug Fixes] - 2026-03-01 20:23
+
+**Git**: 54b5382 (main)
+**Files Modified**: `DPPO/finetune.py`, `DPPO/pretrain.py`, `dp_p_success_cpu.py`
+
+### Bug Fixes Applied
+
+1. **[High] Action chunk state pollution** (`finetune.py`): After env terminates mid-action-chunk, remaining actions were applied to the newly reset episode. Fix: zero out actions for already-done envs (`action[step_done] = 0.0`).
+
+2. **[Medium-High] Eval partial-reset inflation** (`finetune.py`): `evaluate_gpu_inline` tracked `success_once` across partial resets, inflating success rate. Fix: added `ep_done` mask to only track first episode per env slot; early break when all done.
+
+3. **[Medium] Misleading success counter** (`finetune.py`): `n_success_rollout` counted per-step `reward > 0.5`, not episode-level success. Fix: count only on episode boundary (`newly_done & reward > 0.5`), renamed log key to `rollout_ep_successes`.
+
+4. **[Low] exp_name timing** (`finetune.py`): exp_name was generated before checkpoint params override. Fix: moved generation after checkpoint loading.
+
+5. **[Pretrain] LR scheduler double-restore** (`pretrain.py`): Resume loaded scheduler state AND fast-forwarded by start_iter steps. Fix: skip fast-forward when scheduler was restored from checkpoint.
+
+6. **[Pretrain] Old checkpoint EMA overwrite** (`pretrain.py`): Without `ema_state` in checkpoint, `ema.copy_to(ema_model)` at eval overwrote loaded ema_model with fresh EMA. Fix: sync ema shadow params from loaded ema_model.
+
+7. **[Pretrain] EMA device mismatch** (`pretrain.py`): After `ema.load_state_dict()`, shadow params could end up on CPU due to deepcopy. Fix: `ema.shadow_params = [p.to(device) for p in ema.shadow_params]`.
+
+8. **[Coverage] GPU parallel mode** (`dp_p_success_cpu.py`): Added `--gpu` flag for parallel coverage analysis using `num_states * mc_samples` GPU envs with state dict copying. 40x faster than CPU sequential.
+
+9. **[Coverage] zero_qvel support** (`dp_p_success_cpu.py`): Added `--zero_qvel` flag, auto-inherited from checkpoint args.
+

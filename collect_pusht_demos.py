@@ -1,4 +1,7 @@
-"""Collect Push-T demos by rolling out a PPO checkpoint."""
+"""Collect Push-T demos by rolling out a PPO checkpoint.
+
+Saves state obs + actions, and optionally RGB images from env.render().
+"""
 import os
 import argparse
 import h5py
@@ -34,12 +37,15 @@ def main():
     parser.add_argument("--num_trajs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--save_rgb", action="store_true", help="Save RGB images from env.render()")
+    parser.add_argument("--render_size", type=int, default=128, help="Render image size")
     args = parser.parse_args()
 
     args.ckpt = os.path.expanduser(args.ckpt)
     if args.output is None:
+        suffix = "rgb" if args.save_rgb else "state"
         args.output = os.path.expanduser(
-            f"~/.maniskill/demos/{args.env_id}/rl/trajectory.state.{args.control_mode}.collected.h5"
+            f"~/.maniskill/demos/{args.env_id}/rl/trajectory.{suffix}.{args.control_mode}.collected.h5"
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -56,10 +62,13 @@ def main():
     actor.eval()
 
     # Create vectorized env on GPU for speed
+    render_kwargs = {}
+    if args.save_rgb:
+        render_kwargs["human_render_camera_configs"] = {"width": args.render_size, "height": args.render_size}
     env = gym.make(args.env_id, obs_mode="state", control_mode=args.control_mode,
                    render_mode="rgb_array", max_episode_steps=args.max_episode_steps,
                    num_envs=args.num_envs, sim_backend="physx_cuda",
-                   reconfiguration_freq=1)
+                   reconfiguration_freq=1, **render_kwargs)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     f = h5py.File(args.output, "w")
@@ -70,11 +79,19 @@ def main():
     # Storage for current episodes
     obs_buf = [[] for _ in range(args.num_envs)]
     act_buf = [[] for _ in range(args.num_envs)]
+    img_buf = [[] for _ in range(args.num_envs)] if args.save_rgb else None
 
     obs, _ = env.reset(seed=args.seed)
-    # obs shape: (num_envs, obs_dim)
     for i in range(args.num_envs):
         obs_buf[i].append(obs[i].cpu().numpy())
+
+    if args.save_rgb:
+        imgs = env.render().cpu().numpy()  # (num_envs, H, W, 3)
+        for i in range(args.num_envs):
+            img_buf[i].append(imgs[i])
+
+    # Track which envs just reset (to avoid saving 1-step truncated episodes)
+    just_reset = torch.zeros(args.num_envs, dtype=torch.bool)
 
     while traj_id < args.num_trajs:
         with torch.no_grad():
@@ -86,8 +103,12 @@ def main():
         for i in range(args.num_envs):
             act_buf[i].append(action[i].cpu().numpy())
 
+        if args.save_rgb:
+            imgs = env.render().cpu().numpy()
+            for i in range(args.num_envs):
+                img_buf[i].append(imgs[i])
+
         done = terminated | truncated
-        # Check which envs are done
         if done.any():
             done_indices = done.nonzero(as_tuple=False).squeeze(-1).cpu().tolist()
             if isinstance(done_indices, int):
@@ -97,28 +118,43 @@ def main():
                 if traj_id >= args.num_trajs:
                     break
 
-                obs_arr = np.array(obs_buf[idx])    # (T+1, obs_dim)
-                act_arr = np.array(act_buf[idx])     # (T, act_dim)
+                # Skip 1-step episodes from immediate post-reset termination
+                if len(act_buf[idx]) <= 1 and just_reset[idx]:
+                    obs_buf[idx] = []
+                    act_buf[idx] = []
+                    if args.save_rgb:
+                        img_buf[idx] = []
+                    continue
+
+                obs_arr = np.array(obs_buf[idx])
+                act_arr = np.array(act_buf[idx])
                 success = bool(info.get("success", torch.zeros(1))[idx])
 
                 grp = f.create_group(f"traj_{traj_id}")
                 grp.create_dataset("obs", data=obs_arr)
                 grp.create_dataset("actions", data=act_arr)
+                if args.save_rgb:
+                    img_arr = np.array(img_buf[idx])  # (T+1, H, W, 3) uint8
+                    grp.create_dataset("rgb", data=img_arr, compression="gzip", compression_opts=4)
                 grp.attrs["success"] = success
                 grp.attrs["length"] = len(act_arr)
 
                 traj_id += 1
                 pbar.update(1)
 
-                # Reset buffer for this env
                 obs_buf[idx] = []
                 act_buf[idx] = []
+                if args.save_rgb:
+                    img_buf[idx] = []
 
-        # Store next obs for continuing envs
+        # After processing done, start new episodes for done envs
+        just_reset = done.cpu()
         for i in range(args.num_envs):
             if done[i]:
-                # After reset, info contains the new obs
+                # New episode starts with the auto-reset obs
                 obs_buf[i].append(next_obs[i].cpu().numpy())
+                if args.save_rgb:
+                    img_buf[i].append(imgs[i])
             else:
                 obs_buf[i].append(next_obs[i].cpu().numpy())
 
@@ -137,6 +173,8 @@ def main():
     print(f"Success: {successes}/{n} = {successes/n*100:.1f}%")
     print(f"Length: mean={np.mean(lengths):.1f}, min={min(lengths)}, max={max(lengths)}")
     print(f"obs shape: {f['traj_0/obs'].shape}, actions shape: {f['traj_0/actions'].shape}")
+    if args.save_rgb and "rgb" in f["traj_0"]:
+        print(f"rgb shape: {f['traj_0/rgb'].shape}, dtype: {f['traj_0/rgb'].dtype}")
     f.close()
 
 

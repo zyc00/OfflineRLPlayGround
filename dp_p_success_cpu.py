@@ -54,6 +54,10 @@ class Args:
     """If set, use DDIM sampling with this many steps instead of full DDPM."""
     ddim_eta: float = 1.0
     """DDIM eta (EtaFixed base_eta): 0=deterministic DDIM, 1=DDPM-like (original DPPO uses 1)."""
+    zero_qvel: bool = False
+    """Zero out qvel dims (9:18) in obs — must match pretrain setting."""
+    gpu: bool = False
+    """Use GPU parallel rollout (much faster). All num_states*mc_samples envs run simultaneously."""
     # DP architecture args (must match training)
     obs_horizon: int = 2
     act_horizon: int = 8
@@ -109,7 +113,8 @@ class DPAgent(nn.Module):
 
 
 def run_mc(agent, num_states, mc_samples, max_steps, device, seed_offset=0,
-           env_id="PickCube-v1", control_mode="pd_ee_delta_pos", obs_horizon=2):
+           env_id="PickCube-v1", control_mode="pd_ee_delta_pos", obs_horizon=2,
+           zero_qvel=False):
     """Run MC rollouts with vectorized envs (mc_samples parallel envs per state)."""
     p_success = np.zeros(num_states)
     t0 = time.time()
@@ -143,6 +148,8 @@ def run_mc(agent, num_states, mc_samples, max_steps, device, seed_offset=0,
 
         while step < max_steps and not done.all():
             obs_t = torch.from_numpy(obs).float().to(device)
+            if zero_qvel:
+                obs_t[..., 9:18] = 0.0
             action_seq = agent.get_action(obs_t)  # (mc_samples, act_horizon, act_dim)
             action_np = action_seq.cpu().numpy()
 
@@ -174,6 +181,101 @@ def run_mc(agent, num_states, mc_samples, max_steps, device, seed_offset=0,
             print(f"  {i+1}/{num_states} done ({elapsed:.0f}s), SR={sr:.1%}, frac_zero={fz:.1%}", flush=True)
 
     envs.close()
+    return p_success
+
+
+def run_mc_gpu(agent, num_states, mc_samples, max_steps, device,
+               env_id="PickCube-v1", control_mode="pd_joint_delta_pos",
+               obs_horizon=2, zero_qvel=False):
+    """GPU parallel MC rollout: all num_states * mc_samples envs run simultaneously."""
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
+    total_envs = num_states * mc_samples
+    print(f"Creating {total_envs} GPU envs ({num_states} states × {mc_samples} MC)...")
+    t0 = time.time()
+
+    env = gym.make(env_id, num_envs=total_envs, obs_mode="state",
+                   control_mode=control_mode, max_episode_steps=max_steps,
+                   sim_backend="gpu", reward_mode="sparse")
+    env = ManiSkillVectorEnv(env, total_envs, ignore_terminations=True, record_metrics=True)
+
+    # Reset all envs → each gets a random state
+    obs, _ = env.reset()
+    obs = obs.float().to(device)
+
+    # Copy state: for each group of mc_samples envs, replicate state from first env
+    state = env.unwrapped.get_state_dict()
+    # state contains tensors of shape (total_envs, ...).
+    # For each state i, copy env[i*mc] to env[i*mc+1..i*mc+mc-1]
+    for key in state:
+        if isinstance(state[key], torch.Tensor) and state[key].shape[0] == total_envs:
+            for s in range(num_states):
+                base = s * mc_samples
+                state[key][base+1:base+mc_samples] = state[key][base:base+1].expand(mc_samples-1, *state[key].shape[1:])
+    env.unwrapped.set_state_dict(state)
+    # Re-observe after state set
+    obs = env.unwrapped.get_obs()
+    if isinstance(obs, dict):
+        obs = obs["state"] if "state" in obs else obs["obs"]
+    obs = obs.float().to(device)
+
+    # Build obs_history: (total_envs, cond_steps, obs_dim)
+    obs_dim = obs.shape[-1]
+    obs_history = obs.unsqueeze(1).repeat(1, obs_horizon, 1)
+
+    success = torch.zeros(total_envs, dtype=torch.bool, device=device)
+    done = torch.zeros(total_envs, dtype=torch.bool, device=device)
+
+    step = 0
+    n_decision_steps = max_steps // agent.act_steps + 1 if hasattr(agent, 'act_steps') else max_steps
+
+    print(f"Running rollout (max {max_steps} steps)...")
+    while step < max_steps:
+        obs_input = obs_history.clone()
+        if zero_qvel:
+            obs_input[..., 9:18] = 0.0
+
+        with torch.no_grad():
+            action_seq = agent.get_action(obs_input)  # (total_envs, act_horizon, act_dim)
+
+        act_horizon = action_seq.shape[1]
+        for a_idx in range(act_horizon):
+            if step >= max_steps:
+                break
+            action = action_seq[:, a_idx]
+            # Zero actions for already-done envs
+            if done.any():
+                action = action.clone()
+                action[done] = 0.0
+
+            obs_new, reward, terminated, truncated, info = env.step(action)
+            obs_new = obs_new.float()
+            reward_t = reward.float()
+
+            newly_done = (reward_t > 0.5) & ~done
+            success |= newly_done
+
+            rm = (terminated.bool() | truncated.bool()) & ~done
+            done = done | rm
+
+            # Update obs_history
+            if rm.any():
+                obs_history[rm] = obs_new[rm].unsqueeze(1).repeat(1, obs_horizon, 1)
+            obs_history[~rm] = torch.cat(
+                [obs_history[~rm, 1:], obs_new[~rm].unsqueeze(1)], dim=1)
+            step += 1
+
+        if done.all():
+            break
+
+    env.close()
+
+    # Reshape: (num_states, mc_samples) → P(success) per state
+    success_mat = success.cpu().numpy().reshape(num_states, mc_samples)
+    p_success = success_mat.mean(axis=1)
+
+    elapsed = time.time() - t0
+    print(f"Done in {elapsed:.0f}s. SR={p_success.mean():.1%}")
     return p_success
 
 
@@ -294,10 +396,21 @@ if __name__ == "__main__":
     print()
 
     # Run P(success) analysis (vectorized MC)
-    p = run_mc(agent, args.num_states, args.mc_samples, args.max_episode_steps,
-               device, seed_offset=args.seed,
-               env_id=args.env_id, control_mode=args.control_mode,
-               obs_horizon=args.obs_horizon)
+    # Auto-detect zero_qvel from checkpoint
+    if not args.zero_qvel and ckpt.get("args", {}).get("zero_qvel", False):
+        args.zero_qvel = True
+        print("  Inherited zero_qvel=True from checkpoint")
+
+    if args.gpu:
+        p = run_mc_gpu(agent, args.num_states, args.mc_samples, args.max_episode_steps,
+                       device, env_id=args.env_id, control_mode=args.control_mode,
+                       obs_horizon=cond_steps if (is_dppo_pretrain or is_dppo_finetune) else args.obs_horizon,
+                       zero_qvel=args.zero_qvel)
+    else:
+        p = run_mc(agent, args.num_states, args.mc_samples, args.max_episode_steps,
+                   device, seed_offset=args.seed,
+                   env_id=args.env_id, control_mode=args.control_mode,
+                   obs_horizon=args.obs_horizon, zero_qvel=args.zero_qvel)
 
     sr = p.mean()
     fz = (p == 0).mean()
@@ -314,9 +427,37 @@ if __name__ == "__main__":
     print(f"  mean P     = {p.mean():.3f}")
     print(f"  std P      = {p.std():.3f}")
 
+    # Fine-grained bins (0.1 intervals) — markdown table
+    bin_edges = np.arange(0, 1.1, 0.1)
+    bin_counts = []
+    bin_fracs = []
+    for i in range(len(bin_edges) - 1):
+        lo, hi = bin_edges[i], bin_edges[i+1]
+        if i == len(bin_edges) - 2:  # last bin: include 1.0
+            count = int(((p >= lo) & (p <= hi)).sum())
+        else:
+            count = int(((p >= lo) & (p < hi)).sum())
+        bin_counts.append(count)
+        bin_fracs.append(count / len(p))
+
+    # Header row: | Bin | [0,0.1) | [0.1,0.2) | ... | [0.9,1.0] |
+    labels = [f"[{bin_edges[i]:.1f},{bin_edges[i+1]:.1f})" for i in range(len(bin_edges)-2)]
+    labels.append(f"[{bin_edges[-2]:.1f},{bin_edges[-1]:.1f}]")
+    header = "| " + " | ".join(["Metric"] + labels) + " |"
+    sep = "|" + "|".join(["---"] * (len(labels) + 1)) + "|"
+    count_row = "| Count | " + " | ".join(f"{c}" for c in bin_counts) + " |"
+    frac_row = "| Frac | " + " | ".join(f"{f:.1%}" for f in bin_fracs) + " |"
+    bar_row = "| Bar | " + " | ".join("#" * max(1, int(f * 40)) if f > 0 else "" for f in bin_fracs) + " |"
+
+    print(f"\n{header}")
+    print(sep)
+    print(count_row)
+    print(frac_row)
+    print(bar_row)
+
     # Plot
     fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-    bins = np.linspace(0, 1, 18)
+    bins = np.linspace(0, 1, 11)  # 10 bins, 0.1 each
     ax.hist(p, bins=bins, color="steelblue", edgecolor="black", linewidth=0.5, alpha=0.8)
     ax.axvline(sr, color="red", ls="--", lw=2, label=f"SR={sr:.1%}")
 
