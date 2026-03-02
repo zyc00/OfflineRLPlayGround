@@ -5527,3 +5527,93 @@ python -u dp_p_success_cpu.py \
 
 9. **[Coverage] zero_qvel support** (`dp_p_success_cpu.py`): Added `--zero_qvel` flag, auto-inherited from checkpoint args.
 
+---
+
+## [Filtered BC Finetuning for DPPO] - 2026-03-01
+
+**Git**: c2c3646 (main)
+**Script**: `DPPO/finetune_filtered_bc.py`
+**Checkpoint**: `runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt` (PegInsertionSide-v1, pd_joint_delta_pos, zero_qvel)
+
+### Pretrained Policy Coverage (dp_p_success_gpu.py, 200 states × MC16, zero_qvel)
+
+| Metric | Deterministic | Stochastic (std=0.01) |
+|--------|--------------|----------------------|
+| SR | 56.5% | 55.2% |
+| frac_zero | 7.5% | 5.5% |
+| frac_one | 5.5% | 2.5% |
+| frac_decisive | 77.5% | 82.5% |
+
+Deterministic vs stochastic nearly identical — std=0.01 noise is negligible for this policy.
+
+**Bug found**: `dp_p_success_gpu.py` lacked zero_qvel support — without it, SR=3% (model receives unmasked qvel, distribution mismatch). Fixed by adding `--zero_qvel` flag with auto-inherit from checkpoint.
+
+### Run 1: Naive filtered BC (no demo mixing) — COLLAPSED
+
+**Command**:
+```bash
+python -u -m DPPO.finetune_filtered_bc \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 200 --sim_backend gpu \
+  --use_ddim --ddim_steps 10 --n_steps 100 \
+  --n_train_itr 30 --eval_freq 5 \
+  --bc_gradient_steps 200 --bc_lr 1e-4 \
+  --min_sampling_denoising_std 0.01 \
+  --zero_qvel \
+  --num_eval_episodes 500 \
+  --exp_name fbc_peg_warmstart
+```
+
+**Run Dir**: `runs/dppo_filtered_bc/fbc_peg_warmstart/`
+
+| Iter | Rollout SR | Eval SR | Queue |
+|------|-----------|---------|-------|
+| 1 | 57.0% | 55.7% | 8.8k |
+| 5 | 25.8% | 28.5% | 30.7k |
+| 10 | 23.3% | 26.3% | 46.5k |
+| 15 | 22.8% | — | 65.8k |
+
+**Killed early.** Classic self-bootstrap degradation: policy略变差 → 数据质量降 → BC拟合差数据 → policy更差。
+
+**Root causes**:
+1. No demo anchor — queue全是online data，无稳定基准
+2. lr=1e-4 + 200 gradient steps过于aggressive，catastrophic forgetting
+3. Filter太松（return > 0），成功episode的早期差action也入queue
+
+### Run 2: Demo mixing + conservative training — STABLE IMPROVEMENT
+
+**Command**:
+```bash
+python -u -m DPPO.finetune_filtered_bc \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --demo_path ~/.maniskill/demos/PegInsertionSide-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --sim_backend gpu \
+  --use_ddim --ddim_steps 10 --n_steps 100 \
+  --n_train_itr 30 --eval_freq 5 \
+  --bc_gradient_steps 50 --bc_lr 1e-5 \
+  --demo_ratio 0.5 \
+  --min_sampling_denoising_std 0.01 \
+  --zero_qvel \
+  --num_eval_episodes 500 \
+  --exp_name fbc_peg_demomix50_lr1e5
+```
+
+**Run Dir**: `runs/dppo_filtered_bc/fbc_peg_demomix50_lr1e5/`
+**Key changes**: demo_ratio=0.5 (50% MP demos + 50% online), lr 10x lower (1e-5), gradient steps 4x fewer (50), n_envs 2.5x more (500)
+
+| Iter | Rollout SR | Eval SR |
+|------|-----------|---------|
+| 1 | 54.0% | 68.6% |
+| 5 | 63.2% | 64.4% |
+| 10 | 71.3% | 71.4% |
+| 15 | 69.4% | 73.6% |
+
+**Still running.** Stable improvement, no collapse. Demo anchor prevents forgetting, low lr prevents overshooting.
+
+### Code Changes
+
+- `DPPO/finetune_filtered_bc.py`: Bug fixes (eval partial-reset, action chunk pollution, rollout success counting), added zero_qvel, cold_start, CSV logging, demo_ratio mixing, summary plots, coverage analysis
+- `dp_p_success_gpu.py`: Added `--zero_qvel` flag with auto-inherit from checkpoint
+

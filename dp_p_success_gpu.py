@@ -44,6 +44,8 @@ class Args:
     min_sampling_denoising_std: float = 0.01
     deterministic: bool = False
     """Use deterministic DDIM (no noise). Overrides min_sampling_denoising_std."""
+    zero_qvel: bool = False
+    """Zero out qvel dims (9:18). Auto-inherited from checkpoint if stored."""
     ddim_steps: int = 10
     ddim_eta: float = 1.0
     output: Optional[str] = None
@@ -105,10 +107,16 @@ def main():
         model.eta.eta_logit.data = torch.atanh(torch.tensor([0.999]))
     model.eval()
 
+    # Auto-inherit zero_qvel from checkpoint
+    if ckpt_args.get("zero_qvel", False) and not args.zero_qvel:
+        args.zero_qvel = True
+
     print(f"Loaded: {args.ckpt}")
     print(f"  obs_dim={obs_dim}, act_dim={act_dim}, cond_steps={cond_steps}")
     print(f"  horizon={horizon_steps}, act_steps={act_steps}, act_offset={act_offset}")
     print(f"  DDIM steps={args.ddim_steps}, min_std={args.min_sampling_denoising_std}, deterministic={args.deterministic}")
+    if args.zero_qvel:
+        print(f"  zero_qvel=True (dims 9:18 zeroed)")
     print(f"Coverage: {args.num_states} states x {args.mc_samples} MC samples")
     print()
 
@@ -147,7 +155,11 @@ def main():
         for step_block in range(n_steps_per_ep):
             if done.all():
                 break
-            cond = {"state": obs_history}
+            obs_cond = obs_history
+            if args.zero_qvel:
+                obs_cond = obs_cond.clone()
+                obs_cond[..., 9:18] = 0.0
+            cond = {"state": obs_cond}
             with torch.no_grad():
                 samples = model(
                     cond, deterministic=args.deterministic,
