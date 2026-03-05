@@ -408,6 +408,9 @@ In offline RL, data is forced to serve BOTH roles: (1) providing states, and (2)
 - `RL/p_success_analysis.py` — PPO/Gaussian policy，cuda env，分析轨迹中每个state的P(success|s)
 - `bc_p_success_cpu.py` — BC policy，cpu env，支持noise sweep分析确定性policy的bimodality
 - `dp_p_success_cpu.py` — dp_train格式的Diffusion Policy，cpu env，MC rollouts on initial states
+- `dp_p_success_gpu.py` — DPPO格式的Diffusion Policy，gpu env，支持pretrain和finetune checkpoint
+
+**IMPORTANT**: `dp_p_success_gpu.py`运行PegInsertionSide时必须加`--control_mode pd_joint_delta_pos --max_episode_steps 200 --zero_qvel`，否则control_mode默认pd_ee_delta_pos（obs_dim不匹配报错），max_episode_steps默认100（太短），zero_qvel不加会导致GPU eval严重低估。
 
 ### 17. StackCube BC: MLP Fails, Need Stronger IL Methods
 

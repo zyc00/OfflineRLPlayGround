@@ -11,6 +11,7 @@ Usage:
     python -m DPPO.finetune --pretrain_checkpoint runs/dppo_pretrain/dppo_1000traj_unet_5k/ckpt_1500.pt
 """
 
+import copy
 import os
 import time
 import numpy as np
@@ -104,10 +105,110 @@ class Args:
     # Augmentation
     zero_qvel: bool = False  # Zero out qvel dims (9:18) — eliminates GPU/CPU eval gap
 
+    # MC critic: replace learned critic with MC rollout V(s) estimates
+    mc_critic: bool = False
+    """Use MC rollouts to estimate V(s) instead of learned critic. Tests whether accurate
+    values enable higher UTD without collapse."""
+    mc_critic_samples: int = 16
+    """Number of MC rollout samples per state for V(s) estimation."""
+
     # Logging
     exp_name: Optional[str] = None
     seed: int = 0
     save_dir: str = "runs/dppo_finetune"
+
+
+@torch.no_grad()
+def _mc_estimate_values(saved_states, mc_envs, model, args,
+                        normalize_obs, denormalize_actions, act_offset, device):
+    """Estimate V(s) for each saved state using MC rollouts.
+
+    For each state, runs mc_critic_samples rollouts with current policy.
+    V(s) = E[sum gamma^t r_t] — discounted return, consistent with GAE.
+
+    Args:
+        saved_states: list of state_dicts, length n_steps+1
+        mc_envs: env with n_envs * mc_critic_samples envs
+
+    Returns:
+        values: tensor (n_steps+1, n_envs)
+    """
+    n_states = len(saved_states)
+    mc = args.mc_critic_samples
+    n_envs = args.n_envs
+    n_mc = n_envs * mc
+    max_blocks = args.max_episode_steps // args.act_steps + 1
+    gamma = args.gamma
+
+    model.eval()
+    values = torch.zeros(n_states, n_envs, device=device)
+    # Use inference_mode to skip gradient computation — MC estimation is forward-only
+
+    def _replicate_state(state, n_envs, mc):
+        """Recursively replicate state dict tensors: (n_envs,...) -> (n_envs*mc,...)."""
+        out = {}
+        for k, v in state.items():
+            if isinstance(v, dict):
+                out[k] = _replicate_state(v, n_envs, mc)
+            elif isinstance(v, torch.Tensor) and v.shape[0] == n_envs:
+                out[k] = v.repeat_interleave(mc, dim=0)
+            else:
+                out[k] = v
+        return out
+
+    import time as _time
+    _mc_t0 = _time.time()
+    with torch.inference_mode():
+        for t in range(n_states):
+            _st = _time.time()
+            mc_state = _replicate_state(saved_states[t], n_envs, mc)
+            mc_envs.unwrapped.set_state_dict(mc_state)
+            obs_mc = mc_envs.unwrapped.get_obs()
+            if isinstance(obs_mc, torch.Tensor):
+                obs_mc = obs_mc.float().to(device)
+            else:
+                obs_mc = torch.from_numpy(np.array(obs_mc)).float().to(device)
+
+            obs_h = obs_mc.unsqueeze(1).repeat(1, args.cond_steps, 1)
+            mc_returns = torch.zeros(n_mc, device=device)
+            done = torch.zeros(n_mc, dtype=torch.bool, device=device)
+
+            for block in range(max_blocks):
+                if done.all():
+                    break
+                cond = {"state": normalize_obs(obs_h)}
+                samples = model(cond, deterministic=False, return_chain=False)
+                actions = denormalize_actions(samples.trajectories)
+
+                # Accumulate reward within decision block (no intra-block discount)
+                block_reward = torch.zeros(n_mc, device=device)
+                for a_idx in range(args.act_steps):
+                    act_idx = act_offset + a_idx
+                    action = actions[:, min(act_idx, actions.shape[1] - 1)]
+                    if done.any():
+                        action = action.clone()
+                        action[done] = 0.0
+
+                    obs_new, rew, term, trunc, _ = mc_envs.step(action)
+                    obs_new = obs_new.float().to(device)
+                    active = ~done
+                    block_reward[active] += rew.float()[active]
+                    rm = term.bool() | trunc.bool()
+                    done |= rm
+                    if rm.any():
+                        obs_h[rm] = obs_new[rm].unsqueeze(1).repeat(1, args.cond_steps, 1)
+                    obs_h[~rm] = torch.cat([obs_h[~rm, 1:], obs_new[~rm].unsqueeze(1)], dim=1)
+
+                # Discount per decision block, consistent with GAE
+                mc_returns += (gamma ** block) * block_reward
+
+            values[t] = mc_returns.reshape(n_envs, mc).mean(dim=1)
+            _elapsed = _time.time() - _st
+            _total = _time.time() - _mc_t0
+            _eta = _total / (t + 1) * (n_states - t - 1)
+            print(f"  MC state {t+1}/{n_states}: V={values[t].mean():.4f} ({_elapsed:.1f}s, ETA {_eta:.0f}s)", flush=True)
+
+    return values
 
 
 def main():
@@ -294,6 +395,29 @@ def main():
         seed_pool=seed_pool,
     )
 
+    # MC critic setup: create separate envs for value estimation
+    mc_envs = None
+    if args.mc_critic:
+        mc_n_envs = args.n_envs * args.mc_critic_samples
+        mc_envs = make_train_envs(
+            env_id=args.env_id,
+            num_envs=mc_n_envs,
+            sim_backend=args.sim_backend,
+            control_mode=args.control_mode,
+            max_episode_steps=args.max_episode_steps,
+            seed=args.seed + 10000,
+        )
+        mc_envs.reset(seed=args.seed + 10000)
+        # MC critic: disable reward scaling (raw rewards match MC V scale)
+        reward_scaler = None
+        args.reward_scale_const = 1.0
+        # No critic warmup needed
+        args.n_critic_warmup_itr = 0
+        # Skip critic loss
+        args.vf_coef = 0.0
+        print(f"  MC critic: {args.mc_critic_samples} samples × {args.n_envs} envs = {mc_n_envs} MC envs")
+        print(f"  Disabled: reward_scale_running, critic warmup, critic loss")
+
     n_decision_steps = args.n_steps
     K = args.ft_denoising_steps
     assert K > 1, (
@@ -401,10 +525,15 @@ def main():
         reward_trajs = []       # (n_steps, n_envs)
         done_trajs = []         # (n_steps, n_envs) terminated | truncated
         value_trajs = []        # (n_steps, n_envs)
+        saved_states = []       # state_dicts for MC critic (only if mc_critic)
 
         n_success_rollout = 0
 
         for step in range(n_decision_steps):
+            # Save physics state for MC critic (before action execution)
+            if args.mc_critic and use_gpu_env:
+                saved_states.append(copy.deepcopy(train_envs.unwrapped.get_state_dict()))
+
             obs_norm = normalize_obs(obs_history)
             cond = {"state": obs_norm}
 
@@ -483,9 +612,21 @@ def main():
         rewards = rewards * args.reward_scale_const
 
         # ===== 3. GAE COMPUTATION =====
-        with torch.no_grad():
-            obs_norm_last = normalize_obs(obs_history)
-            next_value = model.critic({"state": obs_norm_last}).squeeze(-1)
+        if args.mc_critic and use_gpu_env:
+            # Save state after last rollout step for next_value
+            saved_states.append(copy.deepcopy(train_envs.unwrapped.get_state_dict()))
+            # MC estimate V(s) for all saved states
+            mc_values = _mc_estimate_values(
+                saved_states, mc_envs, model, args,
+                normalize_obs, denormalize_actions, act_offset, device,
+            )
+            values = mc_values[:n_decision_steps]  # (n_steps, n_envs)
+            next_value = mc_values[n_decision_steps]  # (n_envs,)
+            saved_states.clear()  # free memory
+        else:
+            with torch.no_grad():
+                obs_norm_last = normalize_obs(obs_history)
+                next_value = model.critic({"state": obs_norm_last}).squeeze(-1)
 
         advantages = torch.zeros_like(rewards)
         lastgaelam = 0

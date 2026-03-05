@@ -108,7 +108,7 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
 
     device = torch.device("cuda")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    is_finetune = "iteration" in ckpt and "model" in ckpt
+    is_finetune = "model" in ckpt and "ema" not in ckpt
     # For finetuned checkpoints, use pretrain_args for architecture
     args = ckpt.get("pretrain_args", ckpt["args"]) if is_finetune else ckpt["args"]
 
@@ -148,7 +148,7 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         final_action_clip_value=1.0,
         predict_epsilon=True,
     )
-    is_finetune = "iteration" in ckpt and "model" in ckpt
+    is_finetune = "model" in ckpt and "ema" not in ckpt
     if is_finetune:
         # Finetuned: extract actor_ft weights → network.*
         model_sd = ckpt["model"]
@@ -181,6 +181,12 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
             ddim_steps = ft_args.get("ddim_steps", 10)
             print(f"  Using DDIM with {ddim_steps} steps")
 
+    # Auto-inherit zero_qvel from checkpoint args
+    ckpt_args = ckpt["args"]
+    zero_qvel = ckpt_args.get("zero_qvel", False)
+    if zero_qvel:
+        print(f"  zero_qvel=True (auto-inherited from checkpoint)")
+
     metrics = evaluate_cpu_model(
         n_episodes=n_episodes,
         model=model,
@@ -198,6 +204,7 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         no_action_norm=no_action_norm,
         act_offset=act_offset,
         ddim_steps=ddim_steps,
+        zero_qvel=zero_qvel,
     )
     print(f"\nCPU Eval ({n_episodes} eps): success_once={metrics['success_once']:.3f}, "
           f"success_at_end={metrics['success_at_end']:.3f}")

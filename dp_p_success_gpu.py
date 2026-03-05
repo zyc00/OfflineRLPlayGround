@@ -240,7 +240,10 @@ def main():
     out_path = args.output or f"runs/dp_p_success_gpu_ddim{args.ddim_steps}_std{args.min_sampling_denoising_std}.png"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    npz_path = out_path.replace(".png", ".npz")
+    np.savez(npz_path, p_success=p, mc_samples=args.mc_samples, num_states=N)
     print(f"\nSaved plot: {out_path}")
+    print(f"Saved data: {npz_path}")
 
 
 if __name__ == "__main__":

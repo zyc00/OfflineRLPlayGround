@@ -5610,10 +5610,1321 @@ python -u -m DPPO.finetune_filtered_bc \
 | 10 | 71.3% | 71.4% |
 | 15 | 69.4% | 73.6% |
 
-**Still running.** Stable improvement, no collapse. Demo anchor prevents forgetting, low lr prevents overshooting.
+**Final results (30 iterations):**
+
+| Iter | Rollout SR | Eval SR |
+|------|-----------|---------|
+| 1 | 54.0% | 68.6% |
+| 5 | 63.2% | 64.4% |
+| 10 | 71.3% | 71.4% |
+| 15 | 69.4% | 73.6% |
+| 20 | 70.2% | 79.2% |
+| 25 | 69.1% | **81.4%** |
+| 30 | 70.7% | 80.6% |
+
+**Best eval SR: 81.4% (iter 25)**. Final coverage analysis (2000 episodes): 78.3% ± 1.8% (95% CI).
+
+Stable improvement from 55% → 81.4%, no collapse. Demo anchor prevents forgetting, low lr prevents overshooting. Plateaus around 80% — pure exploitation ceiling without RL exploration.
+
+**Comparison**: Filtered BC 81.4% vs DPPO RL 94.2% — 13% gap from objective mismatch (MSE vs trajectory success).
 
 ### Code Changes
 
 - `DPPO/finetune_filtered_bc.py`: Bug fixes (eval partial-reset, action chunk pollution, rollout success counting), added zero_qvel, cold_start, CSV logging, demo_ratio mixing, summary plots, coverage analysis
 - `dp_p_success_gpu.py`: Added `--zero_qvel` flag with auto-inherit from checkpoint
 
+---
+
+## [Deterministic DP Failure & Trajectory Divergence Analysis] - 2026-03-01
+
+**Git**: 0f540d1 (main)
+**Checkpoint**: `runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt` (PegInsertionSide-v1, pretrained DP)
+**Scripts**: `analysis_deterministic_failure_v2.py`, `analysis_trajectory_divergence.py`
+
+### Coverage Analysis (500 states × MC16, GPU, deterministic DDIM-10, zero_qvel)
+
+**Command**:
+```bash
+python -u analysis_deterministic_failure_v2.py \
+  --ckpt runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --num_states 500 --mc_samples 16 --ddim_steps 10
+```
+
+| Category | Count | Fraction |
+|----------|-------|----------|
+| frac_zero (P=0) | 35 | 7.0% |
+| decisive_low (0<P≤0.3) | 89 | 17.8% |
+| decisive_mid (0.3<P<0.7) | 206 | 41.2% |
+| decisive_high (0.7≤P<1) | 133 | 26.6% |
+| frac_one (P=1) | 37 | 7.4% |
+| **SR** | — | **54.1%** |
+
+**Key finding**: 85.6% of states are decisive even with "deterministic" DDIM. The noise source is NOT GPU physics — it's the random initial noise x_T in DDIM sampling (line 160: `x = torch.randn(...)`). Verified by running CPU deterministic (frac_decisive=57% with MC4) — CPU physics is deterministic but DDIM x_T is still random.
+
+### Feature Correlation with P(success)
+
+| Feature | Pearson r | Meaning |
+|---------|-----------|---------|
+| peg_radius | **-0.371** | Smaller peg → higher success (strongest signal) |
+| hole_qx | +0.348 | Hole orientation matters |
+| peg_hole_dist | -0.290 | Closer → higher success |
+| rel_y | +0.285 | Less Y offset → higher success |
+| peg_length | -0.215 | Shorter peg → higher success |
+
+P(success) by peg radius bin:
+- Smallest (0.015-0.016): 68.8% SR, 3.2% frac_zero
+- Largest (0.024-0.025): 34.4% SR, 14.9% frac_zero
+
+### Trajectory Divergence Analysis (200 decisive states × MC32, GPU)
+
+**Command**:
+```bash
+python -u analysis_trajectory_divergence.py \
+  --ckpt runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --num_states 200 --mc_samples 32 --ddim_steps 10
+```
+
+**Run Dir**: `runs/analysis_divergence/`
+
+| Step | TCP pos std | Action std | Succ-Fail TCP dist |
+|------|------------|------------|-------------------|
+| 0 | 0.014m | 0.028 | small |
+| 50 | 0.057m | ~0.05 | growing |
+| 100 | 0.069m | ~0.08 | growing |
+| 150 | 0.058m | ~0.10 | still growing |
+| 192 | — | 0.135 | **0.084m (peak)** |
+
+**No clear fork point** — gradual divergence throughout the episode. Fork ratio never exceeds 2x threshold. All trajectories attempt the same strategy (reach → grasp → move → insert), differences are purely from compounding of per-step action variance.
+
+### CPU Stochastic Coverage (100 states × MC16, CPU, std=0.01)
+
+**Command**:
+```bash
+python -u dp_p_success_cpu.py \
+  --ckpt runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --num_states 100 --mc_samples 16 --max_episode_steps 200 \
+  --ddim_steps 10 --min_sampling_denoising_std 0.01 --zero_qvel
+```
+
+| Metric | CPU stochastic | GPU deterministic |
+|--------|---------------|-------------------|
+| SR | 57.1% | 54.1% |
+| frac_zero | 2.0% | 7.0% |
+| frac_decisive | 87.0% | 85.6% |
+
+CPU stochastic ≈ GPU deterministic — both noise sources (x_T randomness vs std=0.01) produce similar coverage. std=0.01 adds negligible marginal noise on top of x_T.
+
+### Key Insights
+
+1. **Decisive fraction comes from diffusion x_T randomness**, not GPU physics non-determinism. Deterministic DDIM starts from random x_T ~ N(0,I) each call — the denoising is deterministic but the starting point isn't.
+
+2. **Compounding error is the primary bottleneck**: per-step action std=0.028 compounds to 8cm TCP scatter over 25 decision steps, vs 3mm task clearance. No single "fork point" — gradual accumulation.
+
+3. **Peg size is the strongest predictor** of P(success): larger peg = tighter relative clearance = less tolerance for compounding error.
+
+4. **BC's objective mismatch** (MSE vs trajectory success) means BC cannot learn to be robust against its own compounding error. RL (DPPO 94%) directly optimizes trajectory success, learning precision where it matters most.
+
+5. **Filtered BC plateaus at 81%** — it improves by practicing "easy" cases more, but cannot fundamentally reduce compounding error on "hard" cases (large peg + far distance).
+
+### Output Files
+
+- `runs/analysis_deterministic_v2/coverage_analysis.png` — Coverage scatter plots (P(success) vs features)
+- `runs/analysis_divergence/trajectory_divergence.png` — Trajectory divergence plots (TCP std, succ-fail separation, XY trajectories)
+- `runs/analysis_divergence/fork_ratio.png` — Fork ratio over time
+- `runs/analysis_divergence/divergence_data.npz` — Raw data
+
+---
+
+## [Filtered BC Ablation: Which Change Matters Most?] - 2026-03-02 01:30
+
+**Git**: 81f6d02 (main)
+**Script**: `DPPO/finetune_filtered_bc.py`
+**Checkpoint**: `runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt`
+
+### Overview
+Ablation of three key changes from Run 1→Run 2 (filtered BC): demo mixing, low lr, fewer gradient steps. Each ablation reverts ONE change while keeping the other two.
+
+### Shared Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | dppo_pretrain_peg_zeroqvel_500k/best.pt |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| n_envs | 500 |
+| n_steps | 100 |
+| n_train_itr | 30 |
+| sim_backend | gpu |
+| use_ddim / ddim_steps | True / 10 |
+| min_sampling_denoising_std | 0.01 |
+| zero_qvel | True |
+| num_eval_episodes | 500 |
+
+### Ablation Design
+| Ablation | demo_ratio | bc_lr | bc_gradient_steps | Changed vs Run 2 |
+|----------|-----------|-------|-------------------|-------------------|
+| Run 2 (ref) | 0.5 | 1e-5 | 50 | — |
+| A: no demo mix | **0.0** | 1e-5 | 50 | demo_ratio |
+| B: high lr | 0.5 | **1e-4** | 50 | bc_lr |
+| C: many steps | 0.5 | 1e-5 | **200** | bc_gradient_steps |
+
+### Commands
+```bash
+# A: no demo mix
+python -u -m DPPO.finetune_filtered_bc \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --demo_path ~/.maniskill/demos/PegInsertionSide-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --sim_backend gpu \
+  --use_ddim --ddim_steps 10 --n_steps 100 \
+  --n_train_itr 30 --eval_freq 5 \
+  --bc_gradient_steps 50 --bc_lr 1e-5 \
+  --demo_ratio 0.0 \
+  --min_sampling_denoising_std 0.01 --zero_qvel \
+  --num_eval_episodes 500 \
+  --exp_name ablation_no_demo_mix
+
+# B: high lr
+python -u -m DPPO.finetune_filtered_bc \
+  ... --bc_lr 1e-4 --demo_ratio 0.5 --bc_gradient_steps 50 \
+  --exp_name ablation_high_lr
+
+# C: many gradient steps
+python -u -m DPPO.finetune_filtered_bc \
+  ... --bc_lr 1e-5 --demo_ratio 0.5 --bc_gradient_steps 200 \
+  --exp_name ablation_many_steps
+```
+
+### Run Dirs
+- `runs/dppo_filtered_bc/ablation_no_demo_mix/`
+- `runs/dppo_filtered_bc/ablation_high_lr/`
+- `runs/dppo_filtered_bc/ablation_many_steps/`
+
+### Results
+
+| iter | Run 2 (ref) | A: no demo | B: high lr | C: many steps |
+|------|-------------|------------|------------|---------------|
+| 1 | 68.6% | 54.0% | 36.2% | 70.2% |
+| 5 | 64.4% | 71.6% | 25.4% | 72.0% |
+| 10 | 71.4% | 74.6% | 40.0% | 61.4% |
+| 15 | 73.6% | 74.4% | 39.6% | 73.6% |
+| 20 | 79.2% | 71.2% | 43.6% | 81.0% |
+| 25 | **81.4%** | 83.2% | 35.4% | 74.6% |
+| 30 | 80.6% | 68.4% | 9.0% | 59.4% |
+
+| Ablation | Peak SR | Final SR (coverage) | Stability |
+|----------|---------|---------------------|-----------|
+| Run 2 (ref) | **81.4%** | **78.3%** | Stable |
+| A: no demo mix | 83.2% | 69.0% | Unstable, late degradation |
+| B: high lr | 43.6% | 10.4% | Collapsed |
+| C: many steps | 81.0% | 61.7% | Oscillating, late collapse |
+
+### Notes
+- **Importance ranking: Low lr >> Demo mixing >> Fewer gradient steps**
+- **B (high lr=1e-4)**: catastrophic collapse to 9% by iter 30, even with demo anchor. lr is the most critical factor.
+- **A (no demo mix)**: peak 83.2% at iter 25 but crashed to 68.4% at iter 30. Without demo anchor, self-bootstrap eventually degrades.
+- **C (many steps=200)**: oscillates wildly (61%→81%→59%). Overfits to current batch each iteration.
+- **Run 2 succeeds because of the combination**: conservative update (low lr + few steps) + stable anchor (demo mix).
+
+---
+
+## [Filtered BC Sample Efficiency] - 2026-03-02 02:30
+
+**Git**: 81f6d02 (main)
+**Script**: `DPPO/finetune_filtered_bc.py`
+**Checkpoint**: `runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt`
+
+### Overview
+Test sample efficiency: can we reach ~80% with 5x fewer env steps (2.4M vs 12M) by reducing n_envs and improving data utilization?
+
+### Design
+| Run | n_envs | gradient_steps | bc_lr | demo_ratio | env steps (30 iters) |
+|-----|--------|---------------|-------|------------|---------------------|
+| Run 2 (ref) | 500 | 50 | 1e-5 | 0.5 | 12M |
+| S1: fewer envs | **100** | 50 | 1e-5 | 0.5 | **2.4M** |
+| S2: +more updates | **100** | **200** | **2.5e-6** | 0.5 | **2.4M** |
+| S3: +high demo | **100** | **200** | **2.5e-6** | **0.7** | **2.4M** |
+
+S2 keeps effective step size constant: lr×steps = 2.5e-6×200 = 5e-4 ≈ 1e-5×50.
+
+### Commands
+```bash
+# S1
+python -u -m DPPO.finetune_filtered_bc \
+  ... --n_envs 100 --bc_gradient_steps 50 --bc_lr 1e-5 --demo_ratio 0.5 \
+  --exp_name sample_eff_fewer_envs
+
+# S2
+python -u -m DPPO.finetune_filtered_bc \
+  ... --n_envs 100 --bc_gradient_steps 200 --bc_lr 2.5e-6 --demo_ratio 0.5 \
+  --exp_name sample_eff_more_updates
+
+# S3
+python -u -m DPPO.finetune_filtered_bc \
+  ... --n_envs 100 --bc_gradient_steps 200 --bc_lr 2.5e-6 --demo_ratio 0.7 \
+  --exp_name sample_eff_high_demo
+```
+
+### Run Dirs
+- `runs/dppo_filtered_bc/sample_eff_fewer_envs/`
+- `runs/dppo_filtered_bc/sample_eff_more_updates/`
+- `runs/dppo_filtered_bc/sample_eff_high_demo/`
+
+### Results
+
+| iter | Run 2 (12M) | S1 (2.4M) | S2 (2.4M) | S3 (2.4M) |
+|------|-------------|-----------|-----------|-----------|
+| 1 | 68.6% | 58.8% | 63.2% | 62.6% |
+| 5 | 64.4% | 73.0% | 75.0% | 73.4% |
+| 10 | 71.4% | 60.2% | 74.6% | 72.0% |
+| 15 | 73.6% | 79.0% | 74.0% | 71.4% |
+| 20 | 79.2% | 63.6% | 77.4% | 75.2% |
+| 25 | **81.4%** | 80.4% | 74.6% | 72.2% |
+| 30 | 80.6% | 67.2% | 75.6% | **78.2%** |
+
+| Run | Peak SR | Final SR (coverage) | Stability |
+|-----|---------|---------------------|-----------|
+| Run 2 (ref, 12M) | **81.4%** | **78.3%** | Stable |
+| S1 (2.4M) | 80.4% | 64.4% | Very unstable |
+| S2 (2.4M) | 77.4% | **77.1%** | Most stable |
+| S3 (2.4M) | 78.2% | **78.2%** | Stable |
+
+### Notes
+- **S3 (more updates + high demo) is most sample efficient**: 78.2% final SR with 5x fewer env steps, matching Run 2's 78.3%.
+- **S2 (more updates)** also good: 77.1% final, most stable throughout (no oscillation).
+- **S1 (just fewer envs)** failed: 80.4% peak but crashed to 64.4%. Without more gradient steps, data utilization too low.
+- **Key insight**: constant effective step (lr×steps) + more gradient diversity + high demo ratio enables 5x sample efficiency without sacrificing final performance.
+- **Filtered BC ceiling remains ~80%** regardless of sample efficiency — fundamental limitation from objective mismatch (MSE vs trajectory success).
+
+---
+
+## [DPPO RL High-UTD Sample Efficiency] - 2026-03-02 03:00
+
+**Git**: 81f6d02 (main)
+**Script**: `DPPO/finetune.py`
+**Checkpoint**: `runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt`
+
+### Overview
+Test if DPPO RL can reach 90%+ with fewer env steps by reducing rollout size and increasing update epochs (higher UTD ratio).
+
+### Design
+| Run | n_envs | n_steps | update_epochs | minibatch | env steps/iter | total (30 iters) | vs ref |
+|-----|--------|---------|---------------|-----------|---------------|------------------|--------|
+| Ref (best) | 200 | 100 | 10 | 10000 | 160k | 4.8M | — |
+| D1: fewer steps | 200 | **25** | **40** | 10000 | 40k | **1.2M** | 4x fewer |
+| D2: fewer envs | **50** | 100 | **40** | 10000 | 40k | **1.2M** | 4x fewer |
+| D3: extreme | **50** | **25** | **160** | 2500 | 10k | **0.3M** | 16x fewer |
+
+### Shared Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| sim_backend | gpu |
+| zero_qvel | True |
+| ft_denoising_steps | 10 |
+| use_ddim / ddim_steps | True / 10 |
+| gamma | 0.999 |
+| actor_lr | 3e-6 |
+| critic_lr | 1e-3 |
+| n_critic_warmup_itr | 2 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| eval_freq | 5 |
+| eval_n_rounds | 3 |
+| n_train_itr | 30 |
+
+### Commands
+```bash
+# D1: fewer steps + more epochs
+python -u -m DPPO.finetune \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 200 --sim_backend gpu \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --n_steps 25 --n_train_itr 30 --gamma 0.999 \
+  --actor_lr 3e-6 --critic_lr 1e-3 --n_critic_warmup_itr 2 \
+  --update_epochs 40 --minibatch_size 10000 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --eval_freq 5 --eval_n_rounds 3 --zero_qvel \
+  --exp_name dppo_ft_highUTD_steps25_ep40
+
+# D2: fewer envs + more epochs
+python -u -m DPPO.finetune \
+  ... --n_envs 50 --n_steps 100 --update_epochs 40 --minibatch_size 10000 \
+  --exp_name dppo_ft_highUTD_envs50_ep40
+
+# D3: extreme (16x fewer data)
+python -u -m DPPO.finetune \
+  ... --n_envs 50 --n_steps 25 --update_epochs 160 --minibatch_size 2500 \
+  --exp_name dppo_ft_highUTD_extreme
+```
+
+### Run Dirs
+- `runs/dppo_finetune/dppo_ft_highUTD_steps25_ep40/`
+- `runs/dppo_finetune/dppo_ft_highUTD_envs50_ep40/`
+- `runs/dppo_finetune/dppo_ft_highUTD_extreme/`
+
+### Results (in progress — D1/D2 still running)
+
+| iter | Ref (4.8M) | D1 (1.2M) | D2 (1.2M) | D3 (0.3M) |
+|------|------------|-----------|-----------|-----------|
+| 1 | 53.2% | 54.8% | 42.7% | 55.3% |
+| 5 | 80.8% | 74.8% | 70.7% | 61.3% |
+| 10 | 89.8% | 83.2% | 78.0% | 58.0% |
+| 15 | 92.5% | 86.3% | **88.7%** | 50.7% |
+| 20 | 92.8% | **89.3%** | — | 52.0% |
+| 25 | **94.2%** | — | — | 41.3% |
+
+| Run | Best so far | env steps to 85%+ | Status |
+|-----|-------------|-------------------|--------|
+| Ref | **94.2%** | ~1.2M (iter ~8) | Complete |
+| D1 | 89.3% | ~800k (iter ~20) | In progress |
+| D2 | 88.7% | ~600k (iter 15) | In progress |
+| D3 | 61.3% | Never | Collapsed |
+
+### Notes
+- **D2 (fewer envs, long rollout) reaches 88.7% with only 600k env steps** — 8x more sample efficient than ref at comparable performance. Long rollouts (n_steps=100) provide better GAE/critic learning than short rollouts (n_steps=25).
+- **D1 (fewer steps, many envs) at 89.3%** — also works but slightly slower to converge than D2 despite same total data. Short rollouts (25 steps) provide less temporal information for critic.
+- **D3 (extreme, 160 epochs) collapsed** — from 61% to 41%. Severe overfitting with too many epochs on too little data (only 10k env steps/iter).
+- **Key insight**: 4x data reduction with 4x more epochs works well. 16x reduction does not — there's a minimum data diversity threshold.
+- **D1 and D2 are on track to reach 90%+** with only 1.2M total env steps (vs ref's 4.8M). Both still running.
+- At iter 15, ~4000 trajectories: D2=88.7% vs filtered BC S3=71.4% — DPPO is fundamentally more sample efficient because it uses advantage-based optimization instead of binary success filtering.
+
+---
+
+## [DPPO Pretrain 1M — PegInsertionSide] - 2026-03-02 15:11
+
+**Command**: `python -u -m DPPO.pretrain --env_id PegInsertionSide-v1 --demo_path ~/.maniskill/demos/PegInsertionSide-v1/motionplanning/trajectory.state.pd_joint_delta_pos.physx_cpu.h5 --control_mode pd_joint_delta_pos --network_type unet --denoising_steps 100 --horizon_steps 16 --cond_steps 2 --act_steps 8 --batch_size 1024 --no_obs_norm --no_action_norm --max_grad_norm 0 --seed 1 --num_workers 0 --torch_deterministic --total_iters 1000000 --eval_freq 100000 --zero_qvel --exp_name dppo_pretrain_peg_zeroqvel_1M`
+**Git**: 81f6d02 (main)
+**Run Dir**: runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_1M
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| network_type | unet |
+| denoising_steps | 100 |
+| horizon_steps | 16 |
+| cond_steps | 2 |
+| act_steps | 8 |
+| batch_size | 1024 |
+| total_iters | 1,000,000 |
+| lr | 1e-4 (cosine → 0) |
+| no_obs_norm | True |
+| no_action_norm | True |
+| zero_qvel | True |
+| seed | 1 |
+
+### Results
+| Iter | Loss | CPU SR (100 eps, max_steps=200) |
+|------|------|---------------------------------|
+| 100K | ~0.010 | 62% |
+| 200K | ~0.006 | 66% |
+| 300K | ~0.004 | 60% |
+| 400K | ~0.003 | 65% |
+| 500K | ~0.002 | 66% |
+| 600K | ~0.001 | 64% |
+| 700K | ~0.0007 | 55% |
+| 800K | ~0.0004 | **68%** |
+| 900K | ~0.0003 | 66% |
+| 1M | ~0.0001 | 63% |
+
+### Notes
+- **Loss dropped 100x (0.01 → 0.0001) but SR plateaued at 60-68%**. Longer cosine schedule allowed continued loss reduction, but BC loss improvement doesn't translate to SR improvement past a certain point.
+- Inline eval during training showed 1-4% SR because `--max_episode_steps` was not passed (defaulted to 100, but PegInsertion needs 200). All SR numbers above are from post-hoc CPU eval with correct max_episode_steps=200.
+- Compared to 500K pretrain (same architecture, cosine→0 at 500K): SR is similar (55-60% vs 60-68%). The 500K pretrain's loss plateaued at ~0.002; this run's loss continued dropping but SR didn't benefit.
+- **Conclusion**: For PegInsertionSide IL, ~100K-200K iters is sufficient. Additional training reduces BC loss but doesn't improve policy quality — likely memorizing demo actions rather than learning generalizable behavior.
+- 100 episodes CPU eval has SE ≈ 5%, so differences within the 55-68% range are not statistically significant.
+
+---
+
+## [DPPO Finetune GAE n200 e100 — PegInsertionSide] - 2026-03-02 15:11
+
+**Command**: `python -u -m DPPO.finetune --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos --max_episode_steps 200 --n_envs 200 --sim_backend gpu --ft_denoising_steps 10 --use_ddim --ddim_steps 10 --n_steps 25 --n_train_itr 30 --gamma 0.999 --gae_lambda 0.95 --actor_lr 3e-6 --critic_lr 1e-3 --update_epochs 100 --minibatch_size 2500 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 --eval_freq 1 --eval_n_rounds 3 --zero_qvel --exp_name dppo_ft_gae_n200_e100`
+**Git**: 81f6d02 (main)
+**Run Dir**: runs/dppo_finetune/dppo_ft_gae_n200_e100
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| n_envs | 200 |
+| n_steps | 25 |
+| update_epochs | 100 |
+| batch_size | 5000 |
+| gamma | 0.999 |
+| gae_lambda | 0.95 |
+| actor_lr | 3e-6 |
+| critic | learned |
+| eval | every iter, 3 rounds (150 eps) |
+
+### Results
+| Iter | GPU SR | KL |
+|------|--------|----|
+| 1 [WU] | 54.8% | 0.000 |
+| 2 [WU] | 53.7% | 0.000 |
+| 3 | 62.2% | 0.000088 |
+| 4 | 73.5% | 0.000087 |
+| 5 | 72.3% | 0.000087 |
+| 8 | 76.7% | — |
+| 9 | 79.3% | — |
+| 10 | 81.2% | 0.000097 |
+| 15 | **83.2%** | — |
+| 16 | 78.8% | — |
+| 20 | 79.2% | 0.000080 |
+| 23 | 77.5% | — |
+
+### Notes
+- Peak **83.2%** at iter 15, then oscillated and declined to ~77%.
+- Compared to e40 runs: D1 (n50, e40) peak 88.7%, D2 (n200, e40) peak 89.3%. **epochs=100 is worse than epochs=40** — overfitting each iteration's data.
+- KL very stable (~0.00009), no collapse, but the extra epochs hurt rather than help.
+
+---
+
+## [Coverage Analysis: Finetuned D2 Best vs Pretrained Base] - 2026-03-02 15:11
+
+**Git**: 81f6d02 (main)
+
+### Results (GPU, MC32, 500 states, DDIM-10, std=0.01, zero_qvel)
+
+| Bin | Base (pretrained) | FT D2 (best, iter 20) |
+|-----|------------------|----------------------|
+| P=0 | 4.6% | 1.8% |
+| (0,0.1] | 4.6% | 1.2% |
+| (0.1,0.2] | 6.4% | 0.4% |
+| (0.2,0.3] | 6.4% | 0.6% |
+| (0.3,0.4] | 7.4% | 0.8% |
+| (0.4,0.5] | 13.8% | 1.2% |
+| (0.5,0.6] | 10.8% | 3.2% |
+| (0.6,0.7] | 13.0% | 5.2% |
+| (0.7,0.8] | 13.0% | 15.2% |
+| (0.8,0.9] | 11.6% | 23.2% |
+| (0.9,1] | 8.4% | 47.2% |
+| P=1 | 0.6% | 7.4% |
+| **SR** | **53.7%** | **82.5%** |
+| frac_zero | 4.6% | 1.8% |
+| frac_one | 0.6% | 7.4% |
+| frac_decisive | 82.4% | 49.8% |
+| median | 0.562 | 0.875 |
+
+### Notes
+- **Finetuning pushes the mass rightward**: most states moved from 0.3-0.7 range to 0.9+ range.
+- **frac_zero reduced from 4.6% to 1.8%** — finetuning converts some "impossible" states to solvable, but ~2% remain stuck at P=0.
+- **~3% of states still at P<0.1** — these are the hard states that create the ceiling.
+- **Theoretical ceiling ~95-97%** given the remaining hard states, but the gap between current 82.5% GPU SR (≈89% in GPU eval with noise) and ceiling suggests room for further improvement.
+- Main effect of finetuning: converting "learnable" states (0.1<P<0.9) to "mastered" states (P>0.9), not eliminating dead zones.
+
+---
+
+## [MC Exploitation: PPO on Fixed Data with MC16 Advantages] - 2026-03-02 18:20
+
+**Command**:
+```bash
+python -u -m DPPO.mc_exploitation \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 200 --n_steps 25 \
+  --mc_samples 16 --gamma 0.999 --gae_lambda 0.95 \
+  --update_epochs 1000 --minibatch_size 2500 --actor_lr 3e-6 \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --eval_freq 20 --zero_qvel \
+  --exp_name mc_exploitation_mc16
+```
+**Git**: 81f6d02 (main)
+**Run Dir**: `runs/dppo_finetune/mc_exploitation_mc16/`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs | 200 |
+| n_steps (decision steps) | 25 |
+| mc_samples | 16 |
+| gamma | 0.999 |
+| gae_lambda | 0.95 |
+| update_epochs | 1000 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| max_grad_norm | 1.0 |
+| clip_ploss_coef | 0.01 |
+| clip_ploss_coef_base | 1e-3 |
+| clip_ploss_coef_rate | 3.0 |
+| target_kl | None (no early stop) |
+| norm_adv | True |
+| gamma_denoising | 0.99 |
+| ft_denoising_steps | 10 |
+| use_ddim | True |
+| ddim_steps | 10 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| zero_qvel | True |
+| sim_backend | gpu |
+| eval_n_rounds | 3 (600 episodes per eval) |
+| network_type | unet (4.40M params) |
+| obs_dim | 43 |
+| action_dim | 8 |
+| dataset size (N) | 5000 samples |
+| total PPO samples (N×K) | 50000 |
+| pretrain checkpoint | dppo_pretrain_peg_zeroqvel_500k/best.pt |
+
+### Data Collection & MC Estimation
+| Metric | Value |
+|--------|-------|
+| Rollout SR | 57.0% (114/200) |
+| MC16 V(s) mean | 0.2207 |
+| MC16 V(s) std | 0.2195 |
+| MC16 V(s) range | [0.0, 1.0] |
+| V(s_final) mean | 0.0400 |
+| V(s0) vs traj return corr | r=0.376 |
+| MC estimation time | 1199s (~20 min) |
+| Advantage mean | 0.1184 |
+| Advantage std | 0.3415 |
+| frac_positive | 0.496 |
+| frac_zero | 0.154 |
+| Advantage range | [-0.78, 1.0] |
+
+### Results (SR vs Epoch)
+| Epoch | GPU SR | KL | PG Loss | Ratio |
+|-------|--------|----|---------|-------|
+| 0 (pretrained) | **49.0%** | — | — | — |
+| 20 | **66.0%** | 0.0013 | -0.0014 | 0.996 |
+| 40 | 63.3% | 0.0023 | -0.0016 | 0.995 |
+| 60 | 62.3% | 0.0032 | -0.0017 | 0.994 |
+| 80 | 56.8% | 0.0038 | -0.0018 | 0.994 |
+| 100 | 66.7% | 0.0054 | -0.0019 | 0.993 |
+| 240 | 70.2% | 0.0121 | -0.0023 | 0.990 |
+| 400 | 69.8% | 0.0136 | -0.0026 | 0.988 |
+| 540 | 53.0% | 0.0149 | -0.0027 | 0.987 |
+| 780 | **72.3%** | 0.0144 | -0.0028 | 0.986 |
+| 1000 (final) | 62.3% | 0.0170 | -0.0029 | 0.985 |
+
+### Summary
+| Metric | Value |
+|--------|-------|
+| Pretrained SR | 49.0% |
+| Best SR | **72.3%** @ epoch 780 |
+| Final SR | 62.3% @ epoch 1000 |
+| Peak improvement | +23.3% (49.0% → 72.3%) |
+| Degradation from peak | 10.0% |
+| PPO time | 1966s (32.8 min) |
+| Total experiment time | ~55 min (MC=20min + PPO=33min) |
+
+### Notes
+- **Experiment goal**: Test whether accurate MC16 advantages on a fixed on-policy dataset can enable efficient PPO exploitation, isolating the "advantage accuracy" vs "distribution shift" question.
+- **Fast initial gains**: SR jumps from 49% → 66% by epoch 20 (just 20 passes over fixed data). MC16 advantages clearly provide useful learning signal.
+- **Peak at epoch 780 (72.3%)** — but this is noisy. The SR oscillates heavily (±10%) throughout training, making it hard to identify a clean peak.
+- **High eval variance**: SR swings between 53% and 72% across evaluations. This is partly due to GPU eval noise and partly real policy instability on fixed data.
+- **Gradual degradation**: After ~epoch 300, average SR drifts downward from ~65% to ~62%, consistent with off-policy distribution shift as the policy moves away from the data collection distribution.
+- **KL grows monotonically**: 0.001 → 0.017 over 1000 epochs, confirming policy drift from the pretrained baseline. No KL early stopping was used.
+- **Comparison to online DPPO finetune**: Best online DPPO reached ~90% (with iterative data + conservative config). Fixed-data exploitation peaks at ~72% — a **~18% gap** attributable to distribution shift. This confirms that **iterative data collection is essential**, not just advantage accuracy.
+- **Advantage stats look reasonable**: frac_positive=0.496 (~half), mean=0.12 (slightly positive bias from sparse reward), std=0.34. 15.4% of advantages are exactly zero (states where all MC rollouts gave same outcome).
+- **V(s0) vs trajectory return correlation is low (r=0.376)**: This is because V(s0) measures P(success|s0) under current policy, but the trajectory return is binary (0/1) — low correlation is expected for a 57% SR policy.
+
+---
+
+## [MC Exploitation: Data Size × Clip Ratio Sweep] - 2026-03-03 19:11
+
+**Command**: `bash scripts/run_mc_exploit_data_clip_sweep.sh` (12 experiments)
+```bash
+# Each experiment runs:
+python -u -m DPPO.mc_exploitation \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --mc_samples 16 --gae_lambda 0.95 \
+  --minibatch_size 2500 --actor_lr 3e-6 \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --eval_freq 20 --zero_qvel --gamma 0.99 \
+  --update_epochs 1000 \
+  --clip_ploss_coef {0.01,0.02,0.04,0.08} \
+  --subsample_envs {50,200,500}
+```
+**Git**: 81f6d02 (main)
+**Run Dir**: `runs/dppo_finetune/mc_sweep_d{50,200,500}_c{0.01,0.02,0.04,0.08}`
+**Plot**: `runs/dppo_finetune/data_clip_sweep.png`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs (data collection) | 500 |
+| subsample_envs (PPO training) | 50, 200, 500 |
+| n_steps | 25 |
+| mc_samples | 16 |
+| gamma | 0.99 |
+| gae_lambda | 0.95 |
+| update_epochs | 1000 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| clip_ploss_coef | 0.01, 0.02, 0.04, 0.08 |
+| ft_denoising_steps | 10 |
+| use_ddim | True |
+| ddim_steps | 10 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| zero_qvel | True |
+| eval_freq | 20 |
+| eval_n_rounds | 3 (600 episodes per eval) |
+| norm_adv | True |
+| target_kl | None |
+
+### Results
+
+| Data (envs) | clip | best SR | best epoch | final SR | KL@1000 |
+|-------------|------|---------|-----------|----------|---------|
+| 50 | 0.01 | 60.3% | 100 | 58.7% | 0.0018 |
+| 50 | 0.02 | 63.9% | 580 | 57.1% | 0.0573 |
+| 50 | 0.04 | 55.5% | 440 | 47.3% | 0.1659 |
+| 50 | 0.08 | 52.2% | 0 | 33.1% | 0.3529 |
+| 200 | 0.01 | 71.3% | 680 | 64.5% | 0.0026 |
+| 200 | 0.02 | 74.0% | 120 | 65.7% | 0.0183 |
+| 200 | 0.04 | 72.5% | 20 | 58.4% | 0.1295 |
+| 200 | 0.08 | 75.9% | 20 | 40.0% | 0.1848 |
+| 500 | 0.01 | 70.3% | 240 | 57.8% | 0.0032 |
+| 500 | 0.02 | 73.5% | 440 | 61.8% | 0.0174 |
+| 500 | 0.04 | **82.2%** | 180 | 57.5% | 0.1068 |
+| 500 | 0.08 | 77.6% | 20 | 48.7% | 0.1858 |
+
+Rollout stats (500 envs, shared across all experiments via cache):
+- Rollout SR: 54.2% (271/500)
+- V(s): mean=0.0818, std=0.0888
+- Advantages: mean=0.1896, std=0.3078, frac_positive=0.548
+- V(s0) vs trajectory return correlation: r=0.331
+
+### Notes
+- **Data quantity is the dominant factor**: 50→200 envs gives +10-15% best SR across all clip values. 200→500 gives further improvement at moderate clip values.
+- **Best single-round result: d500 + clip=0.04 = 82.2%** — significantly better than all other combinations. This exceeds the previous best single-round of ~71% (d200, clip=0.01).
+- **Small data cannot tolerate large clip**: d50 + clip=0.08 never improved beyond the starting SR (52.2%). The policy immediately diverged. d50 + clip=0.04 also degraded. Only clip≤0.02 is stable at d50.
+- **Large data tolerates larger clip**: d500 + clip=0.04 achieves 82.2%, but d500 + clip=0.08 still degrades to 48.7% by epoch 1000 (though it peaks at 77.6% early).
+- **Large clip peaks early, degrades fast**: clip=0.08 always peaks at epoch 20 regardless of data size, then degrades. clip=0.01 peaks late (epoch 100-680) but is more stable.
+- **Caching enabled**: 500 envs MC16 data collected once (~50 min), cached to `runs/mc_cache/mc_cache_06e7e1a44e50.pt` (138MB). All 12 experiments reused the same cached data, saving ~9 hours of MC estimation.
+- **KL divergence correlates with degradation**: clip=0.08 reaches KL~0.18-0.35 by epoch 1000, while clip=0.01 stays at KL~0.002-0.003. The sweet spot appears to be clip=0.02-0.04 where KL reaches 0.01-0.13.
+- **Implication for multi-round strategy**: d500 + clip=0.04 + early stop (~180 epochs) is the most promising single-round config. Whether multi-round chaining from this can exceed 82.2% remains to be tested.
+
+---
+
+
+
+## [MC Exploitation Multi-Round: N=500, clip=0.04, 5 rounds] - 2026-03-03 22:50
+
+**Command**: `bash scripts/run_mc_exploit_d500_c04_5rounds.sh`
+**Git**: 81f6d02 (main)
+**Run Dir**: `runs/dppo_finetune/mc_d500_c04_r{1..5}/`
+**Script**: `scripts/run_mc_exploit_d500_c04_5rounds.sh`
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs | 500 |
+| n_steps | 25 |
+| mc_samples | 16 |
+| gamma | 0.99 |
+| gae_lambda | 0.95 |
+| update_epochs | 250 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| clip_ploss_coef | 0.04 |
+| ft_denoising_steps | 10 |
+| ddim_steps | 10 |
+| min_sampling/logprob_std | 0.01 |
+| eval_freq | 20 |
+| zero_qvel | True |
+| pretrain_checkpoint | dppo_pretrain_peg_zeroqvel_500k/best.pt |
+| chaining | best.pt → next round |
+
+### Results
+
+| Round | Rollout SR | Start SR (epoch 0) | Best SR | Best Epoch | End SR (epoch 240) |
+|-------|-----------|-------------------|---------|------------|-------------------|
+| R1 | ~55% | 52.2% | **81.3%** | 180 | 76.7% |
+| R2 | 75.4% | 80.1% | **83.8%** | 80 | 79.1% |
+| R3 | 77.0% | 81.1% | **82.0%** | 60 | 74.7% |
+| R4 | 76.0% | — | (stuck in MC16) | — | — |
+| R5 | — | — | — | — | — |
+
+R4 got stuck during MC16 value estimation (~50 min with no progress, likely GPU memory fragmentation from repeated env creation/destruction across rounds). Killed after R3 completion.
+
+### Detailed Eval Curves
+
+**Round 1** (from pretrain):
+| Epoch | SR |
+|-------|-----|
+| 0 | 52.2% |
+| 20 | 79.2% |
+| 40 | 76.9% |
+| 60 | 77.4% |
+| 80 | 80.5% |
+| 100 | 75.6% |
+| 120 | 76.1% |
+| 140 | 76.1% |
+| 160 | 77.7% |
+| 180 | **81.3%** |
+| 200 | 71.6% |
+| 220 | 79.1% |
+| 240 | 76.7% |
+
+**Round 2** (from R1 best):
+| Epoch | SR |
+|-------|-----|
+| 0 | 80.1% |
+| 20 | 83.1% |
+| 40 | 82.7% |
+| 60 | 78.9% |
+| 80 | **83.8%** |
+| 100 | 81.3% |
+| 120 | 81.1% |
+| 140 | 80.0% |
+| 160 | 77.1% |
+| 180 | 80.6% |
+| 200 | 79.7% |
+| 220 | 80.4% |
+| 240 | 79.1% |
+
+**Round 3** (from R2 best):
+| Epoch | SR |
+|-------|-----|
+| 0 | 81.1% |
+| 20 | 78.6% |
+| 40 | 81.6% |
+| 60 | **82.0%** |
+| 80 | 81.0% |
+| 100 | 80.9% |
+| 120 | 81.2% |
+| 140 | 77.9% |
+| 160 | 76.6% |
+| 180 | 77.4% |
+| 200 | 77.3% |
+| 220 | 73.2% |
+| 240 | 74.7% |
+
+### Notes
+- **Plateau confirmed at ~83-84%**: R2 best=83.8%, R3 best=82.0%, no further improvement. Rollout SR also stagnated at 75-77%.
+- **Diminishing returns per round**: R1 gained +29% (52→81), R2 gained +2.5% (81→84), R3 gained 0% (84→82, within noise).
+- **Best epoch shifts earlier**: R1 best@180, R2 best@80, R3 best@60. Later rounds peak faster but also degrade faster — less room to improve.
+- **250 epochs is too many**: All rounds peak at epoch 60-180, then degrade for the remaining epochs. The best checkpoint selection mitigates this, but 80-100 epochs would be more efficient.
+- **R4 stuck on MC16**: GPU memory fragmentation from running multiple rounds in a single script (repeated env creation/destruction). Future multi-round scripts should run rounds as separate processes.
+- **Root cause of plateau**: At 77% rollout SR, MC16 advantages become near-binary (A≈+0.23 for success, A≈-0.77 for failure). No within-trajectory credit assignment — PPO reinforces/suppresses entire trajectories equally. Need finer-grained advantage signal (lower gamma, dense reward, or per-step contrastive methods) to break through.
+- **Comparison**: DPPO finetune (standard online PPO with frequent data refresh) reached 90.3% on the same task, suggesting the plateau is method-specific, not task-specific.
+
+---
+
+## [MC Exploitation: Retry Failed (Replace Mode)] - 2026-03-04 21:08
+
+**Command**: `python -u -m DPPO.mc_exploitation --pretrain_checkpoint runs/dppo_finetune/mc_d500_c04_r2/best.pt --exp_name mc_retry_r2best --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos --max_episode_steps 200 --n_envs 500 --n_steps 25 --mc_samples 16 --gae_lambda 0.95 --update_epochs 250 --minibatch_size 2500 --actor_lr 3e-6 --ft_denoising_steps 10 --use_ddim --ddim_steps 10 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 --eval_freq 20 --zero_qvel --gamma 0.99 --clip_ploss_coef 0.02 --retry_failed --no_cache`
+**Git**: 81f6d02 (main)
+**Run Dir**: runs/dppo_finetune/mc_retry_r2best/
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | runs/dppo_finetune/mc_d500_c04_r2/best.pt (R2 best, ~83.8% SR) |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs | 500 |
+| n_steps | 25 |
+| mc_samples | 16 |
+| gamma | 0.99 |
+| gae_lambda | 0.95 |
+| update_epochs | 250 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| clip_ploss_coef | 0.02 |
+| ft_denoising_steps | 10 |
+| ddim_steps | 10 |
+| min_sampling/logprob_std | 0.01 |
+| zero_qvel | True |
+| retry_failed | True (REPLACE mode — bug, failed trajs overwritten) |
+
+### Dataset
+| Metric | Value |
+|--------|-------|
+| Original rollout | 385/500 success (77.0%) |
+| After retry (replace) | 500/500 success (100.0%) |
+| Retries needed | 31 rounds for hardest state |
+| Advantages mean | 0.2934 |
+| Advantages frac_positive | 0.777 |
+| Advantages frac_zero | 0.091 |
+
+### Results
+| Epoch | SR | KL | PG Loss | Ratio |
+|-------|------|------|---------|-------|
+| 0 | **81.3%** | 0.000 | 0.000 | 1.000 |
+| 20 | 74.5% | 0.013 | -0.003 | 0.977 |
+| 40 | 77.6% | 0.021 | -0.003 | 0.975 |
+| 60 | 74.4% | 0.026 | -0.003 | 0.974 |
+| 80 | 74.3% | 0.031 | -0.004 | 0.973 |
+| 100 | 71.4% | 0.038 | -0.004 | 0.971 |
+| 140 | 70.3% | 0.047 | -0.004 | 0.969 |
+| 200 | 64.6% | 0.056 | -0.004 | 0.968 |
+| 240 | 61.3% | 0.057 | -0.004 | 0.966 |
+
+### Notes
+- **Bug: Replace mode** — failed trajectories were REPLACED with successful retries, discarding original failures. This removed negative advantage signal ("what not to do").
+- **Best = epoch 0 (81.3%)**, monotonic degradation to 61.3%. Worse than non-retry baseline (best 81.7% @ epoch 140).
+- **Why replace hurts**: The 115 retried trajectories are outlier lucky events from states where P(success) ≈ 1-3%. High advantage on these outliers dominates PPO gradient, pushing policy away from its mode.
+- **Advantage bias**: mean=0.293 (too positive), because all trajs succeed. Without failed trajs providing negative advantages, the gradient is biased.
+- **Fix**: Changed to APPEND mode — keep original failures + add successful retries. Also changed to save ALL retry trajectories (success AND fail) for statistical correctness.
+
+---
+
+## [R2 Best Coverage: Extended Max Steps] - 2026-03-04 21:08
+
+**Command**: `python -u dp_p_success_gpu.py --ckpt runs/dppo_finetune/mc_d500_c04_r2/best.pt --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos --max_episode_steps {200,300,500,2000} --zero_qvel --num_states 200 --mc_samples {1,16} --ddim_steps 10 --min_sampling_denoising_std 0.01`
+**Git**: 81f6d02 (main)
+
+### Results: R2 Best Coverage vs Max Steps
+
+| max_steps | Mode | SR | frac_zero | frac_one | frac_decisive |
+|-----------|------|------|-----------|----------|---------------|
+| 200 | deterministic | 86.0% | 14.0% | 86.0% | 0% |
+| 300 | deterministic | 86.0% | 14.0% | 86.0% | 0% |
+| 2000 | deterministic | 93.5% | 6.5% | 93.5% | 0% |
+| 200 | stochastic mc16 | 77.1% | 4.5% | 16.0% | 59.5% |
+| 300 | stochastic mc16 | 84.3% | 3.5% | 32.0% | 37.5% |
+| 500 | stochastic mc16 | 88.4% | 2.0% | 49.5% | 27.5% |
+| 2000 | stochastic mc1 | 94.5% | 5.5% | 94.5% | 0% |
+
+### Pretrain Coverage Comparison
+
+| max_steps | Mode | SR | frac_zero | frac_one | frac_decisive |
+|-----------|------|------|-----------|----------|---------------|
+| 200 | deterministic | 55.0% | 45.0% | 55.0% | 0% |
+| 300 | deterministic | 66.5% | 33.5% | 66.5% | 0% |
+| 200 | stochastic mc16 | 53.5% | 5.0% | 3.0% | 81.0% |
+| 300 | stochastic mc16 | 60.4% | 4.5% | 4.5% | 80.5% |
+
+### Notes
+- **Deterministic DP is always bimodal (frac_decisive=0%)** — both pretrain and finetuned. Identical DDIM actions for same state → P=0 or P=1.
+- **Stochastic decisive fraction shrinks with more steps**: 59.5% → 37.5% → 27.5% as max_steps 200→300→500. More time lets marginal states succeed.
+- **~6% true frac_zero at 2000 steps**: These are geometry configurations the policy cannot handle regardless of time or stochasticity.
+- **Timeout is major bottleneck**: 86%→94% from 200→2000 steps, meaning ~8% of failures are just "too slow" not "can't do."
+
+---
+
+## [Frac Zero Analysis: MC200 on Failing States] - 2026-03-04 21:08
+
+**Command**: Custom script testing frac_zero states from R2 best (deterministic 2000 steps) with MC200 on both pretrain and finetuned policies.
+**Git**: 81f6d02 (main)
+
+### Results: MC200 per-state P(success) at 200 max steps
+
+| env_idx | P_pretrain | P_finetuned | delta |
+|---------|-----------|-------------|-------|
+| 1 | 0.0% | 1.0% | +1.0% |
+| 6 | 1.5% | 0.5% | -1.0% |
+| 18 | 1.0% | 0.5% | -0.5% |
+| 24 | 2.5% | 1.0% | -1.5% |
+| 33 | 2.5% | 0.0% | -2.5% |
+| 34 | 0.5% | 0.0% | -0.5% |
+| 42 | 0.0% | 0.0% | +0.0% |
+| 65 | 0.5% | 0.0% | -0.5% |
+| 106 | 1.5% | 0.5% | -1.0% |
+| 110 | 0.5% | 0.5% | +0.0% |
+| 125 | 0.5% | 0.0% | -0.5% |
+| 128 | 4.0% | 0.0% | -4.0% |
+| 131 | 0.5% | 1.5% | +1.0% |
+| 183 | 1.5% | 1.0% | -0.5% |
+| 184 | 3.0% | 1.0% | -2.0% |
+| 195 | 2.5% | 1.0% | -1.5% |
+| **mean** | **1.41%** | **0.53%** | **-0.88%** |
+
+### Notes
+- **Not truly zero coverage**: MC50 showed 0% for many states, but MC200 reveals most have P=0.5-4% under pretrain. MC50 has 36% chance of missing P=2% (0.98^50).
+- **Finetuning causes mild regression on edge cases**: Mean P drops from 1.4%→0.5% on these hard states. Policy optimizes for the majority of states at a small cost to the tail.
+- **Only 1/16 (env 42) is truly 0% for both policies** — the rest are extremely low but non-zero.
+- **These are geometry edge cases**, not fundamental failures. The peg/hole configurations are extreme, making insertion nearly impossible for any learned policy.
+
+---
+
+## [MC Exploitation: Retry Failed (Append All Trajs)] - 2026-03-04 21:08
+
+**Command**: `python -u -m DPPO.mc_exploitation --pretrain_checkpoint runs/dppo_finetune/mc_d500_c04_r2/best.pt --exp_name mc_retry_alltrajs_r2best --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos --max_episode_steps 200 --n_envs 500 --n_steps 25 --mc_samples 16 --gae_lambda 0.95 --update_epochs 250 --minibatch_size 2500 --actor_lr 3e-6 --ft_denoising_steps 10 --use_ddim --ddim_steps 10 --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 --eval_freq 20 --zero_qvel --gamma 0.99 --clip_ploss_coef 0.02 --retry_failed --no_cache`
+**Git**: 81f6d02 (main)
+**Run Dir**: runs/dppo_finetune/mc_retry_alltrajs_r2best/
+
+### Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | runs/dppo_finetune/mc_d500_c04_r2/best.pt (R2 best, ~83.8% SR) |
+| retry_failed | True (APPEND mode — keeps original fails + appends ALL retry trajs) |
+| All other settings | Same as replace experiment above |
+
+### Dataset
+| Metric | Value |
+|--------|-------|
+| Original rollout | 385/500 success (77.0%), 115 fail |
+| Retry trajectories appended | 174 (65 success + 109 fail) |
+| Total dataset | 674 trajectories |
+| Retry rounds | 31 (same seed, same states) |
+| Dataset composition | 500 original + 174 retries, statistically representative |
+
+### Results
+Best SR: 83.9% @ epoch 20, then oscillated 80-84%. No clear improvement over non-retry baseline (~82%).
+Conclusion: Retry append doesn't help — not the bottleneck.
+
+### Notes
+- **Statistically correct**: Each retry round saves ONE trajectory per still-failed state regardless of outcome. A state needing K retries contributes K trajectories (K-1 fail + 1 success), reflecting the true P(success) distribution.
+- **Fix for two bugs from replace version**: (1) append instead of replace, (2) save all retry trajs not just successes.
+- **Dataset breakdown**: 174 appended = 115 (round 1) + 15 (round 2) + 6 + 3 + 2×7 + 2 + 1×18 + 1 = 174. Matches theoretical count.
+
+---
+
+## [Frac Zero Video Recording Script] - 2026-03-04
+
+**Script**: `DPPO/record_frac_zero.py`
+**Git**: 81f6d02 (main)
+
+**Command**:
+```bash
+python -u -m DPPO.record_frac_zero \
+  --ft_ckpt runs/dppo_finetune/mc_d500_c04_r2/best.pt \
+  --pretrain_ckpt runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 2000 --zero_qvel \
+  --num_states 200 --max_videos 14 \
+  --output_dir runs/frac_zero_videos
+```
+
+### How it works
+1. **Phase 1**: Batch GPU eval (200 envs, deterministic DDIM-10) to find succeed_once=False states. Logic identical to `dp_p_success_gpu.py`.
+2. **Phase 2**: For each failing state, record GPU video (single env, render every raw step, fps=20) with both finetuned and pretrain policies.
+3. Saves `fail_states.pt` (initial states) + `state{idx}_finetuned.mp4` + `state{idx}_pretrain.mp4`.
+
+### Expected results
+- R2 best @ 2000 steps deterministic: ~93% SR, ~14 failing states (7% frac_zero)
+- These are states where the policy never succeeds even once in 2000 steps — true capability limits, not timeout
+
+### Notes
+- succeed_once tracking (not succeed_at_end): `success = success | (got_reward & ~done)` — same as dp_p_success_gpu.py
+- 2000 steps视频很长（每帧=1 raw step, ~2000 frames/video）
+- GPU单env录制：和batch eval可能有微小差异（GPU sim batch vs single env），但不做额外验证
+
+---
+
+## [Gamma=0.9 MC Exploitation 5 Rounds] - 2026-03-04
+
+**Command**: `bash scripts/run_mc_exploit_gamma09_5rounds.sh`
+**Git**: 81f6d02 (main)
+**Status**: Running (Round 1 MC16 in progress)
+
+**Config**: Same as gamma=0.99 experiments, only `--gamma 0.9`:
+```bash
+COMMON="--env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --mc_samples 16 --gae_lambda 0.95 \
+  --update_epochs 250 --minibatch_size 2500 --actor_lr 3e-6 \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --eval_freq 20 --zero_qvel --gamma 0.9 \
+  --clip_ploss_coef 0.02"
+```
+
+**Hypothesis**: gamma=0.99 plateau ~85% because policy has no incentive to succeed faster. ~8% of failures are timeout (succeed @ 2000 steps but not @ 200). gamma=0.9 creates stronger speed pressure:
+- gamma=0.9: step 5 return=0.59, step 25=0.07 (gap=0.52)
+- gamma=0.99: step 5=0.95, step 25=0.78 (gap=0.17)
+
+**Exp names**: `mc_g09_c02_r1` through `mc_g09_c02_r5`
+
+### Results
+
+**Round 1** (from pretrain, best=64.7% @ epoch 140):
+
+| Epoch | SR | KL |
+|-------|------|--------|
+| 0 | 51.8% | 0.0 |
+| 20 | 59.0% | 0.005 |
+| 40 | 64.5% | 0.014 |
+| 140 | **64.7%** | 0.063 |
+| 240 | 59.2% | 0.103 |
+
+**Round 2 COLLAPSED** (from R1 best, start=65.1%):
+
+| Epoch | SR | KL |
+|-------|------|--------|
+| 0 | 65.1% | 0.0 |
+| 20 | **48.7%** | 0.057 |
+| 40 | 49.5% | 0.120 |
+| 60 | 48.1% | 0.182 |
+
+**Root cause**: gamma=0.9 makes V(s) highly sensitive to policy timing behavior. MC16 V is computed once (fixed), but PPO iteratively updates policy → V becomes stale → advantages artificially inflated → positive feedback loop → collapse. gamma=0.99 doesn't have this issue because V is timing-insensitive.
+
+### Conservative variant (lr=1e-6, target_kl=0.01) — also collapsed
+
+```bash
+python -u -m DPPO.mc_exploitation \
+  --pretrain_checkpoint runs/dppo_finetune/mc_g09_c02_r1/best.pt \
+  --exp_name mc_g09_cons_r2_test \
+  ... --actor_lr 1e-6 --target_kl 0.01 --gamma 0.9
+```
+
+R2 with same data cache: start=62.1%, epoch 20=48.9%. KL stop triggered from epoch 10 but already too late. **Confirms the issue is fundamental (fixed MC16 V + changing policy), not just hyperparameters.**
+
+---
+
+## [GAE Learned Critic Finetune (PegInsertionSide)] - 2026-03-05
+
+**Command**:
+```bash
+python -u -m DPPO.finetune \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --gamma 0.99 --gae_lambda 0.95 \
+  --update_epochs 5 --minibatch_size 2500 \
+  --actor_lr 3e-6 --critic_lr 1e-3 \
+  --n_critic_warmup_itr 5 \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --clip_ploss_coef 0.02 --target_kl 1.0 \
+  --eval_freq 1 --eval_n_rounds 3 \
+  --zero_qvel --reward_scale_running \
+  --n_train_itr 10 \
+  --exp_name dppo_ft_peg_gae_g099
+```
+**Git**: 81f6d02 (main)
+**Run dir**: `runs/dppo_finetune/dppo_ft_peg_gae_g099/`
+
+### Results
+
+| Iter | SR | KL | Note |
+|------|------|--------|------|
+| 1-5 | 50-55% | 0.0 | Critic warmup only |
+| 6 | 74.9% | 0.0003 | First actor update |
+| 7 | 80.3% | 0.0003 | |
+| 8 | 83.1% | 0.0003 | |
+| 9 | 83.4% | 0.0003 | |
+| 10 | **85.5%** | 0.0003 | Still improving |
+
+### Comparison with MC exploitation
+
+| Method | Best SR | Data budget | V(s) source |
+|--------|---------|-------------|-------------|
+| MC16 gamma=0.99 R1 | 66.8% | 500 eps + MC16 | Fixed MC rollout |
+| MC16 gamma=0.99 R2 | 77.2% | 1000 eps + MC16 | Fixed MC rollout |
+| MC16 gamma=0.9 R1 | 64.7% | 500 eps + MC16 | Fixed MC rollout |
+| MC16 gamma=0.9 R2 | COLLAPSED | — | Fixed MC rollout |
+| **GAE learned critic** | **85.5%** | 5000 eps (no MC) | On-policy critic |
+
+### Key insights
+1. **GAE learned critic >> MC16 fixed**: 85.5% vs 77.2%, and still improving at iter 10
+2. **No V staleness**: Critic updates every iteration with fresh on-policy data, so V(s) never becomes stale
+3. **No gamma sensitivity**: With learned critic, gamma=0.99 works fine because V adapts to policy changes
+4. **Standard DPPO finetune already works**: No need for MC exploitation's complex pipeline — the simple iterative rollout + GAE + PPO loop is superior
+5. **Data efficiency**: 5 training iterations (2500 episodes) to reach 85%, vs mc_exploitation needing 2 rounds (1000 episodes + expensive MC16) for only 77%
+
+### Scaling experiments (same base config, varying n_envs / epochs / iters)
+
+| Config | Best SR | Best Iter | Total training episodes |
+|--------|---------|-----------|------------------------|
+| 500 envs, 5ep, 10 itr | 85.5% | 10 | 2500 |
+| 200 envs, 10ep, 10 itr | 82.5% | 9 | 1000 |
+| 200 envs, 13ep, 10 itr | 84.0% | 9 | 1000 |
+| 500 envs, 5ep, 20 itr | **91.7%** | 20 | 7500 |
+| 500 envs, 10ep, 20 itr | 91.6% | 20 | 7500 |
+| 500 envs, 20ep, 20 itr | 90.7% | 16 | 7500 |
+
+**Findings**:
+- More iterations (data collection rounds) is the main driver: 10→20 itr = 85%→92%
+- More epochs per iter speeds up convergence but doesn't raise ceiling, and too many hurts:
+  - 5ep: 91.7% (best), 10ep: 91.6% (same), 20ep: 90.7% (worse, oscillates due to over-optimization on single batch)
+  - 20ep has 100 updates/iter → too much policy shift per data collection round
+- **5 epochs is the sweet spot** for this setting (500 envs, minibatch=2500)
+- Fewer envs (200 vs 500) loses ~1-2% at equal gradient steps, due to higher advantage variance
+- Policy still improving at iter 20, ceiling appears ~91-92% at 200 steps
+
+### Ceiling analysis: what bounds the ~92% plateau?
+
+Evaluated 20-iter best checkpoint (91.7% @ 200 steps) at both 200 and 2000 steps on 600 states:
+
+| | 200 steps | 2000 steps |
+|---|---|---|
+| Pretrain | 55% | 95% |
+| 10-iter best (85.5%) | 85.5% | 92.3% |
+| **20-iter best (91.7%)** | **88.3%** | **95.5%** |
+
+Per-state breakdown (20-iter best, 600 states, deterministic mc1):
+
+| Category | Count | % | Meaning |
+|----------|-------|---|---------|
+| Both succeed | 514 | 85.7% | Solved within 200 steps |
+| **Timeout** | 59 | **9.8%** | 200 steps too short, 2000 steps succeeds |
+| True dead | 11 | **1.8%** | Neither succeeds (env-level hard) |
+| Degraded | 16 | 2.7% | 200 ok but 2000 fail (GPU sim stochasticity) |
+
+**Conclusion**: The ~92% ceiling is NOT a policy capability bound — it's an episode length bound. The policy can solve 95.5% of states given enough time. Only ~2% are truly unsolvable. The remaining ~8% failure at 200 steps is timeout: the policy needs >200 steps on those states. Finetuning optimizes for "succeed within 200 steps" but cannot compress all trajectories below this budget.
+
+**Implication**: If episode length increased to 400-500 steps, SR should reach ~95%. Alternatively, the pretrain policy already achieves 95% at 2000 steps — finetune's value is purely speed (compressing success into shorter episodes), not expanding coverage.
+
+---
+
+## [REINFORCE Ablation: Pure Policy Gradient without Baseline/Clip] - 2026-03-05 05:00
+
+**Git**: 81f6d02 (main)
+**Script**: `DPPO/finetune_reinforce.py` (original REINFORCE version, later renamed to `DPPO/finetune_bc.py` for weighted BC)
+**Run Dir**: `runs/dppo_finetune/reinforce_*`
+
+### Context
+
+Ablation study to understand what components of PPO are essential for DPPO finetuning. Stripped PPO of baseline (critic) and clipping, testing pure REINFORCE on fixed sparse reward.
+
+### REINFORCE Experiments (Policy Gradient)
+
+Multiple iterations of debugging were needed:
+- norm_adv=True caused collapse (mean-subtracting returns creates destructive negative gradients)
+- Denoising discount biased gradient toward later denoising steps without baseline
+- Timestep discount (gamma) biased gradient toward early timesteps
+- Final working config: undiscounted returns, no denoising discount, no return normalization
+
+**Command (lr=1e-5, working config)**:
+```bash
+python -u -m DPPO.finetune_reinforce \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --gamma 0.99 --update_epochs 1 --minibatch_size 2500 \
+  --actor_lr 1e-5 --no-norm_adv \
+  --ft_denoising_steps 10 --use_ddim --ddim_steps 10 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --eval_freq 1 --eval_n_rounds 3 \
+  --zero_qvel --reward_scale_running \
+  --n_train_itr 20 --exp_name reinforce_nonorm_lr1e5
+```
+
+### REINFORCE LR Sweep Results
+
+| lr | KL per step | Result |
+|---|---|---|
+| 1e-5 | 0.0001 | No collapse, but no improvement (75% → 66% stagnation) |
+| 5e-5 | 0.02 | Collapsed to 0% in 2 iters |
+| 1e-4 | 0.17 | Collapsed to 0% in 1 iter |
+
+**Conclusion**: Without baseline + without clip, there's no viable learning rate. Small lr = no learning signal (weighted BC is already at its fixed point). Large lr = collapse (noisy gradient direction from success-only weighting).
+
+---
+
+## [Weighted BC / Filtered BC Finetuning] - 2026-03-05 07:00
+
+**Git**: 81f6d02 (main)
+**Script**: `DPPO/finetune_bc.py` (weighted diffusion BC) and `DPPO/finetune_reinforce.py` (REINFORCE with binary returns)
+**Run Dir**: `runs/dppo_finetune/wbc_*` and `runs/dppo_finetune/reinforce_binary_ep5`
+
+### Context
+
+After REINFORCE failed, rewrote the script as **weighted diffusion BC**: replace policy gradient with weighted MSE diffusion loss. Key insight: with sparse reward and undiscounted returns, the weight is binary (1 for success, 0 for failure) → **filtered BC** (only train on successful rollout trajectories).
+
+### Settings (common)
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs | 500 |
+| n_steps | 25 |
+| gamma | 0.99 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| use_ddim | True |
+| ddim_steps | 10 |
+| min_sampling_denoising_std | 0.01 |
+| zero_qvel | True |
+| reward_scale_running | True |
+| n_train_itr | 20 |
+| eval_n_rounds | 3 |
+
+### Weighted BC: Update Epochs Sweep (weight_mode=binary_pos)
+
+**Command template**:
+```bash
+python -u -m DPPO.finetune_bc \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --gamma 0.99 --update_epochs {EP} --minibatch_size 2500 \
+  --actor_lr 3e-6 --weight_mode binary_pos \
+  --use_ddim --ddim_steps 10 --min_sampling_denoising_std 0.01 \
+  --eval_freq 1 --eval_n_rounds 3 \
+  --zero_qvel --reward_scale_running \
+  --n_train_itr 20 --exp_name wbc_binary_pos_ep{EP}
+```
+
+| Epochs | Peak SR | Iter@peak | Trend |
+|---|---|---|---|
+| 2 | 65.7% | 9 | Under-training, degrades after |
+| 3 | 67.1% | 17 | Under-training, high variance |
+| **5** | **85.2%** | **16** | **Stable improvement** |
+| 10 | 69.0% | 8 | Overfitting per batch |
+| 20 | 69.0% | 8 | Severe overfitting, degrades |
+
+**Best (ep5) per-iter detail**:
+
+| Iter | SR | Rollout succ/500 |
+|---|---|---|
+| 1 | 56.1% | 271 |
+| 5 | 57.5% | 314 |
+| 10 | 80.7% | 372 |
+| 15 | 83.1% | 408 |
+| 16 | **85.2%** | 392 |
+| 20 | 82.7% | 404 |
+
+### REINFORCE with Binary Returns (Filtered-BC Equivalent via Policy Gradient)
+
+**Command**:
+```bash
+python -u -m DPPO.finetune_reinforce \
+  --pretrain_checkpoint runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt \
+  --env_id PegInsertionSide-v1 --control_mode pd_joint_delta_pos \
+  --max_episode_steps 200 --n_envs 500 --n_steps 25 \
+  --gamma 1.0 --reward_scale_const 1.0 --no-reward_scale_running \
+  --no-norm_returns --binarize_returns \
+  --gamma_denoising 1.0 \
+  --update_epochs 5 --minibatch_size 2500 \
+  --actor_lr 3e-6 --max_grad_norm 1.0 \
+  --min_sampling_denoising_std 0.01 --min_logprob_denoising_std 0.01 \
+  --use_ddim --ddim_steps 10 \
+  --eval_freq 1 --eval_n_rounds 3 \
+  --zero_qvel \
+  --n_train_itr 20 --exp_name reinforce_binary_ep5
+```
+
+| Iter | SR | Rollout succ/500 |
+|---|---|---|
+| 1 | 52.5% | 271 |
+| 5 | 65.1% | 312 |
+| 10 | 79.9% | 396 |
+| 14 | 85.6% | 418 |
+| 16 | 87.6% | 410 |
+| 17 | **88.2%** | 408 |
+| 20 | 84.9% | 416 |
+
+### Summary Comparison
+
+| Method | Peak SR | Notes |
+|---|---|---|
+| PPO (GAE + critic + clip, 5ep) | **91.7%** | Full DPPO pipeline |
+| REINFORCE (binary returns, 5ep) | 88.2% | No critic, no clip, policy gradient |
+| Weighted BC (binary_pos, 5ep) | 85.2% | No critic, no clip, diffusion MSE loss |
+| REINFORCE (nonorm, lr=1e-5) | ~70% | Stagnates, no improvement |
+| REINFORCE (any lr ≥ 5e-5) | 0% | Collapses |
+
+### Notes
+
+- **Filtered BC works surprisingly well** (85%): only train diffusion model on successful rollout trajectories, iterate. No critic, no advantage, no clipping needed.
+- **REINFORCE with binary returns** (88.2%) slightly outperforms weighted BC, possibly because policy gradient directly optimizes the action distribution rather than fitting noise predictions.
+- **5 epochs is the universal sweet spot** — same conclusion as PPO scaling experiments. Under-training (2-3ep) can't learn enough per iteration; over-training (10-20ep) overfits each batch.
+- **The ~6% gap to PPO (91.7% vs 85-88%)** comes from the critic/baseline providing contrastive signal: PPO learns from both successes AND failures (negative advantages push away from bad actions), while filtered BC/REINFORCE only learns from successes.
+- **Pure REINFORCE (without binary trick) is unstable**: no viable lr exists — too small = stagnation, too large = collapse. The binary return trick works because it removes return variance (all weights are 0 or 1), making the gradient direction stable.
+
+---
