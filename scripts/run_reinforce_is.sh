@@ -6,7 +6,7 @@ PRETRAIN="runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt"
 
 # Tunable parameters
 EPOCHS=5
-LR=3e-6
+LR=1e-5
 ITERS=40
 MINIBATCH=2500
 IS_CLIP=0.2
