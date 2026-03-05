@@ -1,11 +1,14 @@
 """
-REINFORCE finetuning with rollout sampling (no importance sampling ratio).
+REINFORCE finetuning with rollout sampling.
 
 Keeps the same rollout/eval structure as finetune_bc.py, but updates policy with
 policy-gradient objective on diffusion sub-steps:
     L = - E[ log pi_theta(x_{k+1} | x_k, s) * R_t ]
 
 Where each decision-step return R_t is shared across its K denoising sub-steps.
+Optionally supports PPO-style importance ratio:
+    ratio = exp(logp_new - logp_old)
+with optional clip on ratio.
 """
 
 import os
@@ -61,6 +64,8 @@ class Args:
     norm_returns: bool = True
     binarize_returns: bool = False  # If True, use R=1{return>0}
     gamma_denoising: float = 1.0  # 1.0 means no denoising-step discount
+    use_is: bool = False  # If True, use importance ratio exp(logp_new-logp_old)
+    is_clip_ratio: float = 0.0  # >0 enables PPO-style clipped ratio surrogate
 
     # Rollout/logprob noise config
     min_sampling_denoising_std: float = 0.01
@@ -195,7 +200,8 @@ def main():
         p.requires_grad = False
 
     n_actor_params = sum(p.numel() for p in model.actor_ft.parameters() if p.requires_grad)
-    print(f"Finetuned actor params: {n_actor_params:,} (REINFORCE no-IS)")
+    mode = "REINFORCE+IS" if args.use_is else "REINFORCE(no-IS)"
+    print(f"Finetuned actor params: {n_actor_params:,} ({mode})")
 
     optimizer = torch.optim.Adam(model.actor_ft.parameters(), lr=args.actor_lr)
     reward_scaler = RunningRewardScaler(gamma=args.gamma) if args.reward_scale_running else None
@@ -266,12 +272,13 @@ def main():
     best_sr = -1.0
     global_step = 0
 
-    print(f"\nStarting REINFORCE(no-IS) finetuning for {args.n_train_itr} iterations...")
+    mode = "REINFORCE+IS" if args.use_is else "REINFORCE(no-IS)"
+    print(f"\nStarting {mode} finetuning for {args.n_train_itr} iterations...")
     print(f"  n_envs={args.n_envs}, n_steps={n_decision_steps}, act_steps={args.act_steps}, K={K}")
     print(f"  gamma={args.gamma}, update_epochs={args.update_epochs}, minibatch_size={args.minibatch_size}")
     print(
         f"  norm_returns={args.norm_returns}, binarize_returns={args.binarize_returns}, "
-        f"gamma_denoising={args.gamma_denoising}"
+        f"gamma_denoising={args.gamma_denoising}, use_is={args.use_is}, is_clip_ratio={args.is_clip_ratio}"
     )
 
     obs_raw, _ = train_envs.reset()
@@ -365,10 +372,16 @@ def main():
         if args.norm_returns:
             b_returns = (b_returns - b_returns.mean()) / (b_returns.std() + 1e-8)
 
-        # ===== 3. REINFORCE UPDATE (NO IS) =====
+        # Snapshot rollout policy into frozen base actor for IS old-logprob.
+        if args.use_is:
+            model.actor.load_state_dict(model.actor_ft.state_dict())
+
+        # ===== 3. REINFORCE UPDATE =====
         model.train()
         total_loss = 0.0
         total_logp = 0.0
+        total_ratio = 0.0
+        total_clipfrac = 0.0
         n_mb = 0
         grad_norm_last = 0.0
 
@@ -388,10 +401,10 @@ def main():
                 mb_chains_next = b_chains[sample_inds, denoise_inds + 1]
                 mb_returns = b_returns[sample_inds]
 
-                logp, _ = model.get_logprobs_subsample(
+                logp_new, _ = model.get_logprobs_subsample(
                     mb_obs, mb_chains_prev, mb_chains_next, denoise_inds, get_ent=True
                 )
-                logp = logp[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+                logp_new = logp_new[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
 
                 if args.gamma_denoising != 1.0:
                     denoise_discount = torch.pow(
@@ -402,7 +415,33 @@ def main():
                 else:
                     mb_returns_eff = mb_returns
 
-                loss = -(logp * mb_returns_eff).mean()
+                if args.use_is:
+                    with torch.no_grad():
+                        logp_old = model.get_logprobs_subsample(
+                            mb_obs,
+                            mb_chains_prev,
+                            mb_chains_next,
+                            denoise_inds,
+                            get_ent=False,
+                            use_base_policy=True,
+                        )
+                        logp_old = logp_old[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+
+                    ratio = (logp_new - logp_old).exp()
+                    if args.is_clip_ratio > 0:
+                        ratio_clipped = torch.clamp(
+                            ratio, 1.0 - args.is_clip_ratio, 1.0 + args.is_clip_ratio
+                        )
+                        obj = torch.minimum(ratio * mb_returns_eff, ratio_clipped * mb_returns_eff)
+                        clipfrac = ((ratio - ratio_clipped).abs() > 1e-12).float().mean().item()
+                    else:
+                        obj = ratio * mb_returns_eff
+                        clipfrac = 0.0
+                    loss = -obj.mean()
+                    total_ratio += ratio.mean().item()
+                    total_clipfrac += clipfrac
+                else:
+                    loss = -(logp_new * mb_returns_eff).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -410,13 +449,15 @@ def main():
                 optimizer.step()
 
                 total_loss += loss.item()
-                total_logp += logp.mean().item()
+                total_logp += logp_new.mean().item()
                 n_mb += 1
 
         # ===== 4. LOGGING =====
         avg_reward = rewards.sum(0).mean().item()
         avg_loss = total_loss / max(n_mb, 1)
         avg_logp = total_logp / max(n_mb, 1)
+        avg_ratio = total_ratio / max(n_mb, 1) if args.use_is else 1.0
+        avg_clipfrac = total_clipfrac / max(n_mb, 1) if args.use_is else 0.0
         ret_mean = returns.mean().item()
         ret_std = returns.std().item()
         ret_pos_frac = (returns > 0).float().mean().item()
@@ -428,6 +469,8 @@ def main():
         writer.add_scalar("train/ret_mean", ret_mean, iteration)
         writer.add_scalar("train/ret_std", ret_std, iteration)
         writer.add_scalar("train/ret_pos_frac", ret_pos_frac, iteration)
+        writer.add_scalar("train/is_ratio_mean", avg_ratio, iteration)
+        writer.add_scalar("train/is_clipfrac", avg_clipfrac, iteration)
         writer.add_scalar("train/global_step", global_step, iteration)
 
         t_elapsed = time.time() - t_start
@@ -435,6 +478,7 @@ def main():
             f"Iter {iteration}/{args.n_train_itr} | "
             f"r={avg_reward:.3f} | succ={n_success_rollout} | "
             f"reinforce={avg_loss:.6f} | logp={avg_logp:.4f} | "
+            f"ratio={avg_ratio:.3f} clipfrac={avg_clipfrac:.3f} | "
             f"grad={float(grad_norm_last):.2f} | "
             f"ret: mean={ret_mean:.4f} std={ret_std:.4f} pos={ret_pos_frac:.2f} | "
             f"time={t_elapsed:.1f}s"

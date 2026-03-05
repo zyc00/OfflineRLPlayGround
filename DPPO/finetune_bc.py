@@ -69,6 +69,13 @@ class Args:
     weight_mode: str = "return_pos"
     weight_temperature: float = 1.0
     neg_loss_coef: float = 0.25  # used only by posneg_return
+    # Optional data-distribution reweighting (NOT policy-ratio / IS):
+    # - none: no correction
+    # - inv_success_freq: inverse class-frequency by success label (R>0)
+    # This correction multiplies the base BC weights.
+    dist_reweight_mode: str = "none"
+    dist_reweight_power: float = 1.0
+    dist_reweight_max: float = 10.0
 
     # Rollout noise
     min_sampling_denoising_std: float = 0.01
@@ -260,6 +267,10 @@ def main():
         f"  weight_mode={args.weight_mode}, weight_temperature={args.weight_temperature}, "
         f"neg_loss_coef={args.neg_loss_coef}"
     )
+    print(
+        f"  dist_reweight_mode={args.dist_reweight_mode}, power={args.dist_reweight_power}, "
+        f"max={args.dist_reweight_max}"
+    )
 
     obs_raw, _ = train_envs.reset()
     if isinstance(obs_raw, np.ndarray):
@@ -379,6 +390,31 @@ def main():
         if args.norm_returns:
             b_weights = b_weights / (b_weights.mean() + 1e-8)
 
+        # Optional correction for dataset sampling bias (not policy-ratio).
+        dist_corr = torch.ones_like(b_weights)
+        if args.dist_reweight_mode == "none":
+            pass
+        elif args.dist_reweight_mode == "inv_success_freq":
+            is_pos = (b_returns > 0).float()
+            pos_frac = is_pos.mean()
+            neg_frac = 1.0 - pos_frac
+            w_pos = 1.0 / (pos_frac + 1e-8)
+            w_neg = 1.0 / (neg_frac + 1e-8)
+            dist_corr = torch.where(is_pos > 0.5, w_pos, w_neg)
+        else:
+            raise ValueError(
+                f"Unknown dist_reweight_mode={args.dist_reweight_mode}. "
+                "Choose from: none, inv_success_freq."
+            )
+
+        if args.dist_reweight_power != 1.0:
+            dist_corr = dist_corr.pow(args.dist_reweight_power)
+        if args.dist_reweight_max is not None and args.dist_reweight_max > 0:
+            dist_corr = dist_corr.clamp(max=args.dist_reweight_max)
+        # Keep overall update scale stable.
+        dist_corr = dist_corr / (dist_corr.mean() + 1e-8)
+        b_weights = b_weights * dist_corr
+
         # ===== 3. WEIGHTED BC UPDATE =====
         model.train()
         total_loss = 0.0
@@ -432,11 +468,15 @@ def main():
         ret_pos_frac = (b_returns > 0).float().mean().item()
         weight_mean = b_weights.mean().item()
         weight_max = b_weights.max().item()
+        corr_mean = dist_corr.mean().item()
+        corr_max = dist_corr.max().item()
 
         writer.add_scalar("train/reward", avg_reward, iteration)
         writer.add_scalar("train/weighted_bc_loss", avg_bc_loss, iteration)
         writer.add_scalar("train/weight_mean", weight_mean, iteration)
         writer.add_scalar("train/weight_max", weight_max, iteration)
+        writer.add_scalar("train/dist_corr_mean", corr_mean, iteration)
+        writer.add_scalar("train/dist_corr_max", corr_max, iteration)
         writer.add_scalar("train/rollout_ep_successes", n_success_rollout, iteration)
         writer.add_scalar("train/global_step", global_step, iteration)
 
@@ -446,6 +486,7 @@ def main():
             f"r={avg_reward:.3f} | succ={n_success_rollout} | "
             f"wbc={avg_bc_loss:.6f} | "
             f"w_mean={weight_mean:.3f} w_max={weight_max:.3f} | "
+            f"corr_mean={corr_mean:.3f} corr_max={corr_max:.3f} | "
             f"grad={float(grad_norm_last):.2f} | "
             f"ret: mean={ret_mean:.4f} std={ret_std:.4f} pos={ret_pos_frac:.2f} | "
             f"time={t_elapsed:.1f}s"
