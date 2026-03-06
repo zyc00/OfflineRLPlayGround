@@ -7040,11 +7040,174 @@ This was used to answer: why do full DPPO (`~0.91`) and binary-return REINFORCE 
   `critic + GAE + reinforce_is` can work,
   but removing GAE or removing the critic baseline does not preserve performance in this bridge setting.
 
+### Signal Ablation Under Fixed REINFORCE Constraints
+
+To isolate whether the key factor is really `learned critic + GAE`, or simply having a **good signed signal**, we fixed the REINFORCE extraction constraints and only changed the actor signal:
+
+- REINFORCE+IS
+- `is_clip_ratio=0.02`
+- PPO denoising-step clip schedule enabled
+- no critic baseline
+- no GAE
+- gamma_denoising = 1.0
+
+#### Variants
+| Stage | Signal | `norm_adv` | Best SR | Final SR |
+|---|---|---:|---:|---:|
+| p4b | `0/1` | off | 86.1% | 86.1% |
+| p4c | `0/1` | on | 88.9% | 87.2% |
+| p4d | `-1/+1` | off | **93.4%** | **92.7%** |
+| p4e | `-1/+1` | on | 91.5% | 90.7% |
+
+#### Interpretation
+
+- **`0/1 + no norm_adv` is too conservative** under strong diffusion-step constraints.
+  Ratio stays almost exactly at 1.0, KL stays tiny, and learning plateaus around 86%.
+
+- **Turning on `norm_adv` for `0/1` helps** because it effectively converts the batch into a signed signal:
+  successful samples become positive, failed samples become negative after mean subtraction.
+  This lifts performance from 86.1% to 88.9%.
+
+- **Fixed `-1/+1` works even better than `0/1 + norm_adv`.**
+  With explicit signed supervision and the same trust-region design, performance reaches 93.4%, matching / slightly exceeding the PPO anchor on this seed.
+
+- **Adding `norm_adv` on top of `-1/+1` hurts somewhat** (93.4% -> 91.5%).
+  This suggests that once the signal already has a clean fixed sign structure, extra batch normalization is not helping and may over-adapt the scale to the current batch composition.
+
+- **Current takeaway**:
+  the key ingredient may be **signed learning signal + diffusion-step-aware constraint**,
+  not necessarily `learned critic + GAE` specifically.
+  `critic + GAE` is one way to construct a strong signed signal,
+  but a hand-crafted fixed signed signal (`-1/+1`) can already reach the same regime in this single-seed test.
+
 ### Implementation Notes
 
 - The bridge code was cleaned up so that:
   - `ppo_clip` passes raw advantages directly into `model.loss(...)`, matching `finetune.py`
   - `reinforce_is` applies its own `norm_adv + gamma_denoising` preprocessing locally
 - This keeps the PPO anchor cleaner and makes the policy-extraction bridge more interpretable.
+
+### Sample-Efficiency Note: 3k Trajectories Can Reach 90%+ with Larger Per-Iter Batch
+
+After the low-budget `p4d` experiments plateaued in the low/mid-80s, I tested whether the same signed-signal REINFORCE regime could recover under a larger per-iteration batch while keeping the total trajectory budget around `3k`.
+
+#### Target run
+
+- Stage: `p4d_reinforce_pm1_schedclip`
+- Signal: fixed `-1/+1`
+- No critic, no GAE
+- PPO denoising-step clip schedule enabled
+- `n_envs=300`
+- `n_steps=25`
+- `update_epochs=10`
+- `n_train_itr=10`
+
+With `max_episode_steps=200` and `act_steps=8`, this is about `300 trajectories / iter`, so `10 iters ~= 3000 trajectories`.
+
+#### Result
+
+- Best SR: **90.6%**
+- Final SR: **90.6%**
+
+#### Curve
+
+| Iter | Eval SR |
+|---|---:|
+| 1 | 69.8% |
+| 2 | 67.4% |
+| 3 | 73.3% |
+| 4 | 83.3% |
+| 5 | 85.2% |
+| 6 | 86.1% |
+| 7 | 87.3% |
+| 8 | 89.4% |
+| 9 | 88.3% |
+| 10 | **90.6%** |
+
+#### Comparison to the failed 3k high-refresh run
+
+I also tried a much higher-refresh version with the same `p4d` stage:
+
+- `n_envs=50`, `n_steps=25`, `update_epochs=5`, `n_train_itr=60`
+- also about `3000 trajectories`
+
+That run peaked at only `84.0%` and then plateaued / regressed.
+
+#### Interpretation
+
+- **For `p4d`, `3k -> 90%+` does work**, but not in the ultra-small-batch high-refresh regime.
+- The winning tradeoff here is:
+  - larger per-iter rollout batch
+  - moderate UTD (`10 epochs`)
+  - same signed `-1/+1` supervision
+  - same diffusion-step-aware trust-region constraint
+- This is consistent with the earlier `2k` results:
+  the low-budget failure mode is not collapse anymore, but **insufficient sample efficiency when each rollout batch is too small**.
+
+### Coverage Correction: True 93+ DPPO Checkpoint vs Weaker GAE Run
+
+I later re-ran GPU coverage evaluation on the relevant PegInsertion checkpoints and found that my earlier coverage note was using the wrong DPPO checkpoint.
+
+#### Correction
+
+- The checkpoint `runs/dppo_finetune/dppo_ft_peg_gae_g099/best.pt` is **not** the `93%+` DPPO run.
+- It is a weaker GAE/critic run with training `best_sr_once ~= 91.6%`.
+- The **true 93%+ DPPO checkpoint** is:
+  - `runs/dppo_finetune/dppo_ft_peg_zeroqvel_v2/best.pt`
+  - recorded earlier in this log as:
+    - `94.2%` best @ iter 25
+    - `93.0%` @ iter 30
+
+#### Unified coverage protocol
+
+All policies below were re-evaluated with:
+
+- `PegInsertionSide-v1`
+- `pd_joint_delta_pos`
+- `1000` fixed initial states
+- `DDIM-10`
+- deterministic: `mc_samples=1`
+- stochastic: `mc_samples=16`
+- `seed=0`
+
+#### Coverage summary
+
+| Policy | Mode | SR | frac_zero | frac_one | frac_decisive |
+|---|---|---:|---:|---:|---:|
+| pretrain | deterministic | 52.2% | 47.8% | 52.2% | 0.0% |
+| pretrain | stochastic | 53.6% | 5.1% | 3.7% | 82.2% |
+| `dppo_ft_peg_gae_g099` | deterministic | 89.8% | 10.2% | 89.8% | 0.0% |
+| `dppo_ft_peg_gae_g099` | stochastic | 86.4% | 2.0% | 30.2% | 39.2% |
+| `dppo_ft_peg_zeroqvel_v2` | deterministic | **93.6%** | 6.4% | 93.6% | 0.0% |
+| `dppo_ft_peg_zeroqvel_v2` | stochastic | **91.2%** | 2.0% | 48.5% | 22.5% |
+| `p4d_full` | deterministic | 91.6% | 8.4% | 91.6% | 0.0% |
+| `p4d_full` | stochastic | 88.3% | 2.1% | 37.2% | 34.4% |
+| `p4d_3k` | deterministic | 89.2% | 10.8% | 89.2% | 0.0% |
+| `p4d_3k` | stochastic | 84.6% | 2.3% | 30.5% | 41.6% |
+
+#### Training eval vs fixed-state coverage
+
+These numbers are related but not identical:
+
+- training `best_sr_once` = inline finetune evaluation on fresh episodes during training
+- coverage SR = success on a fixed set of initial states
+
+| Policy | Training best `sr_once` | Fixed-state deterministic coverage SR |
+|---|---:|---:|
+| `dppo_ft_peg_gae_g099` | 91.6% | 89.8% |
+| `dppo_ft_peg_zeroqvel_v2` | **94.2%** | **93.6%** |
+| `p4d_full` | 93.4% | 91.6% |
+| `p4d_3k` | 90.6% | 89.2% |
+
+#### Takeaways
+
+- The earlier “DPPO coverage = 89.x” statement referred to the **wrong checkpoint** (`dppo_ft_peg_gae_g099`), not the best zero-qvel GPU DPPO run.
+- The **true 93+ DPPO checkpoint** (`dppo_ft_peg_zeroqvel_v2`) remains the strongest among the policies tested here:
+  - `93.6%` deterministic coverage
+  - `91.2%` stochastic coverage
+- `p4d_full` is strong but still below that checkpoint on the fixed-state protocol:
+  - `91.6%` deterministic
+  - `88.3%` stochastic
+- `p4d_3k` gets close to the weaker `dppo_ft_peg_gae_g099` run in deterministic SR, but remains clearly behind the best DPPO checkpoint.
 
 ---

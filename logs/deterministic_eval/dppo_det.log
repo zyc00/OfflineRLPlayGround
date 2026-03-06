@@ -1,0 +1,26 @@
+/home/jigu/.local/lib/python3.10/site-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+number of parameters: 4.40M
+Loaded: runs/dppo_finetune/dppo_ft_peg_gae_g099/best.pt
+  obs_dim=43, act_dim=8, cond_steps=2
+  horizon=16, act_steps=8, act_offset=1
+  DDIM steps=10, min_std=0.01, deterministic=True
+  zero_qvel=True (dims 9:18 zeroed)
+Coverage: 200 states x 1 MC samples
+
+  MC 1/1: SR=85.5%, frac_zero=14.5%, time=6s
+
+============================================================
+  P(success|s₀) — GPU DDIM-10, min_std=0.01
+  MC1, 200 states
+============================================================
+  SR            = 85.5%
+  frac_zero     = 14.5%
+  frac_one      = 85.5%
+  frac_decisive = 0.0%
+  mean P        = 0.855
+  std P         = 0.352
+  median P      = 1.000
+
+Saved plot: logs/deterministic_eval/dppo_det.png
+Saved data: logs/deterministic_eval/dppo_det.npz

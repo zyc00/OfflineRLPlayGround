@@ -1,0 +1,41 @@
+/home/jigu/.local/lib/python3.10/site-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+number of parameters: 4.40M
+Loaded: runs/dppo_finetune/dppo_ft_peg_zeroqvel_v2/best.pt
+  obs_dim=43, act_dim=8, cond_steps=2
+  horizon=16, act_steps=8, act_offset=1
+  DDIM steps=10, min_std=0.01, deterministic=False
+  zero_qvel=True (dims 9:18 zeroed)
+Coverage: 1000 states x 16 MC samples
+
+  MC 1/16: SR=92.1%, frac_zero=7.9%, time=6s
+  MC 2/16: SR=91.2%, frac_zero=3.5%, time=13s
+  MC 3/16: SR=91.1%, frac_zero=2.8%, time=19s
+  MC 4/16: SR=91.3%, frac_zero=2.5%, time=25s
+  MC 5/16: SR=91.3%, frac_zero=2.2%, time=32s
+  MC 6/16: SR=91.3%, frac_zero=2.2%, time=38s
+  MC 7/16: SR=91.2%, frac_zero=2.2%, time=44s
+  MC 8/16: SR=91.3%, frac_zero=2.2%, time=50s
+  MC 9/16: SR=91.2%, frac_zero=2.2%, time=57s
+  MC 10/16: SR=91.1%, frac_zero=2.2%, time=63s
+  MC 11/16: SR=91.1%, frac_zero=2.2%, time=69s
+  MC 12/16: SR=91.3%, frac_zero=2.1%, time=76s
+  MC 13/16: SR=91.2%, frac_zero=2.0%, time=82s
+  MC 14/16: SR=91.2%, frac_zero=2.0%, time=88s
+  MC 15/16: SR=91.2%, frac_zero=2.0%, time=94s
+  MC 16/16: SR=91.2%, frac_zero=2.0%, time=101s
+
+============================================================
+  P(success|s₀) — GPU DDIM-10, min_std=0.01
+  MC16, 1000 states
+============================================================
+  SR            = 91.2%
+  frac_zero     = 2.0%
+  frac_one      = 48.5%
+  frac_decisive = 22.5%
+  mean P        = 0.912
+  std P         = 0.176
+  median P      = 0.938
+
+Saved plot: logs/coverage_eval/dppo_zeroqvel_v2_sto_1000.png
+Saved data: logs/coverage_eval/dppo_zeroqvel_v2_sto_1000.npz
