@@ -6928,3 +6928,123 @@ python -u -m DPPO.finetune_reinforce \
 - **Pure REINFORCE (without binary trick) is unstable**: no viable lr exists — too small = stagnation, too large = collapse. The binary return trick works because it removes return variance (all weights are 0 or 1), making the gradient direction stable.
 
 ---
+
+## [DPPO Policy-Extraction Bridge: PPO Clip -> REINFORCE+IS] - 2026-03-05 12:30
+
+**Git**: d5fe463 (main)  
+**Script**: `DPPO/finetune_bridge_ablate.py`, `scripts/run_policy_extraction_bridge.sh`  
+**Run Dirs**:
+- `runs/dppo_finetune/peb_p0_ppo_clip_full_seed0`
+- `runs/dppo_finetune/peb_p1_reinforce_is_gae_seed0`
+- `runs/dppo_finetune/peb_p2_reinforce_is_td_seed0`
+- `runs/dppo_finetune/peb_p3_reinforce_is_nobaseline_seed0`
+- `runs/dppo_finetune/peb_p4_reinforce_is_final_seed0`
+**Logs**: `logs/policy_extraction_bridge/`
+
+### Context
+
+Goal: start from a `finetune.py`-aligned PPO/DPPO setup and progressively replace only the **policy extraction / policy loss** with the `finetune_reinforce.py` style IS-REINFORCE surrogate, while keeping rollout structure, optimizer envelope, and diffusion policy architecture fixed.
+
+This was used to answer: why do full DPPO (`~0.91`) and binary-return REINFORCE (`~0.86`) both work, but the naive "critic + GAE + reinforce_is" bridge initially collapsed?
+
+### Shared Settings
+| Parameter | Value |
+|-----------|-------|
+| pretrain_checkpoint | runs/dppo_pretrain/dppo_pretrain_peg_zeroqvel_500k/best.pt |
+| env_id | PegInsertionSide-v1 |
+| control_mode | pd_joint_delta_pos |
+| max_episode_steps | 200 |
+| n_envs | 500 |
+| n_steps | 25 |
+| gamma | 0.99 |
+| update_epochs | 10 |
+| minibatch_size | 2500 |
+| actor_lr | 3e-6 |
+| critic_lr | 1e-3 |
+| use_ddim | True |
+| ddim_steps | 10 |
+| min_sampling_denoising_std | 0.01 |
+| min_logprob_denoising_std | 0.01 |
+| eval_freq | 1 |
+| eval_n_rounds | 3 |
+| zero_qvel | True |
+| reward_scale_running | True |
+| n_train_itr | 20 |
+| warmup (critic stages) | 5 iters |
+
+### Stage Definitions
+| Stage | Meaning |
+|---|---|
+| p0 | Full PPO clip path (`finetune.py`-like) |
+| p1 | Replace PPO policy loss with `reinforce_is`, keep critic + GAE |
+| p2 | Remove GAE, keep critic baseline (`returns - V`) |
+| p3 | Remove critic baseline entirely |
+| p4 | Final REINFORCE style: binary returns, no norm, no critic |
+
+### Main Stage Results (seed 0)
+
+| Stage | Best SR | Final SR | AUC | Notes |
+|---|---|---|---|---|
+| p0 PPO clip full | 90.9% | 90.9% | 0.778 | DPPO anchor |
+| p1 REINFORCE+IS + GAE | **93.0%** | **93.0%** | 0.785 | Stable after fixing clip schedule |
+| p2 REINFORCE+IS + TD | 53.6% | 0.6% | 0.248 | Fails badly |
+| p3 REINFORCE+IS no baseline | 40.1% | 13.9% | 0.204 | Fails badly |
+| p4 REINFORCE final | 86.5% | 85.2% | 0.791 | Binary success-only regime |
+
+### p1 Diagnosis Timeline
+
+#### 1. Original p1: flat IS clip = 0.2
+- Immediate post-warmup collapse.
+- Iter 5 eval: 51.9%
+- Iter 6: `ratio=0.9727`, `gpu_sr=6.4%`
+- Conclusion: this was not evidence that "GAE + reinforce" is impossible; the extraction / trust-region was too loose.
+
+#### 2. Tighten flat IS clip to 0.02
+- Early collapse disappeared.
+- Iter 6: `ratio=0.9984`, `gpu_sr=68.2%`
+- Best SR improved to 89.7%.
+- This showed the main issue was trust-region scale, not GAE itself.
+
+#### 3. Port PPO denoising-step clip schedule into `reinforce_is`
+- Used the same per-denoising-step clip schedule as PPO:
+  early denoising steps clipped very tightly (near `1e-3`), later steps gradually relaxed toward `0.02`.
+- Result: no training collapse across all 20 iterations.
+- Final `p1`:
+  - best SR = 93.0%
+  - final SR = 93.0%
+  - iter 19 eval = 92.6%
+  - iter 20 eval = 93.0%
+
+### Key Findings
+
+- **`p1` vs `p4` is NOT a single-variable "GAE vs 0/1 return" comparison.**
+  `p1` uses critic + signed GAE + value loss + warmup + denoising discount.
+  `p4` uses no critic, binary positive-only returns, no return normalization, and no denoising discount.
+
+- **The original `p1` collapse was caused mainly by extraction / trust-region mismatch.**
+  A flat `is_clip_ratio=0.2` is far looser than PPO's effective clip for early denoising steps.
+
+- **The critical factor is denoising-step-aware clipping.**
+  Early diffusion sub-steps are much more sensitive; they need much tighter clipping than later refinement steps.
+  Once `reinforce_is` used PPO's denoising-step clip schedule, `critic + GAE + reinforce_is` became fully stable.
+
+- **This means the essential difference is not "PPO loss vs REINFORCE loss" in the abstract.**
+  The real stabilizer is the trust-region design over diffusion sub-steps.
+
+- **`target_kl=1.0` was not active in these runs.**
+  Observed KL stayed around `1e-5` to `1e-4`, so early-stop never triggered.
+  The stability gain came from the clip schedule, not from KL stopping.
+
+- **`p2` and `p3` still fail badly.**
+  So after fixing extraction, the current evidence is:
+  `critic + GAE + reinforce_is` can work,
+  but removing GAE or removing the critic baseline does not preserve performance in this bridge setting.
+
+### Implementation Notes
+
+- The bridge code was cleaned up so that:
+  - `ppo_clip` passes raw advantages directly into `model.loss(...)`, matching `finetune.py`
+  - `reinforce_is` applies its own `norm_adv + gamma_denoising` preprocessing locally
+- This keeps the PPO anchor cleaner and makes the policy-extraction bridge more interpretable.
+
+---
