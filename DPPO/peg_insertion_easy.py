@@ -9,18 +9,17 @@ Usage:
     env = gym.make("PegInsertionSideEasy-v1", ...)
 """
 
-import gymnasium as gym
 from mani_skill.envs.tasks.tabletop.peg_insertion_side import PegInsertionSideEnv
+from mani_skill.utils.registration import register_env
 
 
+@register_env("PegInsertionSideEasy-v1", max_episode_steps=200, override=True)
 class PegInsertionSideEasy(PegInsertionSideEnv):
     """PegInsertionSide with larger clearance (default 6mm vs original 3mm)."""
     _clearance = 0.006
 
 
-# Register with gymnasium
-gym.register(
-    id="PegInsertionSideEasy-v1",
-    entry_point="DPPO.peg_insertion_easy:PegInsertionSideEasy",
-    max_episode_steps=200,
-)
+@register_env("PegInsertionSideEasy4p5-v1", max_episode_steps=200, override=True)
+class PegInsertionSideEasy4p5(PegInsertionSideEnv):
+    """PegInsertionSide with 4.5mm radial clearance."""
+    _clearance = 0.0045

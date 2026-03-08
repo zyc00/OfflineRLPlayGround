@@ -28,6 +28,7 @@ import h5py
 import time
 import gymnasium as gym
 import mani_skill.envs
+import DPPO.peg_insertion_easy  # noqa: F401  register easy peg envs
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 from DPPO.model.unet_wrapper import DiffusionUNet
@@ -108,90 +109,103 @@ def collect_from_demo_states(args, model, device, cond_steps, act_steps, act_off
     n_fail = 0
     t_start = time.time()
     max_blocks = args.max_episode_steps // act_steps + 1
+    demo_retries = max(1, args.demo_retries)
 
     for batch_start in range(0, n_total, num_envs):
         batch_end = min(batch_start + num_envs, n_total)
         batch_size = batch_end - batch_start
+        pending_states = initial_states[batch_start:batch_end]
+        batch_success = 0
 
-        # Reset env (triggers scene reconfiguration)
-        env.reset()
-
-        # Set initial states from H5
-        state_dict = build_batch_state_dict(
-            initial_states[batch_start:batch_end], num_envs, device, use_gpu,
-        )
-        env.unwrapped.set_state_dict(state_dict)
-        obs = get_obs_tensor(env, device)  # (num_envs, obs_dim)
-        obs_history = obs.unsqueeze(1).repeat(1, cond_steps, 1)
-
-        # Per-env trajectory buffers (only track batch_size active envs)
-        obs_bufs = [[] for _ in range(batch_size)]
-        act_bufs = [[] for _ in range(batch_size)]
-        done_flags = [False] * batch_size
-        success_flags = [False] * batch_size
-
-        for i in range(batch_size):
-            obs_bufs[i].append(obs[i].cpu().numpy())
-
-        for block in range(max_blocks):
-            if all(done_flags):
+        for attempt in range(demo_retries):
+            if len(pending_states) == 0:
                 break
 
-            cond = {"state": obs_history}
-            with torch.no_grad():
-                samples = model(
-                    cond, deterministic=args.deterministic,
-                    min_sampling_denoising_std=args.min_sampling_std,
-                    ddim_steps=args.ddim_steps,
-                )
-            action_chunk = samples.trajectories  # (num_envs, horizon, act_dim)
+            active_envs = min(num_envs, len(pending_states))
 
-            for a_idx in range(act_steps):
-                act_i = act_offset + a_idx
-                action = action_chunk[:, min(act_i, action_chunk.shape[1] - 1)]
+            # Reset env (triggers scene reconfiguration)
+            env.reset()
 
-                if use_gpu:
-                    obs_new, reward, terminated, truncated, info = env.step(action)
-                    obs_new = obs_new.float()
+            # Set initial states from H5
+            state_dict = build_batch_state_dict(
+                pending_states[:active_envs], num_envs, device, use_gpu,
+            )
+            env.unwrapped.set_state_dict(state_dict)
+            obs = get_obs_tensor(env, device)  # (num_envs, obs_dim)
+            obs_history = obs.unsqueeze(1).repeat(1, cond_steps, 1)
+
+            obs_bufs = [[] for _ in range(active_envs)]
+            act_bufs = [[] for _ in range(active_envs)]
+            done_flags = [False] * active_envs
+            success_flags = [False] * active_envs
+
+            for i in range(active_envs):
+                obs_bufs[i].append(obs[i].cpu().numpy())
+
+            for _ in range(max_blocks):
+                if all(done_flags):
+                    break
+
+                cond = {"state": obs_history}
+                with torch.no_grad():
+                    samples = model(
+                        cond, deterministic=args.deterministic,
+                        min_sampling_denoising_std=args.min_sampling_std,
+                        ddim_steps=args.ddim_steps,
+                    )
+                action_chunk = samples.trajectories  # (num_envs, horizon, act_dim)
+
+                for a_idx in range(act_steps):
+                    act_i = act_offset + a_idx
+                    action = action_chunk[:, min(act_i, action_chunk.shape[1] - 1)]
+
+                    if use_gpu:
+                        obs_new, reward, terminated, truncated, info = env.step(action)
+                        obs_new = obs_new.float()
+                    else:
+                        obs_new, reward, terminated, truncated, info = env.step(action.cpu().numpy())
+                        obs_new = torch.from_numpy(obs_new).float().to(device)
+                        reward = torch.from_numpy(np.asarray(reward)).float().to(device)
+                        terminated = torch.from_numpy(np.asarray(terminated)).bool().to(device)
+                        truncated = torch.from_numpy(np.asarray(truncated)).bool().to(device)
+
+                    for i in range(active_envs):
+                        if not done_flags[i]:
+                            act_bufs[i].append(action[i].cpu().numpy())
+                            obs_bufs[i].append(obs_new[i].cpu().numpy())
+                            if reward[i].item() > 0.5:
+                                success_flags[i] = True
+                                done_flags[i] = True
+                            elif terminated[i].item() or truncated[i].item():
+                                done_flags[i] = True
+
+                    obs_history = torch.cat(
+                        [obs_history[:, 1:], obs_new.unsqueeze(1)], dim=1,
+                    )
+
+            next_pending_states = []
+            for i in range(active_envs):
+                if success_flags[i]:
+                    n_acts = len(act_bufs[i])
+                    ep_obs = np.array(obs_bufs[i][:n_acts])
+                    ep_act = np.array(act_bufs[i])
+                    successful_trajs.append((ep_obs, ep_act))
+                    n_success += 1
+                    batch_success += 1
                 else:
-                    obs_new, reward, terminated, truncated, info = env.step(action.cpu().numpy())
-                    obs_new = torch.from_numpy(obs_new).float().to(device)
-                    reward = torch.from_numpy(np.asarray(reward)).float().to(device)
-                    terminated = torch.from_numpy(np.asarray(terminated)).bool().to(device)
-                    truncated = torch.from_numpy(np.asarray(truncated)).bool().to(device)
+                    next_pending_states.append(pending_states[i])
 
-                # Record per-env
-                for i in range(batch_size):
-                    if not done_flags[i]:
-                        act_bufs[i].append(action[i].cpu().numpy())
-                        obs_bufs[i].append(obs_new[i].cpu().numpy())
+            if len(pending_states) > active_envs:
+                next_pending_states.extend(pending_states[active_envs:])
+            pending_states = next_pending_states
 
-                        if reward[i].item() > 0.5:
-                            success_flags[i] = True
-                            done_flags[i] = True
-                        elif terminated[i].item() or truncated[i].item():
-                            done_flags[i] = True
-
-                # Update obs history (shift left, append new obs)
-                obs_history = torch.cat(
-                    [obs_history[:, 1:], obs_new.unsqueeze(1)], dim=1,
-                )
-
-        # Collect successful trajectories from this batch
-        for i in range(batch_size):
-            if success_flags[i]:
-                n_acts = len(act_bufs[i])
-                ep_obs = np.array(obs_bufs[i][:n_acts])
-                ep_act = np.array(act_bufs[i])
-                successful_trajs.append((ep_obs, ep_act))
-                n_success += 1
-            else:
-                n_fail += 1
+        n_fail += len(pending_states)
 
         elapsed = time.time() - t_start
         print(
             f"  batch {batch_start // num_envs + 1}: processed {batch_end}/{n_total}, "
-            f"success={n_success}, fail={n_fail}, SR={n_success / batch_end:.3f}, "
+            f"success={n_success}, fail={n_fail}, batch_success={batch_success}, "
+            f"SR={n_success / batch_end:.3f}, "
             f"time={elapsed:.1f}s",
             flush=True,
         )
@@ -223,6 +237,8 @@ def main():
                         help="Uniform coverage: try each initial state until success")
     parser.add_argument("--max_retries", type=int, default=50,
                         help="For --uniform: max rollout attempts per initial state")
+    parser.add_argument("--demo_retries", type=int, default=1,
+                        help="For --demo_path: retry each initial state this many times")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 

@@ -19,12 +19,14 @@ from typing import List, Optional
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
+import DPPO.peg_insertion_easy  # noqa: F401  register easy peg env
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tyro
+import h5py
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -49,6 +51,9 @@ class Args:
     ddim_steps: int = 10
     ddim_eta: float = 1.0
     output: Optional[str] = None
+    export_states_path: Optional[str] = None
+    export_min_p: float = 0.0
+    export_max_p: float = 0.3
 
 
 def main():
@@ -244,6 +249,30 @@ def main():
     np.savez(npz_path, p_success=p, mc_samples=args.mc_samples, num_states=N)
     print(f"\nSaved plot: {out_path}")
     print(f"Saved data: {npz_path}")
+
+    if args.export_states_path:
+        export_path = args.export_states_path
+        os.makedirs(os.path.dirname(export_path), exist_ok=True)
+        select = (p >= args.export_min_p) & (p < args.export_max_p)
+        sel_inds = np.nonzero(select)[0]
+        with h5py.File(export_path, "w") as f:
+            for out_idx, src_idx in enumerate(sel_inds):
+                grp = f.create_group(f"traj_{out_idx}")
+                es = grp.create_group("env_states")
+                actors = es.create_group("actors")
+                articulations = es.create_group("articulations")
+                for name, tensor in saved_state["actors"].items():
+                    arr = tensor[src_idx:src_idx + 1].detach().cpu().numpy().astype(np.float32)
+                    actors.create_dataset(name, data=arr)
+                for name, tensor in saved_state["articulations"].items():
+                    arr = tensor[src_idx:src_idx + 1].detach().cpu().numpy().astype(np.float32)
+                    articulations.create_dataset(name, data=arr)
+                grp.attrs["orig_index"] = int(src_idx)
+                grp.attrs["p_success"] = float(p[src_idx])
+        print(
+            f"Exported {len(sel_inds)} initial states with "
+            f"{args.export_min_p:.3f} <= p < {args.export_max_p:.3f} to {export_path}"
+        )
 
 
 if __name__ == "__main__":

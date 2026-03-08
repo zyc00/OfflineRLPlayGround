@@ -14,8 +14,10 @@ Use --bridge_stage presets for reproducible ablation runs.
 """
 
 import os
+import sys
 import time
 import math
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -50,6 +52,11 @@ STAGES = [
     "p2_reinforce_is_td",
     "p3_reinforce_is_nobaseline",
     "p4_reinforce_is_final",
+    "p4b_reinforce_binary_schedclip",
+    "p4c_reinforce_binary_normadv_schedclip",
+    "p4d_reinforce_pm1_schedclip",
+    "p4e_reinforce_pm1_normadv_schedclip",
+    "p4f_awr_is_pm1_histmix",
 ]
 
 
@@ -91,12 +98,15 @@ class Args:
 
     # Return shaping
     binarize_returns: bool = True
+    pm1_returns: bool = False
     norm_returns: bool = False
 
     # Policy objective
-    policy_objective: str = "reinforce_is"  # reinforce_is | ppo_clip
+    policy_objective: str = "reinforce_is"  # reinforce_is | ppo_clip | awr_is_wbc
     use_is: bool = True
     is_clip_ratio: float = 0.2
+    is_weight_max: float = 0.0
+    awr_kl_coef: float = 0.0
     reinforce_use_ppo_clip_schedule: bool = False
 
     # Value / baseline
@@ -106,6 +116,7 @@ class Args:
     norm_adv: bool = False
     vf_coef: float = 0.5
     n_critic_warmup_itr: int = 0
+    actor_return_warmup_itr: int = 0
 
     # PPO params
     clip_ploss_coef: float = 0.02
@@ -121,6 +132,9 @@ class Args:
     actor_lr: float = 3e-6
     critic_lr: float = 1e-3
     max_grad_norm: float = 1.0
+    offpolicy_history_iters: int = 0
+    offpolicy_mix_ratio: float = 0.0
+    offpolicy_precompute_mb: int = 4096
 
     # Augmentation
     zero_qvel: bool = False
@@ -136,21 +150,39 @@ class Args:
 
 
 def apply_stage_preset(args: Args):
+    def cli_overrode(flag: str) -> bool:
+        candidates = {f"--{flag}", f"--{flag.replace('_', '-')}"}
+        for arg in sys.argv[1:]:
+            head = arg.split("=", 1)[0]
+            if head in candidates:
+                return True
+        return False
+
+    keep_gamma_denoising = cli_overrode("gamma_denoising")
+    keep_is_clip_ratio = cli_overrode("is_clip_ratio")
+    keep_is_weight_max = cli_overrode("is_weight_max")
+    keep_awr_kl_coef = cli_overrode("awr_kl_coef")
+    keep_critic_warmup = cli_overrode("n_critic_warmup_itr")
+    keep_actor_return_warmup = cli_overrode("actor_return_warmup_itr")
+
     if args.bridge_stage not in STAGES:
         raise ValueError(f"Unknown bridge_stage={args.bridge_stage}. Choose from: {STAGES}")
 
     # S0 baseline
     args.policy_objective = "reinforce_is"
     args.use_is = True
-    args.is_clip_ratio = 0.2
+    if not keep_is_clip_ratio:
+        args.is_clip_ratio = 0.2
     args.reinforce_use_ppo_clip_schedule = False
     args.binarize_returns = True
     args.norm_returns = False
-    args.gamma_denoising = 1.0
+    if not keep_gamma_denoising:
+        args.gamma_denoising = 1.0
     args.use_value_baseline = False
     args.use_gae = False
     args.norm_adv = False
-    args.n_critic_warmup_itr = 0
+    if not keep_critic_warmup:
+        args.n_critic_warmup_itr = 0
     args.vf_coef = 0.5
 
     if args.bridge_stage in [
@@ -175,7 +207,8 @@ def apply_stage_preset(args: Args):
         "s6_critic_warmup",
         "s7_full_dppo_equiv",
     ]:
-        args.gamma_denoising = 0.99
+        if not keep_gamma_denoising:
+            args.gamma_denoising = 0.99
 
     if args.bridge_stage in [
         "s3_value_baseline_td1",
@@ -194,53 +227,97 @@ def apply_stage_preset(args: Args):
         args.norm_adv = True
 
     # Align with run_dppo_finetune.sh: any stage that learns critic uses 5 iters warmup.
-    if args.use_value_baseline:
+    if args.use_value_baseline and not keep_critic_warmup:
         args.n_critic_warmup_itr = 5
 
     if args.bridge_stage == "s7_full_dppo_equiv":
         args.policy_objective = "ppo_clip"
         args.use_is = True
-        args.is_clip_ratio = 0.2
+        if not keep_is_clip_ratio:
+            args.is_clip_ratio = 0.2
 
     # ===== PPO -> REINFORCE extraction bridge =====
     if args.bridge_stage.startswith("p"):
         # p0: mimic finetune.py training setup as closely as possible.
         args.policy_objective = "ppo_clip"
         args.use_is = True
-        args.is_clip_ratio = 0.2
+        if not keep_is_clip_ratio:
+            args.is_clip_ratio = 0.2
         args.binarize_returns = False
         args.norm_returns = True
-        args.gamma_denoising = 0.99
+        if not keep_gamma_denoising:
+            args.gamma_denoising = 0.99
         args.use_value_baseline = True
         args.use_gae = True
         args.norm_adv = True
         args.vf_coef = 0.5
-        args.n_critic_warmup_itr = 5
+        if not keep_critic_warmup:
+            args.n_critic_warmup_itr = 5
 
         # p1: only switch policy extraction from PPO-clip to IS-REINFORCE.
-        if args.bridge_stage in ["p1_reinforce_is_gae", "p2_reinforce_is_td", "p3_reinforce_is_nobaseline", "p4_reinforce_is_final"]:
+        if args.bridge_stage in ["p1_reinforce_is_gae", "p2_reinforce_is_td", "p3_reinforce_is_nobaseline", "p4_reinforce_is_final", "p4b_reinforce_binary_schedclip"]:
+            args.policy_objective = "reinforce_is"
+        if args.bridge_stage in ["p4c_reinforce_binary_normadv_schedclip", "p4d_reinforce_pm1_schedclip", "p4e_reinforce_pm1_normadv_schedclip", "p4f_awr_is_pm1_histmix"]:
             args.policy_objective = "reinforce_is"
         if args.bridge_stage == "p1_reinforce_is_gae":
             # Match PPO's trust-region scale more closely for the first bridge step.
-            args.is_clip_ratio = 0.02
+            if not keep_is_clip_ratio:
+                args.is_clip_ratio = 0.02
             args.reinforce_use_ppo_clip_schedule = True
 
         # p2: remove GAE (keep baseline/value learning).
-        if args.bridge_stage in ["p2_reinforce_is_td", "p3_reinforce_is_nobaseline", "p4_reinforce_is_final"]:
+        if args.bridge_stage in ["p2_reinforce_is_td", "p3_reinforce_is_nobaseline", "p4_reinforce_is_final", "p4b_reinforce_binary_schedclip"]:
             args.use_gae = False
             args.norm_adv = False
+        if args.bridge_stage in ["p4c_reinforce_binary_normadv_schedclip", "p4d_reinforce_pm1_schedclip", "p4e_reinforce_pm1_normadv_schedclip", "p4f_awr_is_pm1_histmix"]:
+            args.use_gae = False
 
         # p3: remove critic baseline/value module.
-        if args.bridge_stage in ["p3_reinforce_is_nobaseline", "p4_reinforce_is_final"]:
+        if args.bridge_stage in ["p3_reinforce_is_nobaseline", "p4_reinforce_is_final", "p4b_reinforce_binary_schedclip"]:
             args.use_value_baseline = False
-            args.n_critic_warmup_itr = 0
+            if not keep_critic_warmup:
+                args.n_critic_warmup_itr = 0
+            args.vf_coef = 0.0
+        if args.bridge_stage in ["p4c_reinforce_binary_normadv_schedclip", "p4d_reinforce_pm1_schedclip", "p4e_reinforce_pm1_normadv_schedclip", "p4f_awr_is_pm1_histmix"]:
+            args.use_value_baseline = False
+            if not keep_critic_warmup:
+                args.n_critic_warmup_itr = 0
             args.vf_coef = 0.0
 
         # p4: match finetune_reinforce-style return signal.
-        if args.bridge_stage == "p4_reinforce_is_final":
+        if args.bridge_stage in ["p4_reinforce_is_final", "p4b_reinforce_binary_schedclip"]:
             args.binarize_returns = True
             args.norm_returns = False
-            args.gamma_denoising = 1.0
+            if not keep_gamma_denoising:
+                args.gamma_denoising = 1.0
+        if args.bridge_stage == "p4b_reinforce_binary_schedclip":
+            if not keep_is_clip_ratio:
+                args.is_clip_ratio = 0.02
+            args.reinforce_use_ppo_clip_schedule = True
+        if args.bridge_stage in ["p4c_reinforce_binary_normadv_schedclip", "p4d_reinforce_pm1_schedclip", "p4e_reinforce_pm1_normadv_schedclip", "p4f_awr_is_pm1_histmix"]:
+            args.binarize_returns = True
+            args.norm_returns = False
+            if not keep_gamma_denoising:
+                args.gamma_denoising = 1.0
+            if not keep_is_clip_ratio:
+                args.is_clip_ratio = 0.02
+            args.reinforce_use_ppo_clip_schedule = True
+        if args.bridge_stage in ["p4c_reinforce_binary_normadv_schedclip", "p4e_reinforce_pm1_normadv_schedclip"]:
+            args.norm_adv = True
+        else:
+            args.pm1_returns = False
+        if args.bridge_stage in ["p4d_reinforce_pm1_schedclip", "p4f_awr_is_pm1_histmix"]:
+            args.norm_adv = False
+        if args.bridge_stage in ["p4d_reinforce_pm1_schedclip", "p4e_reinforce_pm1_normadv_schedclip", "p4f_awr_is_pm1_histmix"]:
+            args.pm1_returns = True
+        if args.bridge_stage == "p4f_awr_is_pm1_histmix":
+            args.policy_objective = "awr_is_wbc"
+            args.use_is = True
+            args.reinforce_use_ppo_clip_schedule = False
+            if not keep_is_weight_max:
+                args.is_weight_max = 10.0
+            if not keep_awr_kl_coef:
+                args.awr_kl_coef = 1.0
 
 
 def main():
@@ -401,6 +478,38 @@ def main():
             )
         return t
 
+    def build_reinforce_flat_dataset(obs_flat, chains_flat, adv_flat, ret_v_flat, oldv_flat):
+        n_decisions = obs_flat.shape[0]
+        sample_inds = torch.arange(n_decisions, device=device).repeat_interleave(K)
+        denoise_inds = torch.arange(K, device=device).repeat(n_decisions)
+        return {
+            "obs": obs_flat[sample_inds].cpu(),
+            "prev": chains_flat[sample_inds, denoise_inds].cpu(),
+            "next": chains_flat[sample_inds, denoise_inds + 1].cpu(),
+            "denoise": denoise_inds.cpu(),
+            "adv": adv_flat[sample_inds].cpu(),
+            "ret_v": ret_v_flat[sample_inds].cpu(),
+            "oldv": oldv_flat[sample_inds].cpu(),
+        }
+
+    @torch.no_grad()
+    def precompute_behavior_logp(flat_ds):
+        n_flat = flat_ds["denoise"].shape[0]
+        behavior_lp = []
+        for start in range(0, n_flat, args.offpolicy_precompute_mb):
+            end = min(start + args.offpolicy_precompute_mb, n_flat)
+            mb_obs = {"state": flat_ds["obs"][start:end].to(device)}
+            mb_prev = flat_ds["prev"][start:end].to(device)
+            mb_next = flat_ds["next"][start:end].to(device)
+            mb_denoise = flat_ds["denoise"][start:end].to(device)
+            lp = model.get_logprobs_subsample(
+                mb_obs, mb_prev, mb_next, mb_denoise, get_ent=False, use_base_policy=True
+            )
+            lp = lp[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+            behavior_lp.append(lp.cpu())
+        flat_ds["behavior_lp"] = torch.cat(behavior_lp, dim=0)
+        return flat_ds
+
     @torch.no_grad()
     def evaluate_gpu_inline(n_rounds=5):
         model.eval()
@@ -446,18 +555,31 @@ def main():
     print(f"  n_envs={args.n_envs}, n_steps={n_decision_steps}, act_steps={args.act_steps}, K={K}")
     print(f"  gamma={args.gamma}, update_epochs={args.update_epochs}, minibatch_size={args.minibatch_size}")
     print(
-        f"  binarize_returns={args.binarize_returns}, norm_returns={args.norm_returns}, "
+        f"  binarize_returns={args.binarize_returns}, pm1_returns={args.pm1_returns}, norm_returns={args.norm_returns}, "
         f"gamma_denoising={args.gamma_denoising}"
     )
     print(
         f"  use_value_baseline={args.use_value_baseline}, use_gae={args.use_gae}, "
-        f"norm_adv={args.norm_adv}, warmup={args.n_critic_warmup_itr}"
+        f"norm_adv={args.norm_adv}, warmup={args.n_critic_warmup_itr}, "
+        f"actor_return_warmup={args.actor_return_warmup_itr}"
     )
     print(
         f"  policy_objective={args.policy_objective}, use_is={args.use_is}, "
         f"is_clip_ratio={args.is_clip_ratio}, reinforce_ppo_clip_schedule={args.reinforce_use_ppo_clip_schedule}, "
         f"target_kl={args.target_kl}"
     )
+    print(f"  is_weight_max={args.is_weight_max}, awr_kl_coef={args.awr_kl_coef}")
+    print(
+        f"  offpolicy_history_iters={args.offpolicy_history_iters}, "
+        f"offpolicy_mix_ratio={args.offpolicy_mix_ratio}"
+    )
+
+    use_reinforce_history = (
+        args.policy_objective in {"reinforce_is", "awr_is_wbc"}
+        and args.offpolicy_history_iters > 0
+        and args.offpolicy_mix_ratio > 0
+    )
+    history_buffer = deque(maxlen=args.offpolicy_history_iters) if use_reinforce_history else None
 
     obs_raw, _ = train_envs.reset()
     if isinstance(obs_raw, np.ndarray):
@@ -469,7 +591,12 @@ def main():
     for iteration in range(1, args.n_train_itr + 1):
         t_start = time.time()
         model.eval()
-        is_warmup = args.use_value_baseline and (iteration <= args.n_critic_warmup_itr)
+        is_return_actor_warmup = args.use_value_baseline and (iteration <= args.actor_return_warmup_itr)
+        is_warmup = (
+            args.use_value_baseline
+            and (iteration <= args.n_critic_warmup_itr)
+            and not is_return_actor_warmup
+        )
 
         # ===== 1. ROLLOUT =====
         obs_trajs = []
@@ -547,30 +674,36 @@ def main():
 
         if args.binarize_returns:
             returns = (returns > 0).float()
+            if args.pm1_returns:
+                returns = returns * 2.0 - 1.0
         if args.norm_returns:
             returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         if args.use_value_baseline:
-            with torch.no_grad():
-                obs_norm_last = normalize_obs(obs_history)
-                next_value = model.critic({"state": obs_norm_last}).squeeze(-1)
-
-            if args.use_gae:
-                advantages = torch.zeros_like(rewards)
-                lastgaelam = torch.zeros(args.n_envs, device=device)
-                for t in reversed(range(n_decision_steps)):
-                    if t == n_decision_steps - 1:
-                        nextvalues = next_value
-                    else:
-                        nextvalues = values[t + 1]
-                    next_not_done = 1.0 - dones[t]
-                    delta = rewards[t] + args.gamma * nextvalues * next_not_done - values[t]
-                    lastgaelam = delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
-                    advantages[t] = lastgaelam
-                returns_v = advantages + values
-            else:
-                advantages = returns - values
+            if is_return_actor_warmup:
+                advantages = returns
                 returns_v = returns
+            else:
+                with torch.no_grad():
+                    obs_norm_last = normalize_obs(obs_history)
+                    next_value = model.critic({"state": obs_norm_last}).squeeze(-1)
+
+                if args.use_gae:
+                    advantages = torch.zeros_like(rewards)
+                    lastgaelam = torch.zeros(args.n_envs, device=device)
+                    for t in reversed(range(n_decision_steps)):
+                        if t == n_decision_steps - 1:
+                            nextvalues = next_value
+                        else:
+                            nextvalues = values[t + 1]
+                        next_not_done = 1.0 - dones[t]
+                        delta = rewards[t] + args.gamma * nextvalues * next_not_done - values[t]
+                        lastgaelam = delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam
+                        advantages[t] = lastgaelam
+                    returns_v = advantages + values
+                else:
+                    advantages = returns - values
+                    returns_v = returns
         else:
             advantages = returns
             returns_v = returns
@@ -588,6 +721,26 @@ def main():
         if args.use_is or args.policy_objective == "ppo_clip":
             model.actor.load_state_dict(model.actor_ft.state_dict())
 
+        current_flat = None
+        history_cat = None
+        history_pool_samples = 0
+        behavior_logp_mean = 0.0
+        use_flat_replay = use_reinforce_history or args.policy_objective == "awr_is_wbc"
+        if use_flat_replay:
+            current_flat = build_reinforce_flat_dataset(
+                b_obs, b_chains, b_advantages, b_returns_v, b_values
+            )
+            current_flat["reward_signal"] = returns.reshape(-1).repeat_interleave(K).cpu()
+            current_flat = precompute_behavior_logp(current_flat)
+            behavior_logp_mean = current_flat["behavior_lp"].mean().item()
+            if history_buffer:
+                history_cat = {
+                    k: torch.cat([item[k] for item in history_buffer], dim=0)
+                    for k in history_buffer[0].keys()
+                }
+                history_pool_samples = history_cat["denoise"].shape[0]
+            writer.add_scalar("train/log_prob_behavior_mean", behavior_logp_mean, iteration)
+
         # ===== 3. UPDATE =====
         model.train()
         total_loss = 0.0
@@ -597,29 +750,78 @@ def main():
         total_ratio = 0.0
         total_clipfrac = 0.0
         total_kl = 0.0
+        total_kl_penalty = 0.0
+        total_is_weight = 0.0
         n_mb = 0
         grad_norm_actor_last = 0.0
         grad_norm_critic_last = 0.0
 
         total_samples = N * K
+        onpolicy_mb_size = args.minibatch_size
+        history_mb_size = 0
+        if use_reinforce_history and history_pool_samples > 0:
+            history_mb_size = min(
+                int(round(args.minibatch_size * args.offpolicy_mix_ratio)),
+                args.minibatch_size - 1,
+            )
+            onpolicy_mb_size = max(args.minibatch_size - history_mb_size, 1)
+
         early_stop = False
         early_stop_reason = ""
         for _ in range(args.update_epochs):
-            perm = torch.randperm(total_samples, device=device)
-            for mb_start in range(0, total_samples, args.minibatch_size):
-                mb_inds = perm[mb_start:mb_start + args.minibatch_size]
+            perm_device = "cpu" if use_flat_replay else device
+            perm = torch.randperm(total_samples, device=perm_device)
+            mb_stride = onpolicy_mb_size if use_flat_replay else args.minibatch_size
+            for mb_start in range(0, total_samples, mb_stride):
+                mb_inds = perm[mb_start:mb_start + mb_stride]
                 if len(mb_inds) == 0:
                     continue
 
-                sample_inds = mb_inds // K
-                denoise_inds = mb_inds % K
+                if use_flat_replay:
+                    cur_idx = mb_inds.long()
+                    mb_obs_state = current_flat["obs"][cur_idx]
+                    mb_chains_prev = current_flat["prev"][cur_idx]
+                    mb_chains_next = current_flat["next"][cur_idx]
+                    denoise_inds = current_flat["denoise"][cur_idx]
+                    mb_adv = current_flat["adv"][cur_idx]
+                    mb_ret_v = current_flat["ret_v"][cur_idx]
+                    mb_oldv = current_flat["oldv"][cur_idx]
+                    mb_behavior_lp = current_flat["behavior_lp"][cur_idx]
+                    mb_reward_signal = current_flat["reward_signal"][cur_idx]
 
-                mb_obs = {"state": b_obs[sample_inds]}
-                mb_chains_prev = b_chains[sample_inds, denoise_inds]
-                mb_chains_next = b_chains[sample_inds, denoise_inds + 1]
-                mb_adv = b_advantages[sample_inds]
-                mb_ret_v = b_returns_v[sample_inds]
-                mb_oldv = b_values[sample_inds]
+                    if history_mb_size > 0 and history_cat is not None:
+                        hist_idx = torch.randint(0, history_pool_samples, (history_mb_size,))
+                        mb_obs_state = torch.cat([mb_obs_state, history_cat["obs"][hist_idx]], dim=0)
+                        mb_chains_prev = torch.cat([mb_chains_prev, history_cat["prev"][hist_idx]], dim=0)
+                        mb_chains_next = torch.cat([mb_chains_next, history_cat["next"][hist_idx]], dim=0)
+                        denoise_inds = torch.cat([denoise_inds, history_cat["denoise"][hist_idx]], dim=0)
+                        mb_adv = torch.cat([mb_adv, history_cat["adv"][hist_idx]], dim=0)
+                        mb_ret_v = torch.cat([mb_ret_v, history_cat["ret_v"][hist_idx]], dim=0)
+                        mb_oldv = torch.cat([mb_oldv, history_cat["oldv"][hist_idx]], dim=0)
+                        mb_behavior_lp = torch.cat([mb_behavior_lp, history_cat["behavior_lp"][hist_idx]], dim=0)
+                        mb_reward_signal = torch.cat([mb_reward_signal, history_cat["reward_signal"][hist_idx]], dim=0)
+
+                    mb_obs = {"state": mb_obs_state.to(device)}
+                    mb_chains_prev = mb_chains_prev.to(device)
+                    mb_chains_next = mb_chains_next.to(device)
+                    denoise_inds = denoise_inds.to(device)
+                    mb_adv = mb_adv.to(device)
+                    mb_ret_v = mb_ret_v.to(device)
+                    mb_oldv = mb_oldv.to(device)
+                    mb_behavior_lp = mb_behavior_lp.to(device)
+                    mb_reward_signal = mb_reward_signal.to(device)
+                else:
+                    sample_inds = mb_inds // K
+                    denoise_inds = mb_inds % K
+
+                    mb_obs = {"state": b_obs[sample_inds]}
+                    mb_chains_prev = b_chains[sample_inds, denoise_inds]
+                    mb_chains_next = b_chains[sample_inds, denoise_inds + 1]
+                    mb_adv = b_advantages[sample_inds]
+                    mb_ret_v = b_returns_v[sample_inds]
+                    mb_oldv = b_values[sample_inds]
+                    mb_behavior_lp = None
+                    mb_reward_signal = None
 
                 if args.policy_objective == "ppo_clip":
                     with torch.no_grad():
@@ -648,6 +850,53 @@ def main():
                     total_ratio += ratio_mean
                     total_clipfrac += clipfrac
                     total_kl += approx_kl
+                elif args.policy_objective == "awr_is_wbc":
+                    lp_new, _ = model.get_logprobs_subsample(
+                        mb_obs, mb_chains_prev, mb_chains_next, denoise_inds, get_ent=True
+                    )
+                    lp_new = lp_new[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+
+                    with torch.no_grad():
+                        lp_old = model.get_logprobs_subsample(
+                            mb_obs, mb_chains_prev, mb_chains_next, denoise_inds, get_ent=False, use_base_policy=True
+                        )
+                        lp_old = lp_old[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+
+                    is_weight = (lp_old - mb_behavior_lp).exp()
+                    if args.is_weight_max > 0:
+                        is_weight = is_weight.clamp(min=0.0, max=args.is_weight_max)
+
+                    sr_old = mb_reward_signal.mean()
+                    mb_adv_eff = mb_reward_signal - sr_old
+                    logratio = lp_new - lp_old
+                    ratio = logratio.exp()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+
+                    awr_loss = -(is_weight * mb_adv_eff * lp_new).mean()
+                    pg_loss = awr_loss
+                    kl_penalty = args.awr_kl_coef * approx_kl
+
+                    if args.use_value_baseline:
+                        v_pred = model.critic(mb_obs).squeeze(-1)
+                        v_loss = 0.5 * ((v_pred - mb_ret_v) ** 2).mean()
+                    else:
+                        v_loss = torch.zeros([], device=device)
+
+                    if is_warmup and args.use_value_baseline:
+                        loss = args.vf_coef * v_loss
+                    else:
+                        loss = pg_loss + kl_penalty + (args.vf_coef * v_loss if args.use_value_baseline else 0.0)
+
+                    total_pg += pg_loss.item()
+                    total_v += v_loss.item()
+                    total_logp += lp_new.mean().item()
+                    total_ratio += is_weight.mean().item()
+                    total_is_weight += is_weight.mean().item()
+                    total_clipfrac += 0.0
+                    total_kl += approx_kl.item()
+                    total_kl_penalty += kl_penalty.item()
+                    writer.add_scalar("train/is_weight_mean", is_weight.mean().item(), global_step)
+                    writer.add_scalar("train/sr_old_batch", sr_old.item(), global_step)
                 else:
                     # REINFORCE-style stages apply advantage normalization and
                     # denoising-step discount explicitly here. PPO stages do
@@ -674,17 +923,28 @@ def main():
                                 mb_obs, mb_chains_prev, mb_chains_next, denoise_inds, get_ent=False, use_base_policy=True
                             )
                             lp_old = lp_old[:, act_offset:act_offset + args.act_steps, :].mean(dim=(-1, -2))
+                        # For replay samples, correct behavior->old mismatch
+                        # separately from the PPO-style old->new ratio.
+                        if mb_behavior_lp is not None:
+                            is_weight = (lp_old - mb_behavior_lp).exp()
+                            if args.is_weight_max > 0:
+                                is_weight = is_weight.clamp(min=0.0, max=args.is_weight_max)
+                        else:
+                            is_weight = torch.ones_like(lp_old)
+
                         ratio = (lp_new - lp_old).exp()
                         if args.is_clip_ratio > 0:
                             clip_coef = get_reinforce_clip_coef(denoise_inds)
                             ratio_clipped = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
-                            obj = torch.minimum(ratio * mb_adv_eff, ratio_clipped * mb_adv_eff)
+                            obj_core = torch.minimum(ratio * mb_adv_eff, ratio_clipped * mb_adv_eff)
                             clipfrac = ((ratio - ratio_clipped).abs() > 1e-12).float().mean().item()
                         else:
-                            obj = ratio * mb_adv_eff
+                            obj_core = ratio * mb_adv_eff
                             clipfrac = 0.0
+                        obj = is_weight * obj_core
                         pg_loss = -obj.mean()
                         total_ratio += ratio.mean().item()
+                        total_is_weight += is_weight.mean().item()
                         total_clipfrac += clipfrac
                         total_kl += (((ratio - 1) - (lp_new - lp_old)).mean().item())
                     else:
@@ -737,6 +997,8 @@ def main():
         avg_ratio = total_ratio / max(n_mb, 1) if total_ratio != 0 else 1.0
         avg_clipfrac = total_clipfrac / max(n_mb, 1) if total_clipfrac != 0 else 0.0
         avg_kl = total_kl / max(n_mb, 1) if total_kl != 0 else 0.0
+        avg_kl_penalty = total_kl_penalty / max(n_mb, 1) if total_kl_penalty != 0 else 0.0
+        avg_is_weight = total_is_weight / max(n_mb, 1) if total_is_weight != 0 else 1.0
         adv_mean = b_advantages.mean().item()
         adv_std = b_advantages.std().item()
         adv_pos_frac = (b_advantages > 0).float().mean().item()
@@ -749,20 +1011,30 @@ def main():
         writer.add_scalar("train/ratio_mean", avg_ratio, iteration)
         writer.add_scalar("train/clipfrac", avg_clipfrac, iteration)
         writer.add_scalar("train/approx_kl", avg_kl, iteration)
+        writer.add_scalar("train/kl_penalty", avg_kl_penalty, iteration)
+        writer.add_scalar("train/is_weight_mean_epoch", avg_is_weight, iteration)
         writer.add_scalar("train/adv_mean", adv_mean, iteration)
         writer.add_scalar("train/adv_std", adv_std, iteration)
         writer.add_scalar("train/adv_pos_frac", adv_pos_frac, iteration)
         writer.add_scalar("train/rollout_ep_successes", n_success_rollout, iteration)
         writer.add_scalar("train/global_step", global_step, iteration)
+        writer.add_scalar("train/history_pool_samples", history_pool_samples, iteration)
+        writer.add_scalar("train/log_prob_behavior_mean", behavior_logp_mean, iteration)
 
         t_elapsed = time.time() - t_start
-        warmup_tag = " [WARMUP]" if is_warmup else ""
+        if is_return_actor_warmup:
+            warmup_tag = " [RET-WARMUP]"
+        elif is_warmup:
+            warmup_tag = " [WARMUP]"
+        else:
+            warmup_tag = ""
         print(
             f"Iter {iteration}/{args.n_train_itr}{warmup_tag} | "
             f"r={avg_reward:.3f} | succ={n_success_rollout} | "
             f"loss={avg_loss:.6f} pg={avg_pg:.6f} v={avg_v:.6f} | "
-            f"logp={avg_logp:.4f} ratio={avg_ratio:.4f} clipfrac={avg_clipfrac:.3f} kl={avg_kl:.6f} | "
+            f"logp={avg_logp:.4f} logp_beta={behavior_logp_mean:.4f} isw={avg_is_weight:.4f} ratio={avg_ratio:.4f} clipfrac={avg_clipfrac:.3f} kl={avg_kl:.6f} klp={avg_kl_penalty:.6f} | "
             f"adv: mean={adv_mean:.4f} std={adv_std:.4f} pos={adv_pos_frac:.2f} | "
+            f"hist={history_pool_samples} | "
             f"grad_a={grad_norm_actor_last:.2f} grad_c={grad_norm_critic_last:.2f} | "
             f"time={t_elapsed:.1f}s"
         )
@@ -800,6 +1072,9 @@ def main():
                 }
                 torch.save(save_ckpt, os.path.join(run_dir, "best.pt"))
                 print(f"  Saved best checkpoint (sr_once={best_sr:.3f})")
+
+        if use_reinforce_history:
+            history_buffer.append(current_flat)
 
     print(f"Finetuning complete. Best sr_once={best_sr:.3f}")
     train_envs.close()

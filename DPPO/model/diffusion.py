@@ -156,7 +156,8 @@ class DiffusionModel(nn.Module):
             ddim_steps: if set, use DDIM with this many steps instead of full DDPM
         """
         device = self.betas.device
-        B = len(cond["state"])
+        sample_data = cond["state"] if "state" in cond else cond["rgb"]
+        B = len(sample_data)
         x = torch.randn((B, self.horizon_steps, self.action_dim), device=device)
 
         if ddim_steps is not None and ddim_steps < self.denoising_steps:

@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import gymnasium as gym
 import mani_skill.envs
+import DPPO.peg_insertion_easy
 from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack
 from tqdm import tqdm
 

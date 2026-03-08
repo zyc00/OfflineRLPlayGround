@@ -11,6 +11,7 @@ GPU env pattern follows ManiSkill official PPO example:
 """
 
 import mani_skill.envs  # noqa: F401  register envs
+import DPPO.peg_insertion_easy  # noqa: F401  register easy peg env
 import gymnasium as gym
 import numpy as np
 from mani_skill.utils.wrappers import CPUGymWrapper

@@ -22,7 +22,7 @@ import tyro
 from DPPO.model.mlp import DiffusionMLP
 from DPPO.model.unet_wrapper import DiffusionUNet
 from DPPO.model.diffusion import DiffusionModel
-from DPPO.dataset import DPPODataset
+from DPPO.dataset import DPPODataset, DPPOImageDataset
 from DPPO.evaluate import evaluate_gpu
 from DPPO.eval_cpu import evaluate_cpu_model
 
@@ -84,6 +84,24 @@ class Args:
     obs_noise_std: float = 0.0  # Gaussian noise on obs cond (fraction of per-dim std, 0=off)
     zero_qvel: bool = False  # Zero out qvel dims (9:18) in obs — reduces GPU/CPU sensitivity
 
+    # Image-based DP (vision mode)
+    obs_mode: str = "state"  # "state" or "image"
+    camera_names: List[str] = field(default_factory=lambda: ["base_camera"])
+    state_keys: List[str] = field(default_factory=lambda: ["agent/qpos", "agent/qvel"])
+    img_size: int = 128  # Image resolution (ManiSkill default 128)
+    img_cond_steps: int = 1  # Number of image frames for conditioning
+    # ViT encoder
+    vit_embed_dim: int = 128
+    vit_depth: int = 1
+    vit_num_heads: int = 4
+    vit_embed_style: str = "embed2"
+    vit_embed_norm: int = 0
+    # Vision feature compression
+    spatial_emb: int = 128  # SpatialEmb dim (0 = use linear compression)
+    visual_feature_dim: int = 128  # Only used when spatial_emb=0
+    vision_dropout: float = 0.0
+    augment: bool = False  # RandomShiftsAug for images
+
     # Resume
     resume: Optional[str] = None  # Path to checkpoint to resume from
 
@@ -110,14 +128,29 @@ def main():
     print(f"Using device: {device}")
 
     # Dataset
-    dataset = DPPODataset(
-        data_path=args.demo_path,
-        horizon_steps=args.horizon_steps,
-        cond_steps=args.cond_steps,
-        num_traj=args.num_demos,
-        no_obs_norm=args.no_obs_norm,
-        no_action_norm=args.no_action_norm,
-    )
+    use_image = args.obs_mode == "image"
+    if use_image:
+        dataset = DPPOImageDataset(
+            data_path=args.demo_path,
+            horizon_steps=args.horizon_steps,
+            cond_steps=args.cond_steps,
+            img_cond_steps=args.img_cond_steps,
+            num_traj=args.num_demos,
+            camera_names=args.camera_names,
+            state_keys=args.state_keys,
+            img_size=args.img_size,
+            no_action_norm=args.no_action_norm,
+            no_state_norm=args.no_obs_norm,
+        )
+    else:
+        dataset = DPPODataset(
+            data_path=args.demo_path,
+            horizon_steps=args.horizon_steps,
+            cond_steps=args.cond_steps,
+            num_traj=args.num_demos,
+            no_obs_norm=args.no_obs_norm,
+            no_action_norm=args.no_action_norm,
+        )
 
     # Iteration-based dataloader (like dp_train.py)
     from diffusion_policy.utils import IterationBasedBatchSampler
@@ -129,13 +162,70 @@ def main():
 
     obs_dim = dataset.obs_dim
     action_dim = dataset.action_dim
-    cond_dim = obs_dim * args.cond_steps
+    state_cond_dim = dataset.state_dim * args.cond_steps if use_image else obs_dim * args.cond_steps
+    cond_dim = state_cond_dim
 
     print(f"obs_dim={obs_dim}, action_dim={action_dim}, cond_dim={cond_dim}")
+    if use_image:
+        print(f"Image mode: cameras={args.camera_names}, img_size={args.img_size}, "
+              f"state_dim={dataset.state_dim}")
     print(f"Dataset: {len(dataset)} samples, training {args.total_iters} iters")
 
     # Build network
-    if args.network_type == "unet":
+    if use_image:
+        from DPPO.model.vit import VitEncoder, VitEncoderConfig
+        vit_cfg = VitEncoderConfig(
+            embed_dim=args.vit_embed_dim,
+            depth=args.vit_depth,
+            num_heads=args.vit_num_heads,
+            embed_style=args.vit_embed_style,
+            embed_norm=args.vit_embed_norm,
+        )
+        num_img = len(args.camera_names)
+        num_channel = 3 * args.img_cond_steps
+        backbone = VitEncoder(
+            cfg=vit_cfg,
+            num_channel=num_channel,
+            img_h=args.img_size,
+            img_w=args.img_size,
+        )
+        if args.network_type == "unet":
+            from DPPO.model.vision_unet import VisionUnet1D
+            network = VisionUnet1D(
+                backbone=backbone,
+                action_dim=action_dim,
+                img_cond_steps=args.img_cond_steps,
+                cond_dim=cond_dim,
+                diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+                dim=args.unet_dims[0] if args.unet_dims else 64,
+                dim_mults=tuple(d // args.unet_dims[0] for d in args.unet_dims) if args.unet_dims else (1, 2, 4),
+                kernel_size=5,
+                n_groups=args.n_groups,
+                spatial_emb=args.spatial_emb,
+                visual_feature_dim=args.visual_feature_dim,
+                dropout=args.vision_dropout,
+                num_img=num_img,
+                augment=args.augment,
+            )
+        else:
+            from DPPO.model.vision_mlp import VisionDiffusionMLP
+            network = VisionDiffusionMLP(
+                backbone=backbone,
+                action_dim=action_dim,
+                horizon_steps=args.horizon_steps,
+                cond_dim=cond_dim,
+                img_cond_steps=args.img_cond_steps,
+                time_dim=args.time_dim,
+                mlp_dims=args.mlp_dims,
+                activation_type=args.activation_type,
+                residual_style=args.residual_style,
+                spatial_emb=args.spatial_emb,
+                visual_feature_dim=args.visual_feature_dim,
+                dropout=args.vision_dropout,
+                num_img=num_img,
+                augment=args.augment,
+            )
+    elif args.network_type == "unet":
         network = DiffusionUNet(
             action_dim=action_dim,
             horizon_steps=args.horizon_steps,
@@ -220,7 +310,7 @@ def main():
     action_max = dataset.action_max.to(device)
 
     # Precompute per-dim obs std for scaled noise augmentation
-    if args.obs_noise_std > 0:
+    if args.obs_noise_std > 0 and not use_image:
         obs_std_dev = dataset.obs_std.to(device)  # (obs_dim,)
         print(f"Obs noise augmentation: {args.obs_noise_std} * per-dim std")
 
@@ -241,11 +331,11 @@ def main():
         cond = {k: v.to(device) for k, v in batch["cond"].items()}
 
         # Zero out qvel dims (9:18) to reduce GPU/CPU sensitivity
-        if args.zero_qvel:
+        if args.zero_qvel and "state" in cond:
             cond["state"][..., 9:18] = 0.0
 
-        # Obs noise augmentation: per-dim Gaussian noise scaled by data std
-        if args.obs_noise_std > 0:
+        # Obs noise augmentation: per-dim Gaussian noise scaled by data std (state-only)
+        if args.obs_noise_std > 0 and not use_image:
             noise = torch.randn_like(cond["state"]) * obs_std_dev * args.obs_noise_std
             cond["state"] = cond["state"] + noise
 
@@ -278,7 +368,30 @@ def main():
             # For UNet with dp_train convention: execute actions starting at obs_horizon-1
             act_offset = args.cond_steps - 1 if args.network_type == "unet" else 0
 
-            if args.cpu_eval:
+            if use_image:
+                from DPPO.eval_image import evaluate_image_gpu
+                eval_metrics = evaluate_image_gpu(
+                    n_episodes=args.num_eval_episodes,
+                    model=ema_model,
+                    device=device,
+                    act_steps=args.act_steps,
+                    cond_steps=args.cond_steps,
+                    env_id=args.env_id,
+                    num_envs=args.num_eval_envs,
+                    control_mode=args.control_mode,
+                    max_episode_steps=args.max_episode_steps,
+                    camera_names=args.camera_names,
+                    state_keys=args.state_keys,
+                    img_size=args.img_size,
+                    state_min=obs_min,
+                    state_max=obs_max,
+                    action_min=action_min,
+                    action_max=action_max,
+                    no_state_norm=args.no_obs_norm,
+                    no_action_norm=args.no_action_norm,
+                    act_offset=act_offset,
+                )
+            elif args.cpu_eval:
                 eval_metrics = evaluate_cpu_model(
                     n_episodes=args.num_eval_episodes,
                     model=ema_model,
@@ -323,7 +436,7 @@ def main():
             sr_once = eval_metrics.get("success_once", 0.0)
             writer.add_scalar("eval/success_at_end", sr, iteration)
             writer.add_scalar("eval/success_once", sr_once, iteration)
-            backend = "cpu" if args.cpu_eval else "cuda"
+            backend = "image-gpu" if use_image else ("cpu" if args.cpu_eval else "cuda")
             print(f"  Eval [{backend}] @ iter {iteration}: success_at_end={sr:.3f}, success_once={sr_once:.3f}")
 
             # Save checkpoint at every eval
