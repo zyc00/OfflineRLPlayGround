@@ -40,6 +40,16 @@ class Args:
     horizon_steps: int = 4
     cond_steps: int = 1
     act_steps: int = 4
+    predict_epsilon: bool = True  # True=ε-prediction (DP default), False=x-prediction
+    t_sampling: str = "uniform"  # "uniform" or "lognormal" (for x-pred, lognormal avoids high-noise waste)
+    lognormal_mean: float = -0.8  # P_mean for log-normal t sampling (JiT default)
+    lognormal_std: float = 0.8    # P_std for log-normal t sampling (JiT default)
+    noise_input: bool = False     # Feed pure noise ε instead of x_t during training
+    cascade_training: bool = False  # Sequential cascade training (train matches inference)
+    cascade_steps: int = 10        # Number of cascade steps (matches DDIM inference)
+    mip_noise: bool = False        # MIP-style noise: x₀ + σ·ε (no signal scaling), cascade inference
+    fixed_t_points: List[int] = field(default_factory=list)  # Custom fixed timestep list for t_sampling="fixed"
+    cascade_start: str = "noise"   # Cascade start: "noise" (randn), "zeros" (MIP-style)
 
     # Network
     network_type: str = "mlp"  # "mlp" or "unet"
@@ -254,8 +264,24 @@ def main():
         denoised_clip_value=1.0,
         randn_clip_value=10,
         final_action_clip_value=1.0,
-        predict_epsilon=True,
+        predict_epsilon=args.predict_epsilon,
+        t_sampling=args.t_sampling,
+        lognormal_mean=args.lognormal_mean,
+        lognormal_std=args.lognormal_std,
+        noise_input=args.noise_input,
+        mip_noise=args.mip_noise,
     )
+    if args.mip_noise:
+        model.predict_epsilon = False  # MIP-style always uses x-prediction
+        model.cascade_start = args.cascade_start
+        print(f"MIP-style noise: x₀ + σ·ε, cascade inference, t_sampling={args.t_sampling}, cascade_start={args.cascade_start}")
+    if args.fixed_t_points:
+        model.fixed_t_points = torch.tensor(args.fixed_t_points, dtype=torch.long)
+        print(f"Fixed timestep points: {args.fixed_t_points} ({len(args.fixed_t_points)} steps)")
+    if args.cascade_training:
+        model.cascade_training = True
+        model.cascade_steps = args.cascade_steps
+        model.predict_epsilon = False  # cascade always uses x-prediction
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 

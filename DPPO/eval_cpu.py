@@ -147,8 +147,11 @@ def evaluate_cpu_ckpt(ckpt_path, n_episodes=100, env_id="PickCube-v1",
         denoised_clip_value=1.0,
         randn_clip_value=10,
         final_action_clip_value=1.0,
-        predict_epsilon=True,
+        predict_epsilon=args.get("predict_epsilon", True),
+        mip_noise=args.get("mip_noise", False),
     )
+    if args.get("fixed_t_points"):
+        model.fixed_t_points = torch.tensor(args["fixed_t_points"], dtype=torch.long)
     is_finetune = "model" in ckpt and "ema" not in ckpt
     if is_finetune:
         # Finetuned: extract actor_ft weights → network.*

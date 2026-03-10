@@ -73,6 +73,11 @@ class DiffusionModel(nn.Module):
         denoising_steps=100,
         predict_epsilon=True,
         base_eta=1.0,
+        t_sampling="uniform",  # "uniform" or "lognormal"
+        lognormal_mean=-0.8,   # P_mean for log-normal t sampling
+        lognormal_std=0.8,     # P_std for log-normal t sampling
+        noise_input=False,     # If True, feed pure noise ε instead of x_t during training
+        mip_noise=False,       # If True, use MIP-style noise: x₀ + σ·ε (no signal scaling)
     ):
         super().__init__()
         self.device = device
@@ -87,6 +92,15 @@ class DiffusionModel(nn.Module):
 
         self.network = network.to(device)
         self.eta = EtaFixed(base_eta=base_eta)
+        self.t_sampling = t_sampling
+        self.lognormal_mean = lognormal_mean
+        self.lognormal_std = lognormal_std
+        self.noise_input = noise_input
+        self.mip_noise = mip_noise
+        self.fixed_t_points = None  # Custom fixed timestep list, e.g. [5,10,15,...,55]
+        self.cascade_training = False  # Set externally; use cascade_loss instead of p_losses
+        self.cascade_steps = 10       # Number of cascade steps (matches DDIM inference)
+        self.cascade_start = "noise"  # "noise" (randn), "zeros", for cascade inference start
 
         # DDPM parameters: cosine beta schedule
         self.betas = cosine_beta_schedule(denoising_steps).to(device)
@@ -160,7 +174,14 @@ class DiffusionModel(nn.Module):
         B = len(sample_data)
         x = torch.randn((B, self.horizon_steps, self.action_dim), device=device)
 
-        if ddim_steps is not None and ddim_steps < self.denoising_steps:
+        if self.mip_noise:
+            # MIP-style cascade: feed prediction directly as next input
+            steps = ddim_steps if ddim_steps is not None else 10
+            if self.cascade_start == "zeros":
+                x = torch.zeros_like(x)
+            # else: x stays as randn (default)
+            return self._forward_mip_cascade(x, cond, steps)
+        elif ddim_steps is not None and ddim_steps < self.denoising_steps:
             return self._forward_ddim(x, cond, ddim_steps, deterministic,
                                       min_sampling_denoising_std)
         else:
@@ -251,17 +272,20 @@ class DiffusionModel(nn.Module):
         for i in range(ddim_steps):
             t_b = make_timesteps(B, ddim_t[i].item(), device)
 
-            # Predict noise
-            noise_pred = self.network(x, t_b, cond=cond)
+            net_out = self.network(x, t_b, cond=cond)
 
-            # Predict x_0: x₀ = (xₜ - √(1-ᾱₜ) ε) / √ᾱₜ
             alpha = ddim_alphas[i]
             alpha_prev = ddim_alphas_prev[i]
             sqrt_one_minus_alpha = ddim_sqrt_one_minus_alphas[i]
 
-            x_recon = (x - sqrt_one_minus_alpha * noise_pred) / (alpha ** 0.5)
+            if self.predict_epsilon:
+                noise_pred = net_out
+                x_recon = (x - sqrt_one_minus_alpha * noise_pred) / (alpha ** 0.5)
+            else:
+                x_recon = net_out
+                noise_pred = (x - (alpha ** 0.5) * x_recon) / sqrt_one_minus_alpha
 
-            # Clip x_0 and recompute noise for consistency (matches original)
+            # Clip x_0 and recompute noise for consistency
             if self.denoised_clip_value is not None:
                 x_recon.clamp_(-self.denoised_clip_value, self.denoised_clip_value)
                 noise_pred = (x - (alpha ** 0.5) * x_recon) / sqrt_one_minus_alpha
@@ -298,25 +322,167 @@ class DiffusionModel(nn.Module):
 
     # --- Supervised training ---
 
+    def _sample_timesteps(self, batch_size, device):
+        """Sample training timesteps. Supports uniform, log-normal, and fixed strategies."""
+        if self.t_sampling == "lognormal":
+            # Log-normal noise level sampling (EDM/JiT style).
+            # Sample σ ~ LogNormal(P_mean, P_std), then find nearest discrete t.
+            # This concentrates training on medium noise levels, avoiding
+            # wasted capacity on high-noise timesteps where x-pred is ill-conditioned.
+            ln_sigma = torch.randn(batch_size, device=device) * self.lognormal_std + self.lognormal_mean
+            sigma = ln_sigma.exp()
+            # Map σ to discrete t: σ(t) = sqrt((1-ᾱ_t)/ᾱ_t), so ᾱ_t = 1/(1+σ²)
+            alpha_bar_target = 1.0 / (1.0 + sigma ** 2)
+            # Find nearest t by comparing to schedule's alpha_cumprod
+            # alphas_cumprod is (T,) decreasing
+            diffs = (alpha_bar_target.unsqueeze(1) - self.alphas_cumprod.unsqueeze(0)).abs()
+            t = diffs.argmin(dim=1)
+            return t
+        elif self.t_sampling == "fixed":
+            # Fixed K points — uniform sampling among custom timestep positions.
+            # Points set via self.fixed_t_points (e.g. [5,10,15,...,55]).
+            assert self.fixed_t_points is not None, "Set model.fixed_t_points for t_sampling='fixed'"
+            fixed_t = self.fixed_t_points.to(device)
+            K = len(fixed_t)
+            k = torch.randint(0, K, (batch_size,), device=device)
+            return fixed_t[k]
+        else:
+            return torch.randint(0, self.denoising_steps, (batch_size,), device=device).long()
+
     def loss(self, x, *args):
+        if self.cascade_training:
+            return self.cascade_loss(x, *args, cascade_steps=self.cascade_steps)
         batch_size = len(x)
-        t = torch.randint(
-            0, self.denoising_steps, (batch_size,), device=x.device
-        ).long()
+        t = self._sample_timesteps(batch_size, x.device)
         return self.p_losses(x, *args, t)
 
     def p_losses(self, x_start, cond, t):
         """
-        Noise prediction loss: E_{t,x0,eps} [||eps - eps_theta(sqrt(alpha_bar_t)*x0 + sqrt(1-alpha_bar_t)*eps, t)||^2]
+        Diffusion training loss. Supports epsilon-prediction and x-prediction,
+        with optional noise_input or mip_noise.
         """
         device = x_start.device
         noise = torch.randn_like(x_start, device=device)
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_recon = self.network(x_noisy, t, cond=cond)
+        if self.noise_input:
+            # Feed pure noise ε as input (no signal from x₀)
+            x_input = noise
+        elif self.mip_noise:
+            # MIP-style: x_noisy = x₀ + σ·ε (no signal scaling)
+            # σ_t = sqrt((1-ᾱ_t)/ᾱ_t), same SNR mapping as DDPM
+            alpha_bar = extract(self.alphas_cumprod, t, x_start.shape)
+            sigma = ((1 - alpha_bar) / alpha_bar).sqrt()
+            x_input = x_start + sigma * noise
+            # For the highest fixed_t_point (cascade start), replace input with
+            # pure noise or zeros to match inference starting condition
+            if self.fixed_t_points is not None and self.cascade_start != "noise_signal":
+                max_t = self.fixed_t_points.max().item()
+                start_mask = (t == max_t)
+                if start_mask.any():
+                    if self.cascade_start == "zeros":
+                        x_input[start_mask] = torch.zeros_like(x_input[start_mask])
+                    else:  # "noise" — pure Gaussian, no x₀ signal
+                        x_input[start_mask] = noise[start_mask]
+        else:
+            x_input = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_recon = self.network(x_input, t, cond=cond)
         if self.predict_epsilon:
             return F.mse_loss(x_recon, noise, reduction="mean")
         else:
             return F.mse_loss(x_recon, x_start, reduction="mean")
+
+    def cascade_loss(self, x_start, cond, cascade_steps=10):
+        """Sequential cascade training: train matches inference.
+
+        Runs K-step DDIM-like cascade from noise, supervising each step's
+        x₀ prediction. Steps between are detached (no backprop through chain).
+
+        Args:
+            x_start: clean actions (B, H, Da)
+            cond: conditioning dict
+            cascade_steps: number of cascade steps (matches DDIM inference steps)
+        """
+        device = x_start.device
+        B = x_start.shape[0]
+        T = self.denoising_steps
+
+        # Same timestep schedule as DDIM inference
+        step_ratio = T // cascade_steps
+        ddim_t = torch.arange(0, cascade_steps, device=device) * step_ratio
+
+        # Precompute alpha schedules (ascending, then flip to descending)
+        ddim_alphas = self.alphas_cumprod[ddim_t].clone()
+        ddim_alphas_prev = torch.cat([
+            torch.tensor([1.0], device=device),
+            self.alphas_cumprod[ddim_t[:-1]],
+        ])
+        ddim_sqrt_one_minus_alphas = (1.0 - ddim_alphas) ** 0.5
+
+        # Descending order (high noise → clean)
+        ddim_t = torch.flip(ddim_t, [0])
+        ddim_alphas = torch.flip(ddim_alphas, [0])
+        ddim_alphas_prev = torch.flip(ddim_alphas_prev, [0])
+        ddim_sqrt_one_minus_alphas = torch.flip(ddim_sqrt_one_minus_alphas, [0])
+
+        # Start from noise
+        x = torch.randn_like(x_start)
+        total_loss = 0.0
+
+        for i in range(cascade_steps):
+            t_b = make_timesteps(B, ddim_t[i].item(), device)
+
+            # Network predicts x₀
+            x0_pred = self.network(x, t_b, cond=cond)
+
+            # Supervise each step's prediction
+            total_loss = total_loss + F.mse_loss(x0_pred, x_start, reduction="mean")
+
+            # Construct next step's input via DDIM update (deterministic)
+            alpha = ddim_alphas[i]
+            alpha_prev = ddim_alphas_prev[i]
+            sqrt_one_minus_alpha = ddim_sqrt_one_minus_alphas[i]
+
+            if self.denoised_clip_value is not None:
+                x0_pred = x0_pred.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+
+            # Reconstruct noise from prediction
+            noise_pred = (x - (alpha ** 0.5) * x0_pred) / sqrt_one_minus_alpha
+
+            # Deterministic DDIM update: x_{t-1} = √ᾱ_{t-1} · x₀ + √(1-ᾱ_{t-1}) · ε_dir
+            dir_coef = (1.0 - alpha_prev).clamp(min=0).sqrt()
+            x = ((alpha_prev ** 0.5) * x0_pred + dir_coef * noise_pred).detach()
+
+        return total_loss / cascade_steps
+
+    def _forward_mip_cascade(self, x, cond, ddim_steps):
+        """MIP-style cascade inference: feed x₀_pred directly as next input.
+
+        No DDIM update formula — just iterative refinement through the network.
+        Timesteps go from high (noisy) to low (clean) in DDPM convention.
+        Uses fixed_t_points if set, otherwise default DDIM schedule.
+        """
+        T = self.denoising_steps
+        B = x.shape[0]
+        device = x.device
+
+        if self.fixed_t_points is not None:
+            ddim_t = self.fixed_t_points.to(device)
+            ddim_steps = len(ddim_t)
+        else:
+            step_ratio = T // ddim_steps
+            ddim_t = torch.arange(0, ddim_steps, device=device) * step_ratio
+        # Descending: high noise (large t) first
+        ddim_t = torch.flip(ddim_t, [0])
+
+        for i in range(ddim_steps):
+            t_b = make_timesteps(B, ddim_t[i].item(), device)
+            x0_pred = self.network(x, t_b, cond=cond)
+            if self.denoised_clip_value is not None:
+                x0_pred.clamp_(-self.denoised_clip_value, self.denoised_clip_value)
+            x = x0_pred  # MIP-style: use prediction directly
+
+        if self.final_action_clip_value is not None:
+            x = torch.clamp(x, -self.final_action_clip_value, self.final_action_clip_value)
+        return Sample(x, None)
 
     def q_sample(self, x_start, t, noise=None):
         """Forward diffusion: q(x_t | x_0)"""

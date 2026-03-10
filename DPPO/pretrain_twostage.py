@@ -92,6 +92,7 @@ class Args:
     stage1_ckpt: Optional[str] = None  # Required for stage 2
     unfreeze_after: int = 0  # Unfreeze all params after this many iters in stage 2 (0=never)
     stage2_lr: Optional[float] = None  # Override lr for stage 2
+    target_obs_dim: Optional[int] = None  # Override obs_dim for network (for multi-task Stage 1)
 
     # Logging
     exp_name: Optional[str] = None
@@ -176,7 +177,7 @@ def main():
     dataloader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=args.num_workers,
                             pin_memory=(args.num_workers > 0))
 
-    obs_dim = dataset.obs_dim
+    obs_dim = args.target_obs_dim if args.target_obs_dim else dataset.obs_dim
     action_dim = dataset.action_dim
     cond_dim = obs_dim * args.cond_steps
 
@@ -268,7 +269,12 @@ def main():
 
         # Stage 1: zero out obs conditioning
         if args.stage == "1":
-            cond["state"] = torch.zeros_like(cond["state"])
+            # When using multi-task data with target_obs_dim, reshape cond to match network
+            if args.target_obs_dim and dataset.obs_dim != obs_dim:
+                batch_sz = cond["state"].shape[0]
+                cond["state"] = torch.zeros(batch_sz, args.cond_steps, obs_dim, device=device)
+            else:
+                cond["state"] = torch.zeros_like(cond["state"])
 
         # Stage 2: unfreeze backbone after N iters
         if (args.stage == "2" and args.unfreeze_after > 0

@@ -90,9 +90,12 @@ def main():
         obs_dim=obs_dim, action_dim=act_dim, device=device,
         denoising_steps=arch_args.get("denoising_steps", 100),
         denoised_clip_value=1.0, randn_clip_value=10,
-        final_action_clip_value=1.0, predict_epsilon=True,
+        final_action_clip_value=1.0, predict_epsilon=arch_args.get("predict_epsilon", True),
+        mip_noise=arch_args.get("mip_noise", False),
         base_eta=args.ddim_eta,
     )
+    if arch_args.get("fixed_t_points"):
+        model.fixed_t_points = torch.tensor(arch_args["fixed_t_points"], dtype=torch.long)
     state_key = "ema" if "ema" in ckpt else "model"
     raw_sd = ckpt[state_key]
     # Finetuned checkpoints store actor weights under 'actor_ft.unet.*'
